@@ -1,0 +1,34 @@
+# Configuration for KG_LFM training with lite dataset
+dataset:
+  lite: True
+  base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
+  graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
+  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-0.6B"
+  big_graph_training_epochs: 0
+
+pretrain_data:
+  batch_size: 512
+  shuffle: True
+
+  include_graphs: True
+  return_tensors: "pt"
+
+model:
+  # LLM Configuration
+  llm_model_name: "Qwen/Qwen3-8B"
+  
+  # Graph Encoder Configuration
+  graph_pooling: True
+  dropout: 0.2
+  num_heads: 1
+  num_quantizers: 3
+  codebook_size: 512
+  shared_codebook: False
+  
+  # Training Configuration
+  tune_language_model: False
+  tune_kg_encoder: True
+  kg_encoder_lr: 0.0001
+  
+  # Graph Node Embedding Configuration
+  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-0.6B"
