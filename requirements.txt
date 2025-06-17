@@ -1,1 +1,15 @@
 sentence-transformers
+transformers
+torch
+scikit-learn
+accelerate
+datasets
+torch-geometric
+vector-quantize-pytorch
+networkx
+numpy
+h5py
+tqdm
+pyyaml
+wandb
+torchbiggraph
