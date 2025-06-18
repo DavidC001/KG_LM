@@ -14,6 +14,119 @@ from torch_geometric.nn import global_mean_pool
 from torch_geometric.data import Batch
 from vector_quantize_pytorch import ResidualVQ
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ResidualVectorQuantization(nn.Module):
+    """
+    Residual-vector quantizer that outputs one code per stage.
+    
+    Parameters
+    ----------
+    dim : int
+        Embedding dimension of the inputs.
+    num_quantizers : int, default 3
+        Number of residual stages (codebooks).
+    codebook_size : int, default 512
+        Number of entries in each codebook.
+    shared_codebook : bool, default False
+        If True, every stage re-uses the same nn.Embedding object.
+    commit_weight : float, default 0.25
+        Multiplier for the commitment (codebook) loss term.
+    """
+    def __init__(
+        self,
+        dim,
+        num_quantizers: int = 3,
+        codebook_size: int = 512,
+        shared_codebook: bool = False,
+        commit_weight: float = 0.25,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_quantizers = num_quantizers
+        self.commit_weight = commit_weight
+
+        # ── codebooks ──────────────────────────────────────────────────────────
+        if shared_codebook:
+            shared = nn.Embedding(codebook_size, dim)
+            self.codebooks = nn.ModuleList([shared] * num_quantizers)
+        else:
+            self.codebooks = nn.ModuleList(
+                [nn.Embedding(codebook_size, dim) for _ in range(num_quantizers)]
+            )
+
+    # -------- helpers ---------------------------------------------------------
+    @torch.no_grad()
+    def _nearest_code(self, residual: torch.Tensor, table: nn.Embedding):
+        """
+        Args
+        ----
+        residual : (B, D)
+        table.weight : (K, D)
+        
+        Returns
+        -------
+        idx : (B,)          LongTensor – chosen code indices
+        q   : (B, D)        quantized vectors
+        """
+        # (B, 1, D) × (1, K, D) → (B, K)
+        dist = torch.cdist(residual.unsqueeze(1), table.weight.unsqueeze(0)).squeeze(1)
+        idx = dist.argmin(-1)           # (B,)
+        return idx, table(idx)          # (B,), (B, D)
+
+    # -------- forward ---------------------------------------------------------
+    def forward(self, x: torch.Tensor):
+        """
+        x : (B, D) – encoder embeddings
+        
+        Returns
+        -------
+        quantized : (B, Q, D)   stacked quantized vectors with STE for gradient flow
+        indices   : (B, Q)      codebook indices per stage
+        loss      : ()          scalar — residual-energy + β * commit loss
+        """
+        assert x.dim() == 2 and x.size(1) == self.dim, \
+            f"expected (batch, {self.dim}); got {tuple(x.shape)}"
+
+        residual = x
+        quantized_list, index_list = [], []
+        commit_loss = 0.0
+
+        for cb in self.codebooks:
+            # 1. Pick the nearest codebook vector (this operation is non-differentiable)
+            idx, q = self._nearest_code(residual, cb)
+            
+            # 2. Apply the Straight-Through Estimator (STE)
+            # This allows the gradient to be passed from 'q_ste' back to 'residual'
+            # as if the operation was an identity function in the backward pass.
+            q_ste = residual + (q - residual).detach()
+            
+            # 3. Accumulate the STE-modified quantized vectors for the final output
+            quantized_list.append(q_ste)
+            index_list.append(idx)
+            
+            # 4. Calculate the commitment loss to train the codebook.
+            # The gradient for this loss should only affect the codebook, not the encoder.
+            commit_loss = commit_loss + F.mse_loss(residual.detach(), q)
+            
+            # 5. Update the residual for the next quantization stage using the original 'q'.
+            residual = residual - q
+
+        quantized = torch.stack(quantized_list, dim=1)   # (B, Q, D)
+        indices   = torch.stack(index_list,   dim=1)     # (B, Q)
+        
+        # The residual loss encourages the encoder to produce outputs that are 
+        # close to the codebook, providing a gradient path back to the encoder.
+        res_loss  = residual.pow(2).mean()
+
+        # The total loss for the quantization module
+        loss = res_loss + self.commit_weight * commit_loss
+
+        return quantized, indices, loss
+        
 
 class KGEncoder(nn.Module):
     def __init__(
@@ -63,11 +176,11 @@ class KGEncoder(nn.Module):
         self.norm = nn.LayerNorm(node_embedding_dim)
 
         # residual vector quantization layer
-        self.vq = ResidualVQ(
+        self.vq = ResidualVectorQuantization(
             dim=node_embedding_dim,
-            num_quantizers= num_quantizers,
+            num_quantizers=num_quantizers,
             codebook_size=codebook_size,
-            shared_codebook= shared_codebook,
+            shared_codebook=shared_codebook
         )
         
         # output projection layer
@@ -87,12 +200,8 @@ class KGEncoder(nn.Module):
         """
         x, edge_index, edge_attr = graphs.x, graphs.edge_index, graphs.edge_attr
         
-        # Ensure input tensors have the same dtype as model parameters
-        model_dtype = next(self.parameters()).dtype
-        x = x.to(dtype=model_dtype)
-        if edge_attr is not None:
-            edge_attr = edge_attr.to(dtype=model_dtype)
-        
+        x = x.to(dtype=self.conv.lin_l.weight.dtype)  # Ensure x is in the correct dtype for GATv2Conv
+        edge_attr = edge_attr.to(dtype=self.conv.lin_l.weight.dtype) if edge_attr is not None else None
         # Apply GATv2Conv
         x = self.conv(x, edge_index, edge_attr)
         
@@ -118,14 +227,8 @@ class KGEncoder(nn.Module):
         # Normalize the output
         x = self.norm(x)
         
-        # Ensure tensor is in the correct dtype before vector quantization
-        x = x.to(dtype=model_dtype)
-        
         # Apply residual vector quantization
-        _, indices, loss, quantized_x = self.vq(x, return_all_codes = True)
-        
-        # invert first dimension (num_quantizers) with second dimension (batch size)
-        quantized_x = quantized_x.permute(1, 0, 2)
+        quantized_x, indices, loss = self.vq(x)
         
         quantized_x = self.output_projection(quantized_x)
         

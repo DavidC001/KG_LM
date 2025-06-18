@@ -39,7 +39,7 @@ class BigGraphAligner:
             self.config.graph_nodes_embedding_model,
             model_kwargs={
                 "attn_implementation": "flash_attention_2",
-                "device_map": "cuda:0",
+                # "device_map": "cuda:0",
                 "torch_dtype": torch.float16
             } if torch.cuda.is_available() else {},
             tokenizer_kwargs={"padding_side": "left"},
@@ -56,6 +56,9 @@ class BigGraphAligner:
         self.prepare()
         self.train()
         self.build_index()
+        
+        # unload the embedder to free up memory
+        self.embedder = None
 
 
     def prepare(self):

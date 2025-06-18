@@ -570,7 +570,6 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         
         self.tokenizer : PreTrainedTokenizer = AutoTokenizer.from_pretrained(
             config.llm_model_name, 
-            use_fast=True, 
             trust_remote_code=True
         )
         if "<KG_EMBEDDING>" not in self.tokenizer.get_vocab():

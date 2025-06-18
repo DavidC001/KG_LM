@@ -13,3 +13,4 @@ tqdm
 pyyaml
 wandb
 torchbiggraph
+deepspeed

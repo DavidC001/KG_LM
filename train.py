@@ -22,13 +22,20 @@ def pretrain(config: ProjectConfig):
         config.model
     )
     
-    model : KG_LFM = KG_LFM(model_config)
     
     # Create dataloaders
     train_dataloader, val_dataloader, _ = create_dataloader(
         config.dataset, config.pretrain_data, 
         model.tokenizer, "all"
     )
+    
+    
+    model : KG_LFM = KG_LFM(model_config)
+    
+    # set require grads of model.llm to False if not tuning
+    if not config.model.tune_language_model:
+        for param in model.llm.parameters():
+            param.requires_grad = False
     
     # Prepare model and dataloaders with accelerator
     optimizer = AdamW(
@@ -60,7 +67,7 @@ def pretrain(config: ProjectConfig):
             optimizer.step()
             optimizer.zero_grad()
             
-            if step % config.pretrain_data.logging_steps == 0:
+            if step % 1 == 0:
                 print(f"Step {step}, Loss: {loss.item()}")
         
         # Validation step

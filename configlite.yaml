@@ -7,7 +7,7 @@ dataset:
   big_graph_training_epochs: 0
 
 pretrain_data:
-  batch_size: 512
+  batch_size: 64
   shuffle: True
 
   include_graphs: True
