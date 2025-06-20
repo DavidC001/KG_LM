@@ -57,6 +57,11 @@ class ResidualVectorQuantization(nn.Module):
             self.codebooks = nn.ModuleList(
                 [nn.Embedding(codebook_size, dim) for _ in range(num_quantizers)]
             )
+            
+    def _init_weights(self):
+        """Initialize weights with proper scaling for stability."""
+        for cb in self.codebooks:
+            nn.init.xavier_uniform_(cb.weight, gain=0.1)
 
     # -------- helpers ---------------------------------------------------------
     @torch.no_grad()
@@ -167,6 +172,7 @@ class KGEncoder(nn.Module):
             heads=num_heads,
             dropout=0.2,
         )
+        self.num_heads = num_heads
         
         # adapter layer
         self.adapter = nn.Linear(node_embedding_dim, node_embedding_dim)
@@ -174,6 +180,7 @@ class KGEncoder(nn.Module):
 
         # normalization layer
         self.norm = nn.LayerNorm(node_embedding_dim)
+        self.out_norm = nn.LayerNorm(final_embedding_dim)
 
         # residual vector quantization layer
         self.vq = ResidualVectorQuantization(
@@ -188,6 +195,23 @@ class KGEncoder(nn.Module):
         
         self.graph_pooling = graph_pooling
         
+        # Initialize weights properly
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights with proper scaling for stability."""
+        # Initialize adapter layer with small weights
+        nn.init.xavier_uniform_(self.adapter.weight, gain=0.1)
+        nn.init.constant_(self.adapter.bias, 0)
+        
+        # Initialize output projection with small weights
+        nn.init.xavier_uniform_(self.output_projection.weight, gain=0.1)
+        nn.init.constant_(self.output_projection.bias, 0)
+        
+        # Initialize layer norm
+        nn.init.constant_(self.norm.weight, 1.0)
+        nn.init.constant_(self.norm.bias, 0)
+        
     def forward(self, graphs: Batch):
         """
         Forward pass for the KGEncoder.
@@ -200,10 +224,16 @@ class KGEncoder(nn.Module):
         """
         x, edge_index, edge_attr = graphs.x, graphs.edge_index, graphs.edge_attr
         
-        x = x.to(dtype=self.conv.lin_l.weight.dtype)  # Ensure x is in the correct dtype for GATv2Conv
-        edge_attr = edge_attr.to(dtype=self.conv.lin_l.weight.dtype) if edge_attr is not None else None
+        # check if any is nan or inf and stop
+        if torch.isnan(x).any() or torch.isinf(x).any() or torch.isnan(edge_attr).any() or torch.isinf(edge_attr).any():
+            Warning("Input contains NaN or Inf values.")
+        
+        x = x.to(dtype=self.conv.lin_l.weight.dtype).to(device=self.conv.lin_l.weight.device)
+        edge_attr = edge_attr.to(dtype=self.conv.lin_l.weight.dtype).to(device=self.conv.lin_l.weight.device)
         # Apply GATv2Conv
         x = self.conv(x, edge_index, edge_attr)
+        # average the output across all heads
+        x = x.view(x.shape[0], self.num_heads, -1).mean(dim=1)
         
         if self.graph_pooling:
             x = global_mean_pool(x, graphs.batch)
@@ -217,7 +247,7 @@ class KGEncoder(nn.Module):
             first_indices[1:] = torch.where(mask)[0] + 1 # Shift indices by 1 to account for the first node in each graph
             
             x = x[first_indices]
-            
+        
         # Apply adapter layer
         x = self.adapter(x)
         
@@ -230,7 +260,12 @@ class KGEncoder(nn.Module):
         # Apply residual vector quantization
         quantized_x, indices, loss = self.vq(x)
         
-        quantized_x = self.output_projection(quantized_x)
+        tokens = self.output_projection(quantized_x)
+        
+        tokens = self.dropout(tokens)
+        
+        # Normalize the quantized output
+        tokens = self.out_norm(tokens)
         
         # Return the quantized representations
-        return quantized_x, indices, loss
+        return tokens, indices, loss

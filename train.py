@@ -1,104 +1,442 @@
-from accelerate import Accelerator
-import torch
+#!/usr/bin/env python3
+"""
+Improved training script for KG-LFM with wandb logging, checkpointing, and better validation.
 
+This version adds:
+- Full checkpoint resumption logic.
+- Gradient clipping for training stability.
+- A unified evaluation loop for validation and testing.
+- Final evaluation on the test set with the best model.
+- Reproducibility with a global seed.
+- wandb Artifacts for model versioning.
+"""
+
+import os
+import logging
+import argparse
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+from datetime import datetime
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+import wandb
+from tqdm.auto import tqdm
+import numpy as np
+
+# Assuming these are defined in your project structure
 from configuration import load_yaml_config, ProjectConfig
 from model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
-
 from utils.Dataloaders.pretrain_data import create_dataloader
 
-from torch.optim import AdamW
+
+class MetricsTracker:
+    """Track and compute running averages of metrics using defaultdict."""
+
+    def __init__(self):
+        self.values = defaultdict(float)
+        self.counts = defaultdict(int)
+
+    def reset(self):
+        """Resets the tracker."""
+        self.values.clear()
+        self.counts.clear()
+
+    def update(self, metrics: Dict[str, float], count: int = 1):
+        """Update metrics."""
+        for key, value in metrics.items():
+            self.values[key] += value * count
+            self.counts[key] += count
+
+    def get_averages(self) -> Dict[str, float]:
+        """Get the current average of all tracked metrics."""
+        return {key: self.values[key] / self.counts[key]
+                for key in self.values if self.counts[key] > 0}
 
 
-def pretrain(config: ProjectConfig):
-    accelerator = Accelerator()
-    print(f"Using device: {accelerator.device}")
+class KG_LFM_Trainer:
+    """
+    Advanced trainer for KG-LFM with comprehensive features for robust and reproducible training.
+    """
 
-    model_config = KG_LFMConfig.from_pretrained(
-        config.model.llm_model_name,
-        trust_remote_code=True,
-    )
-    model_config = set_KGLM_model_args(
-        model_config, 
-        config.model
-    )
-    
-    
-    # Create dataloaders
-    train_dataloader, val_dataloader, _ = create_dataloader(
-        config.dataset, config.pretrain_data, 
-        model.tokenizer, "all"
-    )
-    
-    
-    model : KG_LFM = KG_LFM(model_config)
-    
-    # set require grads of model.llm to False if not tuning
-    if not config.model.tune_language_model:
-        for param in model.llm.parameters():
-            param.requires_grad = False
-    
-    # Prepare model and dataloaders with accelerator
-    optimizer = AdamW(
-        model.kg_encoder.parameters(),
-        lr=config.model.kg_encoder_lr if config.model.kg_encoder_lr else 1e-4
-    )
-    
-    train_dataloader, val_dataloader, model, optimizer = accelerator.prepare(
-        train_dataloader, val_dataloader, model, optimizer
-    )
-    
-    model.correct_train()
-    
-    for epoch in range(10):
-        print(f"Epoch {epoch + 1}/{10}")
+    def __init__(self, config: ProjectConfig, run_name: Optional[str] = None, resume: Optional[bool] = False):
+        self.config = config
+        self.run_name = run_name or f"kg_lfm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.resume = resume
+
+        # Initialize Accelerator and set seed for reproducibility
+        self.accelerator = Accelerator(log_with="wandb")
+        set_seed(self.config.seed)
+
+        self.device = self.accelerator.device
+
+        # Setup logging
+        self.setup_logging()
+
+        # Initialize state
+        self.model = None
         
-        for step, batch in enumerate(train_dataloader):
-            # breakpoint()
-            outputs = model(
+        self.optimizer = None
+        self.scheduler = None
+        
+        self.grad_accumulation_steps = self.config.pretrain_conf.gradient_accumulation_steps
+        
+        self.train_dataloader = None
+        self.val_dataloader = None
+        self.test_dataloader = None
+        
+        self.wandb_run_id = None
+
+        self.global_step = 0
+        self.start_epoch = 0
+        self.best_val_loss = float('inf')
+        self.epochs_without_improvement = 0
+        
+        self.checkpoint_dir = Path(self.config.pretrain_conf.checkpoint_dir + f"/{self.run_name}")
+
+        self.accelerator.print(f"Trainer initialized on device: {self.device}")
+
+    def setup_logging(self):
+        """Setup logging configuration."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(f'training_{self.run_name}.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def setup_wandb(self):
+        """Initialize wandb, potentially resuming a previous run."""
+        wandb_config = self.config.to_dict() # Assuming a method to convert config to dict
+        
+        run_id = self.wandb_run_id
+        
+        self.accelerator.init_trackers(
+            project_name="kg-lfm-training",
+            config=wandb_config,
+            init_kwargs={"wandb": {"name": self.run_name, "resume": "auto", "id": run_id}}
+        )
+        self.logger.info("Wandb initialized successfully")
+
+    def setup_model(self):
+        """Initialize the model with proper configuration."""
+        self.accelerator.print("Setting up model...")
+        model_config = KG_LFMConfig.from_pretrained(
+            self.config.model.llm_model_name,
+            trust_remote_code=True,
+        )
+        model_config = set_KGLM_model_args(model_config, self.config.model)
+        self.model = KG_LFM(model_config)
+
+        # Freeze layers if configured
+        if not self.config.model.tune_language_model:
+            self.accelerator.print("Freezing language model parameters.")
+            for param in self.model.llm.parameters():
+                param.requires_grad = False
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        self.logger.info(f"Total parameters: {total_params:,}")
+        self.logger.info(f"Trainable parameters: {trainable_params:,}")
+
+        # Only log from main process to avoid duplicate logs
+        if self.accelerator.is_main_process:
+            self.accelerator.log({
+                "model/total_parameters": total_params,
+                "model/trainable_parameters": trainable_params,
+            }, step=0)
+
+    def setup_data(self):
+        """Setup data loaders."""
+        self.accelerator.print("Setting up data loaders...")
+        self.train_dataloader, self.val_dataloader, self.test_dataloader = create_dataloader(
+            self.config.dataset,
+            self.config.pretrain_conf.dataloader,
+            self.model.tokenizer,
+            "all"
+        )
+
+    def setup_optimizer_and_scheduler(self, num_epochs: int):
+        """Setup optimizer and learning rate scheduler with warmup."""
+        self.accelerator.print("Setting up optimizer and scheduler...")
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        # Start with a lower learning rate for warmup
+        initial_lr = self.config.pretrain_conf.learning_rate * 0.1
+        
+        self.optimizer = AdamW(
+            trainable_params,
+            lr=initial_lr,
+            weight_decay=self.config.pretrain_conf.weight_decay,
+            eps=1e-8,  # Slightly higher epsilon for stability
+            betas=(0.9, 0.999)
+        )
+
+        total_steps = len(self.train_dataloader) * num_epochs
+        warmup_steps = min(500, total_steps // 10)  # 10% of total steps or 500 steps max
+        
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=total_steps,
+            eta_min=self.config.pretrain_conf.scheduler_eta_min
+        )
+        
+        self.warmup_steps = warmup_steps
+        self.target_lr = self.config.pretrain_conf.learning_rate
+        self.initial_lr = initial_lr
+        
+        self.logger.info(f"Warmup steps: {warmup_steps}, Target LR: {self.target_lr}")
+
+    def update_learning_rate(self, step):
+        """Update learning rate with warmup."""
+        if step < self.warmup_steps:
+            # Linear warmup
+            lr = self.initial_lr + (self.target_lr - self.initial_lr) * (step / self.warmup_steps)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            # Use cosine annealing after warmup
+            self.scheduler.step()
+
+    def prepare_for_training(self):
+        """Prepare all components with accelerator."""
+        self.accelerator.print("Preparing components with Accelerator...")
+        (self.model, self.optimizer, self.train_dataloader, self.val_dataloader, self.test_dataloader, self.scheduler) = self.accelerator.prepare(
+            self.model, self.optimizer, self.train_dataloader, self.val_dataloader, self.test_dataloader, self.scheduler
+        )
+
+    def compute_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
+        """Compute metrics from loss."""
+        return {
+            'loss': loss.item(),
+            'learning_rate': self.optimizer.param_groups[0]['lr']
+        }
+
+    def _evaluation_loop(self, dataloader: torch.utils.data.DataLoader, description: str) -> Dict[str, float]:
+        """Generic evaluation loop for validation or testing."""
+        self.model.eval()
+        metrics_tracker = MetricsTracker()
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process):
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    graphs=batch['graphs'],
+                    attention_mask=batch['attention_mask'],
+                    labels=batch['input_ids'],
+                    use_cache=False,
+                )
+                
+                # Gather loss across all devices
+                loss = self.accelerator.gather(outputs.loss).mean()
+                metrics = self.compute_metrics(loss)
+                metrics_tracker.update(metrics, batch['input_ids'].size(0))
+
+        return metrics_tracker.get_averages()
+
+    def train_epoch(self, epoch: int):
+        """Train for one epoch."""
+        self.model.correct_train()
+        metrics_tracker = MetricsTracker()
+
+        progress_bar = tqdm(
+            self.train_dataloader,
+            desc=f"Epoch {epoch + 1}",
+            disable=not self.accelerator.is_local_main_process
+        )
+
+        loss = torch.tensor(0.0, device=self.device)
+        for step, batch in enumerate(progress_bar):
+            outputs = self.model(
                 input_ids=batch['input_ids'],
                 graphs=batch['graphs'],
                 attention_mask=batch['attention_mask'],
                 labels=batch['input_ids'],
-                use_cache=True,
+                use_cache=False,
             )
-            loss = outputs.loss
             
-            accelerator.backward(loss)
-            optimizer.step()
-            optimizer.zero_grad()
+            language_loss = outputs.loss
+            RVQ_loss = outputs.RVQ_loss
             
-            if step % 1 == 0:
-                print(f"Step {step}, Loss: {loss.item()}")
+            # chech if any of the two is nan
+            if torch.isnan(language_loss) or torch.isnan(RVQ_loss) or torch.isinf(language_loss) or torch.isinf(RVQ_loss):
+                self.accelerator.print(f"NaN or inf detected in losses at step {step + 1}. Skipping this batch.")
+                continue
+            
+            loss += (language_loss+RVQ_loss) / self.grad_accumulation_steps
+            
+            if (step + 1) % self.grad_accumulation_steps == 0:
+                torch.cuda.empty_cache()  # Clear cache to prevent memory issues
+                self.accelerator.backward(loss)
+                
+                # Clip gradients to prevent exploding gradients
+                if self.config.pretrain_conf.clip_grad_norm is not None:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.pretrain_conf.clip_grad_norm)
+                
+                self.optimizer.step()
+                self.update_learning_rate(self.global_step)
+                self.optimizer.zero_grad()
+                
+                if self.accelerator.sync_gradients:
+                    
+                    self.global_step += 1
+                    metrics = self.compute_metrics(loss)
+                    metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    
+                    self.accelerator.log({f"train/{k}": v for k, v in metrics.items()}, step=self.global_step)
+                    
+                    progress_bar.set_postfix({
+                        'loss': f"{metrics['loss']:.4f}",
+                        'lr': f"{metrics['learning_rate']:.2e}"
+                    })
+
+                loss = torch.tensor(0.0, device=self.device)
         
-        # Validation step
-        model.eval()
-        with torch.no_grad():
-            for val_batch in val_dataloader:
-                val_outputs = model(
-                    input_ids=val_batch['input_ids'],
-                    graphs=val_batch['graphs'],
-                    attention_mask=val_batch['attention_mask'],
-                    labels=val_batch['input_ids'],
-                    use_cache=True,
-                )
-                val_loss = val_outputs.loss
-                print(f"Validation Loss: {val_loss.item()}")
+        return metrics_tracker.get_averages()
+    
+    def save_checkpoint(self, epoch: int, is_best: bool = False):
+        """Save model checkpoint, optionally as a wandb artifact."""
+        if not self.accelerator.is_main_process:
+            return
         
-        model.correct_train()
+        checkpoint_dir = self.checkpoint_dir
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-    print("Pretraining complete.")
-    
-    # save the model
-    accelerator.wait_for_everyone()
-    unwrapped_model = accelerator.unwrap_model(model)
-    
-    unwrapped_model.save_pretrained(config.pretrain_data.output_dir, save_function=accelerator.save)
-    print(f"Model saved to {config.pretrain_data.output_dir}")
-    
-    
+        # Save the full training state with accelerator
+        self.logger.info(f"Saving checkpoint for epoch {epoch + 1}...")
+        self.accelerator.save_state(checkpoint_dir / "latest_checkpoint")
+        self.logger.info(f"Latest training state saved at epoch {epoch + 1}")
+        
+        # save the current epoch
+        other_state = {
+            'epoch': epoch + 1,
+            'global_step': self.global_step,
+            'best_val_loss': self.best_val_loss,
+            'epochs_without_improvement': self.epochs_without_improvement,
+            'wandb_run_id': wandb.run.id if wandb.run else None,
+        }
+        torch.save(other_state, checkpoint_dir / "training_state.pth")
+        self.logger.info(f"Training state saved: {other_state}")
+
+        if is_best:
+            best_path = checkpoint_dir / "best_model"
+            
+            unwrapped_model : KG_LFM = self.accelerator.unwrap_model(self.model)
+            unwrapped_model.save_pretrained(best_path)
+            self.logger.info(f"New best model saved to {best_path}")
+
+            # Log the best model as a wandb Artifact
+            # artifact = wandb.Artifact(f"{self.run_name}-best-model", type="model")
+            # artifact.add_dir(str(best_path))
+            # wandb.log_artifact(artifact)
+
+    def train(self):
+        """Main training loop."""
+        num_epochs = self.config.pretrain_conf.epochs
+        patience = self.config.pretrain_conf.early_stopping_patience
+
+        self.setup_model()
+        self.setup_data()
+        self.setup_optimizer_and_scheduler(num_epochs)
+        self.prepare_for_training()
+
+        if self.resume:
+            self.accelerator.print(f"Resuming training from: {self.checkpoint_dir}")
+            self.accelerator.load_state(self.checkpoint_dir / "latest_checkpoint")
+            
+            state_path = self.checkpoint_dir / "training_state.pth"
+            state = torch.load(state_path, map_location=self.device)
+            
+            self.start_epoch = state.get('epoch', 0)
+            self.global_step = state.get('global_step', 0)
+            self.best_val_loss = state.get('best_val_loss', float('inf'))
+            self.epochs_without_improvement = state.get('epochs_without_improvement', 0)
+            self.accelerator.print(f"Resuming from epoch {self.start_epoch + 1}, global step {self.global_step}")
+            self.wandb_run_id = state.get('wandb_run_id', None)
+
+        self.setup_wandb()
+        self.accelerator.print(f"Starting training for {num_epochs} epochs with patience {patience}")
+
+        for epoch in range(self.start_epoch, num_epochs):
+            self.accelerator.print(f"--- Starting epoch {epoch + 1}/{num_epochs} ---")
+            train_metrics = self.train_epoch(epoch)
+            val_metrics = self._evaluation_loop(self.val_dataloader, "Validation")
+
+            log_metrics = {
+                "epoch": epoch + 1,
+                **{f"train_epoch/{k}": v for k, v in train_metrics.items()},
+                **{f"val_epoch/{k}": v for k, v in val_metrics.items()},
+            }
+            self.accelerator.log(log_metrics, step=self.global_step)
+            
+            self.accelerator.print(f"Epoch {epoch + 1} | Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+
+            is_best = val_metrics['loss'] < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_metrics['loss']
+                self.epochs_without_improvement = 0
+                self.accelerator.print(f"New best validation loss: {self.best_val_loss:.4f}")
+            else:
+                self.epochs_without_improvement += 1
+
+            self.save_checkpoint(epoch, is_best)
+
+            if self.epochs_without_improvement >= patience:
+                self.accelerator.print(f"Early stopping triggered after {patience} epochs.")
+                break
+        
+        self.accelerator.print("Training finished. Evaluating on the test set with the best model.")
+        self.run_test_evaluation()
+
+        self.accelerator.end_training()
+        self.logger.info("Training process completed.")
+
+    def run_test_evaluation(self):
+        """Load the best model and evaluate on the test set."""
+        if self.test_dataloader and self.accelerator.is_main_process:
+            best_model_path = self.checkpoint_dir / "best_model"
+            if best_model_path.exists():
+                self.accelerator.print(f"Loading best model from {best_model_path} for test evaluation.")
+                # We need a new model object on the CPU to load the pretrained weights
+                cpu_model = KG_LFM.from_pretrained(best_model_path)
+                cpu_model.to(self.device)
+                self.model = self.accelerator.prepare(cpu_model)
+
+                test_metrics = self._evaluation_loop(self.test_dataloader, "Testing")
+                self.accelerator.print(f"Test Set Evaluation | Loss: {test_metrics['loss']:.4f} | Perplexity: {test_metrics['perplexity']:.2f}")
+                self.accelerator.log({"test/final_loss": test_metrics['loss'], "test/final_perplexity": test_metrics['perplexity']})
+            else:
+                self.accelerator.print("No best model found to evaluate on the test set.")
+
+
 def main():
-    config = load_yaml_config("configlite.yaml")
-    pretrain(config)
+    """Main function with argument parsing."""
+    parser = argparse.ArgumentParser(description="Train KG-LFM model")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to configuration file.")
     
+    args = parser.parse_args()
+    
+    config = load_yaml_config(args.config)
+    
+    trainer = KG_LFM_Trainer(config, run_name=config.pretrain_conf.run_name, resume=config.pretrain_conf.resume)
+    
+    try:
+        trainer.train()
+    except Exception as e:
+        logging.error(f"Training failed with an unexpected error: {e}", exc_info=True)
+        # Ensure wandb run is closed on error
+        if wandb.run:
+            wandb.finish()
+        raise
+
 if __name__ == "__main__":
     main()

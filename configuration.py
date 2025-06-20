@@ -1,3 +1,4 @@
+import copy
 import os
 from dataclasses import dataclass as og_dataclass
 from dataclasses import is_dataclass
@@ -114,23 +115,86 @@ class ModelConfig:
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Defaults to 'Qwen/Qwen3-Embedding-0.6B'."""
     
+@dataclass
+class PretrainConfig:
+    """
+    Configuration for pretraining on Tri-REx.
+    """
+    run_name: str = "pretrain_trirex"
+    
+    epochs: int = 20
+    """Number of epochs for pretraining. Defaults to 20."""
+    
+    early_stopping_patience: int = 3
+    """Patience for early stopping during pretraining. Defaults to 3."""
+    
+    learning_rate: float = 1e-4
+    """Learning rate for the pretraining optimizer. Defaults to 1e-4."""
+    
+    scheduler_eta_min: float = 1e-5
+    """Minimum learning rate for the scheduler. Defaults to 1e-5."""
+    
+    weight_decay: float = 0.01
+    """Weight decay for the pretraining optimizer. Defaults to 0.01."""
+    
+    gradient_accumulation_steps: int = 1
+    """Number of gradient accumulation steps. Defaults to 1."""
+    
+    clip_grad_norm: float = 1.0
+    """Maximum gradient norm for clipping. Defaults to 1.0."""
+    
+    dataloader: TriRex_DataLoaderConfig = field(default_factory=TriRex_DataLoaderConfig)
+    
+    checkpoint_dir: str = "out/pretrain"
+    
+    resume : bool = False
+    
+    def __post_init__(self):
+        # Ensure that learning rate and weight decay are numbers
+        self.learning_rate = float(self.learning_rate)
+        self.weight_decay = float(self.weight_decay)
+        self.scheduler_eta_min = float(self.scheduler_eta_min)
 
 
 @dataclass
 class ProjectConfig:
+    seed: int = 42
+    """Random seed for reproducibility. Defaults to 42."""
     
     dataset: TRex_DatasetConfig = field(default_factory=TRex_DatasetConfig)
     """General configuration for the datasets."""
     
-    pretrain_data: TriRex_DataLoaderConfig = field(default_factory=TriRex_DataLoaderConfig)
-    
-    model: ModelConfig = field(default_factory=ModelConfig)
-    
+    pretrain_conf: PretrainConfig = field(default_factory=PretrainConfig)
     """Configuration for pretraining on Tri-REx."""
     
-    # def __post_init__(self):
-    #     # Ensure that the dataset base path is set correctly
-    #     self.pretrain.dataloader.graph_nodes_embedding_model = self.model.graph_nodes_embedding_model
+    model: ModelConfig = field(default_factory=ModelConfig)
+    """Configuration for the model architecture and training."""
+    
+    def __post_init__(self):
+        # Ensure that the dataset base path is set correctly
+        self.dataset.graph_nodes_embedding_model = self.model.graph_nodes_embedding_model
+    
+    def recursive_dict(self, in_dict):
+        """
+        Convert the ProjectConfig instance to a nested dictionary.
+        This is useful for serialization or logging.
+        """
+        for key, value in in_dict.items():
+            if is_dataclass(value):
+                in_dict[key] = self.recursive_dict(value.__dict__)
+            elif isinstance(value, list):
+                in_dict[key] = [self.recursive_dict(item) if is_dataclass(item) else item for item in value]
+            elif isinstance(value, dict):
+                in_dict[key] = self.recursive_dict(value)
+        return in_dict
+    
+    def to_dict(self):
+        """
+        Convert the ProjectConfig instance to a dictionary.
+        This is useful for serialization or logging.
+        """
+        return self.recursive_dict(copy.deepcopy(self.__dict__))
+                
 
 
 def load_yaml_config(path) -> ProjectConfig:

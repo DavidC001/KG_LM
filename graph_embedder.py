@@ -14,6 +14,8 @@ def main(config: ProjectConfig, batch_size: int = 128):
         batch_size = batch_size,
     )
     
+    print("=" * 50)
+    print("DONE!")
     # breakpoint()
     
 if __name__ == "__main__":

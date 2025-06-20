@@ -18,6 +18,7 @@ from torchbiggraph.train import train
 from torchbiggraph.util import SubprocessInitializer
 
 from sentence_transformers import SentenceTransformer
+from transformers import AutoConfig
 from configuration import TRex_DatasetConfig
 import socket
 
@@ -34,16 +35,6 @@ class BigGraphAligner:
         os.makedirs(f'{self.folder}', exist_ok=True)
         
         self.batch_size: int = batch_size
-            
-        self.embedder: SentenceTransformer = SentenceTransformer(
-            self.config.graph_nodes_embedding_model,
-            model_kwargs={
-                "attn_implementation": "flash_attention_2",
-                # "device_map": "cuda:0",
-                "torch_dtype": torch.float16
-            } if torch.cuda.is_available() else {},
-            tokenizer_kwargs={"padding_side": "left"},
-        )
         
         self.graphs: Dict[str, nx.DiGraph] = graphs
         
@@ -53,21 +44,34 @@ class BigGraphAligner:
         self.entity_index: Dict[str, np.array] = dict()   # Maps entity IDs to their embedding value
         self.relation_index: Dict[str, np.array] = dict() # Maps relation IDs to their embedding value
 
+        # embedder configuration
+        self.embedder: AutoConfig = AutoConfig.from_pretrained(self.config.graph_nodes_embedding_model)
+        # embedder dimension
+        self.embedder_dim: int = self.embedder.hidden_size
+        
         self.prepare()
         self.train()
         self.build_index()
         
-        # unload the embedder to free up memory
-        self.embedder = None
 
 
     def prepare(self):
-        if os.path.isfile(f'{self.folder}/init/embeddings_entity_0.v0.h5'):
+        if os.path.isfile(f'{self.folder}/init/embeddings_entity_0.v0.h5') and os.path.isfile(f'{self.folder}/init/embeddings_relation_0.v0.h5'):
             print("Already prepared")
             return
 
         print("Preparing BigGraphAligner...")
 
+        embedder: SentenceTransformer = SentenceTransformer(
+            self.config.graph_nodes_embedding_model,
+            model_kwargs={
+                "attn_implementation": "flash_attention_2",
+                "device_map": "cuda:0",
+                "torch_dtype": torch.float16
+            } if torch.cuda.is_available() else {},
+            tokenizer_kwargs={"padding_side": "left"},
+        )
+        
         os.makedirs(f'{self.folder}/init', exist_ok=True)
 
         entities = dict()
@@ -124,16 +128,37 @@ class BigGraphAligner:
         entity_labels = [entity[1] for entity in sorted_entity_list]
         all_embeddings = []
         
-        for i in tqdm(range(0, len(entity_labels), self.batch_size), desc='Encoding entity labels'):
-            batch_labels = entity_labels[i:i+self.batch_size]
-            batch_embeddings = self.embedder.encode(batch_labels, convert_to_tensor=True)
-            all_embeddings.append(batch_embeddings.cpu())
+        if not os.path.isfile(f'{self.folder}/init/embeddings_entity_0.v0.h5'):
+            for i in tqdm(range(0, len(entity_labels), self.batch_size), desc='Encoding entity labels'):
+                batch_labels = entity_labels[i:i+self.batch_size]
+                batch_embeddings = embedder.encode(batch_labels, convert_to_tensor=True)
+                # is any is nan breakpoint
+                if torch.isnan(batch_embeddings).any():
+                    breakpoint()
+                all_embeddings.append(batch_embeddings.cpu())
+            
+            # Save Entity embeddings
+            dataset = torch.cat(all_embeddings, dim=0)
+            with h5py.File(f'{self.folder}/init/embeddings_entity_0.v0.h5', 'w') as hf:
+                hf.create_dataset("embeddings", data=dataset.cpu().numpy(), dtype=np.float32)
+                hf.attrs[FORMAT_VERSION_ATTR] = FORMAT_VERSION
         
-        dataset = torch.cat(all_embeddings, dim=0)
+        if not os.path.isfile(f'{self.folder}/init/embeddings_relation_0.v0.h5'):
+            # Batch encode relations
+            all_embeddings = []
+            relation_labels = [relation[1] for relation in sorted_relation_list]
+            for i in tqdm(range(0, len(relation_labels), self.batch_size), desc='Encoding relation labels'):
+                batch_labels = relation_labels[i:i+self.batch_size]
+                batch_embeddings = embedder.encode(batch_labels, convert_to_tensor=True)
+                all_embeddings.append(batch_embeddings.cpu())
+            
+            # Save Relation embeddings
+            dataset = torch.cat(all_embeddings, dim=0)
+            with h5py.File(f'{self.folder}/init/embeddings_relation_0.v0.h5', 'w') as hf:
+                hf.create_dataset("embeddings", data=dataset.cpu().numpy(), dtype=np.float32)
+                hf.attrs[FORMAT_VERSION_ATTR] = FORMAT_VERSION
 
-        with h5py.File(f'{self.folder}/init/embeddings_entity_0.v0.h5', 'w') as hf:
-            hf.create_dataset("embeddings", data=dataset.cpu().numpy(), dtype=np.float32)
-            hf.attrs[FORMAT_VERSION_ATTR] = FORMAT_VERSION
+        print("BigGraphAligner prepared successfully.")
 
     def train(self):
         if self._use_untrained:
@@ -165,7 +190,7 @@ class BigGraphAligner:
             init_path=f"{self.folder}/init",
             dynamic_relations=True,
 
-            dimension=self.embedder.get_sentence_embedding_dimension(),  # Dimension of the embeddings
+            dimension=self.embedder_dim,  # Dimension of the embeddings
             global_emb=False,
             loss_fn="logistic",
             comparator="dot",
@@ -263,6 +288,9 @@ class BigGraphAligner:
         else:
             with h5py.File(f'{self.folder}/model_checkpoint/embeddings_entity_0.v{self.epochs}.h5', 'r') as hf:
                 trained_embeddings = hf['embeddings'][:]
+                
+        with h5py.File(f'{self.folder}/init/embeddings_relation_0.v{self.epochs}.h5', 'r') as hf:
+            trained_embeddings_rel = hf['embeddings'][:]
 
         total_entities = 0
         with open(f'{self.folder}/entities.csv', 'r') as file:
@@ -274,38 +302,42 @@ class BigGraphAligner:
                 total_entities += 1
 
         assert trained_embeddings.shape == (
-        total_entities, self.embedder.get_sentence_embedding_dimension()), "Trained embedding shape mismatch"
+        total_entities, self.embedder_dim), "Trained embedding shape mismatch"
 
         cpu = torch.device("cpu")
         with open(f'{self.folder}/relations.csv', 'r') as file:
             reader = csv.reader(file)
             next(reader)  # Skip the header row
-            #build relation index
-            print("Building relation index...")
-            relation_id_label = [(row[0], row[1]) for row in reader]
-            encoded_relations = self.embedder.encode(
-                [label for _, label in relation_id_label],
-                convert_to_tensor=True,
-            ).to(cpu)
-            
-            # Store the relation embeddings in the index
-            for i, (relation_id, _) in enumerate(relation_id_label):
-                self.relation_index[relation_id] = encoded_relations[i, :]
+            for i, row in tqdm(enumerate(reader), desc='Building relation index'):
+                relation_id, _ = row
+                self.relation_index[relation_id] = torch.from_numpy(trained_embeddings_rel[i, :]).to(cpu)
+
+        assert len(self.entity_index) > 0, "Entity index is empty"
+        assert len(self.relation_index) > 0, "Relation index is empty"
 
     def node_embedding(self, entity_id: str) -> torch.Tensor:
-        return self.entity_index.get(entity_id).to(self.embedder.device)
+        # check if NaN and break if so
+        if entity_id not in self.entity_index:
+            raise ValueError(f"Entity ID {entity_id} not found in the entity index.")
+        
+        # Return the embedding for the given entity ID
+        if torch.isnan(self.entity_index[entity_id]).any():
+            print(f"NaN found in entity ID {entity_id}, Substituting with zero vector.")
+            return torch.zeros(self.embedder_dim)
+            
+        return self.entity_index.get(entity_id)
 
     def edge_embedding(self, predicate_id: str) -> torch.Tensor:
-        return self.relation_index.get(predicate_id).to(self.embedder.device)
+        return self.relation_index.get(predicate_id)
 
     def node_embedding_batch(self, entity_ids: List[str]) -> torch.Tensor:
-        batch_embedding = torch.zeros((len(entity_ids), self.embedder.get_sentence_embedding_dimension())).to(self.embedder.device)
+        batch_embedding = torch.zeros((len(entity_ids), self.embedder_dim))
         for i, entity_id in enumerate(entity_ids):
             batch_embedding[i, :] = self.node_embedding(entity_id)
         return batch_embedding
 
     def edge_embedding_batch(self, predicate_ids: List[str]) -> torch.Tensor:
-        batch_embedding = torch.zeros((len(predicate_ids), self.embedder.get_sentence_embedding_dimension())).to(self.embedder.device)
+        batch_embedding = torch.zeros((len(predicate_ids), self.embedder_dim))
         for i, predicate_id in enumerate(predicate_ids):
             batch_embedding[i, :] = self.edge_embedding(predicate_id)
         return batch_embedding

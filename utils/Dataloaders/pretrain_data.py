@@ -134,10 +134,10 @@ class TriRexStarDataset(Dataset):
         num_neighbors = len(neighbour_ids)
         
         # Each neighbor connects to the central node
-        # Create edges: neighbors->central
+        # Create edges: neighbors->central and central->neighbors
         edge_index = torch.tensor([
-            list(range(1, num_neighbors + 1)),  # Neighbors to central node
-            [0] * num_neighbors  # Central node index (0)
+            list(range(1, num_neighbors + 1)) + [0] * num_neighbors,  # Neighbor nodes to central node
+            [0] * num_neighbors  + list(range(1, num_neighbors + 1))  # Central node to neighbor nodes
         ], dtype=torch.long)
         
         # Node features: central node + neighbor nodes
@@ -146,8 +146,8 @@ class TriRexStarDataset(Dataset):
             neighbour_node_embs  # Neighbor node embeddings
         ], dim=0)
         
-        # Edge features: duplicate for bidirectional edges
-        edge_features = torch.cat([edge_embs], dim=0)
+        # Edge features: duplicate for bidirectional edges (neighbors->central and central->neighbors)
+        edge_features = torch.cat([edge_embs, edge_embs], dim=0)
 
         # Create a PyTorch Geometric graph data object
         graph_data = Data(
@@ -251,11 +251,13 @@ class TriRexStarDataLoader:
         self.tokenizer = tokenizer
         
         # Load datasets
+        print("Loading TriREx and TRExStar datasets...")
         self.train_dataset, self.val_dataset, self.test_dataset = trirex_factory(dataset_config)
         self.star_graphs = trex_star_graphs_factory(dataset_config)
         
         self.collator = self._get_collator()
         
+        print("Loading BigGraphAligner...")
         # BigGraphAligner for graph processing
         self.big_graph_aligner = BigGraphAligner(
             graphs=self.star_graphs,
@@ -354,6 +356,7 @@ def create_dataloader(
     Returns:
         DataLoader for the specified split or a tuple of dataloaders for all splits.
     """
+    print(f"Creating dataloader for split")
     dataloader_factory = TriRexStarDataLoader(dataset_config, dataloader_config, tokenizer)
     
     if split == "train":
@@ -363,6 +366,7 @@ def create_dataloader(
     elif split == "test":
         return dataloader_factory.get_test_dataloader()
     elif split == "all":
+        print("Returning all dataloaders (train, val, test)...")
         train_loader, val_loader, test_loader = dataloader_factory.get_all_dataloaders()
         return train_loader, val_loader, test_loader
     else:

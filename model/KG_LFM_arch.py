@@ -103,6 +103,8 @@ class KG_LFMMetaModel(ABC):
 
         self.llm = AutoModelForCausalLM.from_pretrained(config.llm_model_name, trust_remote_code=True)
         
+        self.text_embs_std = self.llm.get_input_embeddings().weight.std().item()
+        
         self.llm_embedding_dim = self.llm.config.hidden_size
         
         # Initialize the KGEncoder with the specified dimensions
@@ -126,33 +128,93 @@ class KG_LFMMetaModel(ABC):
         
     @classmethod
     def load_pretrained(cls, model_path_or_config, *args, **kwargs):
-        raise NotImplementedError(
-            "This method should be implemented."
-        )
+        """
+        Loads a pretrained KG_LFM model from a specified directory.
+
+        This method reconstructs the model by:
+        1. Loading the KG_LFM configuration.
+        2. Initializing the model architecture (`cls`).
+        3. Loading the pretrained weights for the language model (`llm`).
+        4. Loading the pretrained weights for the knowledge graph encoder (`kg_encoder`).
+        5. Loading the correct tokenizer.
+        """
+        if not osp.isdir(model_path_or_config):
+            raise ValueError(f"The path '{model_path_or_config}' is not a valid directory.")
+
+        # Load the main configuration file for the KG_LFM model
+        config = KG_LFMConfig.from_pretrained(model_path_or_config, **kwargs)
+
+        # Initialize the model instance (e.g., KG_LFM) using the loaded config.
+        # This will call `init_KGLM` and create the base architecture.
+        model = cls(config, *args, **kwargs)
+
+        # Load the pretrained language model from the 'llm' subdirectory
+        llm_path = osp.join(model_path_or_config, "llm")
+        if osp.exists(llm_path):
+            logging.info(f"Loading pretrained LLM from {llm_path}")
+            model.llm = AutoModelForCausalLM.from_pretrained(llm_path, trust_remote_code=True)
+        else:
+            warnings.warn(
+                f"LLM directory not found at {llm_path}. "
+                "The model will use the base LLM initialized from the config's `llm_model_name`."
+            )
+            
+        # Load the tokenizer from the 'llm' subdirectory to ensure it matches the saved model
+        if osp.exists(llm_path):
+            logging.info(f"Loading tokenizer from {llm_path}")
+            model.tokenizer = AutoTokenizer.from_pretrained(llm_path, trust_remote_code=True)
+
+        # Load the state dictionary for the KG Encoder
+        kg_encoder_path = osp.join(model_path_or_config, "kg_encoder.pth")
+        if osp.exists(kg_encoder_path):
+            logging.info(f"Loading pretrained KG Encoder from {kg_encoder_path}")
+            kg_encoder_state_dict = torch.load(kg_encoder_path, map_location='cpu')
+            model.get_kg_encoder().load_state_dict(kg_encoder_state_dict)
+        else:
+            warnings.warn(
+                f"KG Encoder weights not found at {kg_encoder_path}. "
+                "The model will use a randomly initialized KG Encoder."
+            )
+
+        model.is_loaded = True
+        return model
+
 
     def save_pretrained(self, output_dir, state_dict=None):
         if state_dict is None:
             state_dict = self.state_dict()
         
-        if getattr(self, "tokenizer", None):
-            self.tokenizer.save_pretrained(osp.join(output_dir, "llm"))
-
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Define specific paths for components
+        llm_dir = osp.join(output_dir, "llm")
+        kg_encoder_path = osp.join(output_dir, "kg_encoder.pth")
+        
+        # Save tokenizer and llm config/weights
         if self.get_llm():
-            print(f"saving llm to {osp.join(output_dir, 'llm')}")
-            self.llm.config._name_or_path = osp.join(output_dir, "llm")
-            llm_state_dict = OrderedDict({k.split("llm.")[-1]: v for k, v in state_dict.items() if "llm" in k})
-            self.llm.save_pretrained(os.path.join(output_dir, "llm"), state_dict=llm_state_dict)
+            logging.info(f"Saving LLM and tokenizer to {llm_dir}")
+            # The tokenizer is part of the class, save it to the same directory as the llm
+            if getattr(self, "tokenizer", None):
+                self.tokenizer.save_pretrained(llm_dir)
+            
+            self.llm.config._name_or_path = llm_dir
+            llm_state_dict = OrderedDict({k.split("llm.")[-1]: v for k, v in state_dict.items() if "llm." in k})
+            self.llm.save_pretrained(llm_dir, state_dict=llm_state_dict)
 
+        # Save KG encoder weights
         if self.get_kg_encoder():
-            print(f"saving kg_encoder to {osp.join(output_dir, 'kg_encoder')}")
+            logging.info(f"Saving KG Encoder to {kg_encoder_path}")
             kg_encoder_state_dict = OrderedDict(
-                {k.split("kg_encoder.")[-1]: v for k, v in state_dict.items() if "kg_encoder" in k}
+                {k.split("kg_encoder.")[-1]: v for k, v in state_dict.items() if "kg_encoder." in k}
             )
-            torch.save(kg_encoder_state_dict, f"{output_dir}/kg_encoder.pth")
+            torch.save(kg_encoder_state_dict, kg_encoder_path)
 
+        # Save the main model config
         self.config._name_or_path = output_dir
         self.config.architectures = [self.__class__.__name__]
         self.config.save_pretrained(output_dir)
+
 
     def get_llm(self):
         llm = getattr(self, "llm", None)
@@ -181,6 +243,7 @@ class KG_LFMMetaModel(ABC):
             logging.info("Freezed llm model to eval mode.")
         if self.get_kg_encoder() and not getattr(self.config, "tune_kg_encoder", False):
             self.get_kg_encoder().eval()
+            logging.info("Freezed kg_encoder model to eval mode.")
     
     def encode_graphs(self, graphs):
         kg_encoder = self.get_kg_encoder()
@@ -218,45 +281,41 @@ class KG_LFMMetaForCausalLM(ABC):
         4. Managing attention masks and position IDs for the modified sequences
         """
         kg_encoder = self.get_kg_encoder()
+        RVQ_loss = None
         
         # Early return for cases where no multimodal processing is needed
-        if kg_encoder is None or graphs is None or input_ids.shape[1] == 1:
-            # Handle generation case where we have past key values and single token input
-            if (
-                past_key_values is not None
-                and kg_encoder is not None
-                and graphs is not None
-                and input_ids.shape[1] == 1
-            ):
-                # Extend attention mask to account for cached key-value pairs
-                target_shape = past_key_values[-1][-1].shape[-2] + 1
-                attention_mask = torch.cat(
-                    (
-                        attention_mask,
-                        torch.ones(
-                            (
-                                attention_mask.shape[0],
-                                target_shape - attention_mask.shape[1],
-                            ),
-                            dtype=attention_mask.dtype,
-                            device=attention_mask.device,
-                        ),
-                    ),
-                    dim=1,
-                )
-                # Update position IDs to point to the last valid position
-                position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
+        if kg_encoder is None or graphs is None or not any(self.special_kg_token in x for x in input_ids):
             return (
                 input_ids,
                 position_ids,
                 attention_mask,
                 past_key_values,
-                None,  # No input embeddings needed
+                self.get_input_embeddings()(input_ids), # Return standard embeddings
                 labels,
+                RVQ_loss,
             )
+
+        # Handle generation case (input_ids.shape[1] == 1)
+        if input_ids.shape[1] == 1:
+            if past_key_values is not None:
+                 # In generation, graph embeddings are already in the cache, so just process the new token
+                return (
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    past_key_values,
+                    None,
+                    labels,
+                    RVQ_loss,
+                )
+            else:
+                 # This branch should not be hit in typical autoregressive generation after the first step
+                 pass
+
 
         # Encode the knowledge graphs into embeddings that will replace KG tokens
         graph_features, _, RVQ_loss = kg_encoder(graphs)
+        graph_features = graph_features.to(self.llm.dtype)
 
         # Store original inputs for later reference
         _labels = labels
@@ -287,90 +346,99 @@ class KG_LFMMetaForCausalLM(ABC):
 
         # Extract valid tokens based on attention mask for each sample in the batch
         # This removes padding tokens from processing
-        input_ids = [
+        input_ids_unpadded = [
             cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)
         ]
-        input_embeds_1 = [
+        input_embeds_unpadded = [
             cur_input_embeds[cur_attention_mask]
             for cur_input_embeds, cur_attention_mask in zip(input_embeds, attention_mask)
         ]
-        labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
+        labels_unpadded = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
 
         # Lists to store the final processed embeddings and labels
         new_input_embeds = []
         new_labels = []
         
         # Process each sample in the batch individually
-        for batch_idx, cur_input_ids in enumerate(input_ids):
+        for batch_idx, cur_input_ids in enumerate(input_ids_unpadded):
             # Count how many KG tokens are in this sample
             num_kg_tokens = (cur_input_ids == self.special_kg_token).sum()
             
             if num_kg_tokens == 0:
                 # No KG tokens found, just use the original text embeddings
-                cur_input_embeds_1 = input_embeds_1[batch_idx]
-                new_input_embeds.append(cur_input_embeds_1)
-                new_labels.append(labels[batch_idx])
+                new_input_embeds.append(input_embeds_unpadded[batch_idx])
+                new_labels.append(labels_unpadded[batch_idx])
                 continue
 
             # Get the current embeddings and labels for this sample
-            cur_input_embeds = input_embeds_1[batch_idx]
+            cur_input_embeds = input_embeds_unpadded[batch_idx]
             
             # Find positions of KG tokens and create segments between them
             # Add -1 at start and sequence length at end to handle boundaries
             kg_token_indices = (
-                [-1] + torch.where(cur_input_ids == self.special_kg_token)[0].tolist() + [cur_input_ids.shape[0]]
+                [-1] + torch.where(cur_input_ids == self.special_kg_token)[0].tolist()
             )
-            cur_labels = labels[batch_idx]
+            cur_labels = labels_unpadded[batch_idx]
 
             # Split the sequence into segments: text before first KG token, between KG tokens, after last KG token
-            cur_input_ids_nokg = []
-            cur_labels_nokg = []
-            cur_input_embeds_no_kg = []
+            text_segments = []
+            label_segments = []
+            
+            # Extract text segments
+            for i in range(len(kg_token_indices)):
+                start_idx = kg_token_indices[i] + 1
+                end_idx = kg_token_indices[i+1] if i + 1 < len(kg_token_indices) else cur_input_ids.shape[0]
+                text_segments.append(cur_input_embeds[start_idx:end_idx])
+                label_segments.append(cur_labels[start_idx:end_idx])
+            
+            # Handle text after the last KG token
+            last_kg_idx = kg_token_indices[-1]
+            if last_kg_idx + 1 < cur_input_ids.shape[0]:
+                text_segments.append(cur_input_embeds[last_kg_idx + 1:])
+                label_segments.append(cur_labels[last_kg_idx + 1:])
+            else: # Append empty tensors to maintain structure
+                text_segments.append(torch.tensor([], device=cur_input_embeds.device, dtype=cur_input_embeds.dtype).reshape(0, cur_input_embeds.shape[1]))
+                label_segments.append(torch.tensor([], device=cur_labels.device, dtype=cur_labels.dtype))
 
-            # Extract segments between KG tokens (excluding the KG tokens themselves)
-            for i in range(len(kg_token_indices) - 1):
-                cur_input_ids_nokg.append(cur_input_ids[kg_token_indices[i] + 1 : kg_token_indices[i + 1]])
-                cur_labels_nokg.append(cur_labels[kg_token_indices[i] + 1 : kg_token_indices[i + 1]])
-                cur_input_embeds_no_kg.append(cur_input_embeds[kg_token_indices[i] + 1 : kg_token_indices[i + 1]])
 
             # Reconstruct the sequence by interleaving text segments with graph embeddings
             cur_new_input_embeds = []
             cur_new_labels = []
 
-            for i in range(num_kg_tokens + 1):
-                # Add the text segment
-                cur_new_input_embeds.append(cur_input_embeds_no_kg[i])
-                cur_new_labels.append(cur_labels_nokg[i])
+            for i in range(num_kg_tokens):
+                cur_new_input_embeds.append(text_segments[i])
+                cur_new_labels.append(label_segments[i])
                 
-                # Insert graph embedding after each text segment (except the last one)
-                if i < num_kg_tokens:
-                    # Get the graph features for this batch sample and add batch dimension
-                    cur_graph_features = graph_features[batch_idx] #TODO: not sure if this is correct
-                    cur_new_input_embeds.append(cur_graph_features)
-                    
-                    # Mark graph embedding positions to be ignored in loss calculation
-                    # Graph embeddings should not contribute to language modeling loss
-                    cur_new_labels.append(
-                        torch.full(
-                            (cur_graph_features.shape[0],),
-                            IGNORE_INDEX,
-                            device=cur_labels.device,
-                            dtype=cur_labels.dtype,
-                        )
+                # Insert graph embedding
+                cur_graph_feature = graph_features[batch_idx] # Select graph for this sample
+                cur_new_input_embeds.append(cur_graph_feature)
+                
+                # Mark graph embedding positions to be ignored in loss calculation
+                cur_new_labels.append(
+                    torch.full(
+                        (cur_graph_feature.shape[0],),
+                        IGNORE_INDEX,
+                        device=cur_labels.device,
+                        dtype=cur_labels.dtype,
                     )
+                )
+
+            # Append the final text segment
+            cur_new_input_embeds.append(text_segments[-1])
+            cur_new_labels.append(label_segments[-1])
 
             # Concatenate all segments and graph embeddings into final sequence
-            cur_new_input_embeds = torch.cat(cur_new_input_embeds)
-            cur_new_labels = torch.cat(cur_new_labels)
+            cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
+            cur_new_labels = torch.cat(cur_new_labels, dim=0)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
         # Handle sequence length limits by truncating if necessary
-        tokenizer_model_max_length = getattr(self.llm.config, "tokenizer_model_max_length", None)
+        tokenizer_model_max_length = getattr(self.llm.config, "model_max_length", None)
         if tokenizer_model_max_length is not None:
             if any(len(x) > tokenizer_model_max_length for x in new_input_embeds):
-                warnings.warn("Inputs truncated!")
+                warnings.warn("Inputs truncated due to model_max_length!")
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
 
@@ -379,7 +447,11 @@ class KG_LFMMetaForCausalLM(ABC):
         batch_size = len(new_input_embeds)
 
         # Initialize padded tensors with appropriate default values
-        new_input_embeds_padded = []
+        new_input_embeds_padded = torch.zeros(
+            (batch_size, max_len, new_input_embeds[0].shape[1]),
+            dtype=new_input_embeds[0].dtype,
+            device=new_input_embeds[0].device
+        )
         new_labels_padded = torch.full(
             (batch_size, max_len),
             IGNORE_INDEX,  # Padded positions should be ignored in loss
@@ -389,11 +461,15 @@ class KG_LFMMetaForCausalLM(ABC):
         # Create new attention mask for the modified sequences
         attention_mask = torch.zeros(
             (batch_size, max_len),
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
+            dtype=_attention_mask.dtype if _attention_mask is not None else torch.long,
+            device=input_ids.device,
         )
         # Create new position IDs for the modified sequences
-        position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
+        position_ids = torch.zeros(
+            (batch_size, max_len), 
+            dtype=_position_ids.dtype if _position_ids is not None else torch.long, 
+            device=input_ids.device
+        )
 
         # Pad each sequence and update corresponding masks and position IDs
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
@@ -401,53 +477,16 @@ class KG_LFMMetaForCausalLM(ABC):
             
             # Handle left padding (useful for some model architectures)
             if getattr(self.llm.config, "tokenizer_padding_side", "right") == "left":
-                # Pad embeddings on the left side with zeros
-                new_input_embeds_padded.append(
-                    torch.cat(
-                        (
-                            torch.zeros(
-                                (max_len - cur_len, cur_new_embed.shape[1]),
-                                dtype=cur_new_embed.dtype,
-                                device=cur_new_embed.device,
-                            ),
-                            cur_new_embed,
-                        ),
-                        dim=0,
-                    )
-                )
-                # Update labels, attention mask, and position IDs for left padding
-                if cur_len > 0:
-                    new_labels_padded[i, -cur_len:] = cur_new_labels
-                    attention_mask[i, -cur_len:] = True
-                    position_ids[i, -cur_len:] = torch.arange(
-                        0, cur_len, dtype=position_ids.dtype, device=position_ids.device
-                    )
+                new_input_embeds_padded[i, -cur_len:] = cur_new_embed
+                new_labels_padded[i, -cur_len:] = cur_new_labels
+                attention_mask[i, -cur_len:] = 1
+                position_ids[i, -cur_len:] = torch.arange(0, cur_len, device=position_ids.device)
             else:
                 # Handle right padding (default case)
-                # Pad embeddings on the right side with zeros
-                new_input_embeds_padded.append(
-                    torch.cat(
-                        (
-                            cur_new_embed,
-                            torch.zeros(
-                                (max_len - cur_len, cur_new_embed.shape[1]),
-                                dtype=cur_new_embed.dtype,
-                                device=cur_new_embed.device,
-                            ),
-                        ),
-                        dim=0,
-                    )
-                )
-                # Update labels, attention mask, and position IDs for right padding
-                if cur_len > 0:
-                    new_labels_padded[i, :cur_len] = cur_new_labels
-                    attention_mask[i, :cur_len] = True
-                    position_ids[i, :cur_len] = torch.arange(
-                        0, cur_len, dtype=position_ids.dtype, device=position_ids.device
-                    )
-
-        # Stack all padded embeddings into a single batch tensor
-        new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+                new_input_embeds_padded[i, :cur_len] = cur_new_embed
+                new_labels_padded[i, :cur_len] = cur_new_labels
+                attention_mask[i, :cur_len] = 1
+                position_ids[i, :cur_len] = torch.arange(0, cur_len, device=position_ids.device)
 
         # Preserve None values for optional inputs that were originally None
         if _labels is None:
@@ -457,9 +496,6 @@ class KG_LFMMetaForCausalLM(ABC):
 
         if _attention_mask is None:
             attention_mask = None
-        else:
-            # Ensure attention mask has the same dtype as the original
-            attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 
         if _position_ids is None:
             position_ids = None
@@ -470,7 +506,7 @@ class KG_LFMMetaForCausalLM(ABC):
             position_ids,
             attention_mask,
             past_key_values,
-            new_input_embeds,  # The main output: text + graph embeddings
+            new_input_embeds_padded,  # The main output: text + graph embeddings
             new_labels,
             RVQ_loss,  # Return the RVQ loss for training purposes
         )
@@ -490,22 +526,36 @@ class KG_LFMMetaForCausalLM(ABC):
             input_ids (torch.Tensor): Input token IDs for the language model.
             graphs (Batch): A batch of graphs from PyTorch Geometric.
             attention_mask (Optional[torch.Tensor]): Attention mask for the input tokens.
-            cfg (Optional[float]): Guidance scale for controlled generation.
             **generation_kwargs: Additional keyword arguments for generation.
         
         Returns:
             torch.Tensor: Generated token IDs.
         """
-        if graphs is not None:
-            (_, _, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(
-                input_ids, None, attention_mask, None, None, graphs
-            )
-        else:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+        # Prepare the initial embeddings by combining text and graph data
+        (
+            _,
+            position_ids,
+            attention_mask,
+            _,
+            inputs_embeds,
+            _,
+            _
+        ) = self.prepare_inputs_labels_for_multimodal(
+            input_ids, None, attention_mask, None, None, graphs
+        )
         
-        inputs_embeds = inputs_embeds.to(self.dtype)
+        inputs_embeds = inputs_embeds.to(self.llm.dtype)
 
-        outputs = self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        # Set default generation config if not provided
+        gen_config = self.default_generation_config
+        for key, value in generation_kwargs.items():
+            setattr(gen_config, key, value)
+
+        outputs = self.llm.generate(
+            inputs_embeds=inputs_embeds, 
+            attention_mask=attention_mask, 
+            generation_config=gen_config
+        )
 
         return outputs
      
@@ -529,19 +579,25 @@ class KG_LFMMetaForCausalLM(ABC):
         """
         Returns the default generation configuration for the KG_LFM model.
         
-        This method retrieves the generation configuration from the underlying LLM model.
+        This method retrieves the generation configuration from the underlying LLM model
+        and sets sensible defaults if they are missing.
         """
         generation_config = copy.deepcopy(self.llm.generation_config)
-        if self.tokenizer.eos_token is None:
-            raise ValueError("The tokenizer does not have an end-of-sequence token defined. Please set the eos_token in the tokenizer.")
-        if generation_config.max_length == GenerationConfig().max_length:
-            generation_config.max_length = self.tokenizer.model_max_length
+        
+        if generation_config.max_length == 20: # Default value in base GenerationConfig
+            generation_config.max_length = self.tokenizer.model_max_length or 2048
+            
         if generation_config.pad_token_id is None:
             generation_config.pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-        if generation_config.bos_token_id is None:
-            generation_config.bos_token_id = self.tokenizer.bos_token_id or self.tokenizer.eos_token_id
+            
         if generation_config.eos_token_id is None:
-            generation_config.eos_token_id = self.tokenizer.convert_tokens_to_ids(infer_stop_tokens(self.tokenizer))
+            eos_tokens = infer_stop_tokens(self.tokenizer)
+            if eos_tokens:
+                generation_config.eos_token_id = self.tokenizer.convert_tokens_to_ids(eos_tokens[0])
+
+        if generation_config.bos_token_id is None:
+             generation_config.bos_token_id = self.tokenizer.bos_token_id
+             
         return generation_config
 
 
@@ -564,17 +620,23 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         super(KG_LFM, self).__init__(config)
         self.config = config
         
-        # Initialize components
+        # Initialize components. This will create self.llm and self.kg_encoder
         self.init_KGLM(config)
         
-        
+        # Initialize the tokenizer. It might be overwritten by load_pretrained if a custom one was saved.
         self.tokenizer : PreTrainedTokenizer = AutoTokenizer.from_pretrained(
             config.llm_model_name, 
             trust_remote_code=True
         )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         if "<KG_EMBEDDING>" not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens({"additional_special_tokens": ["<KG_EMBEDDING>"]})
-        self.special_kg_token = self.tokenizer.encode("<KG_EMBEDDING>", add_special_tokens=False)[0]
+            # Important: resize token embeddings in the LLM to account for the new token
+            self.llm.resize_token_embeddings(len(self.tokenizer))
+            
+        self.special_kg_token = self.tokenizer.convert_tokens_to_ids("<KG_EMBEDDING>")
         
         
     @classmethod
@@ -582,15 +644,17 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         """
         Load a pre-trained KG_LFM model from the specified path.
         
+        This method serves as a convenient entry point and delegates the core
+        loading logic to the `load_pretrained` method implemented in the MetaModel.
+        
         Args:
-            pretrained_model_name_or_path (str): Path to the pre-trained model.
+            pretrained_model_name_or_path (str): Path to the pre-trained model directory.
             *model_args: Additional positional arguments for the model.
             **kwargs: Additional keyword arguments for the model.
         
         Returns:
-            KG_LFM: An instance of the KG_LFM model.
+            KG_LFM: An instance of the loaded KG_LFM model.
         """
-        
         return cls.load_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
     
     def forward(
@@ -611,6 +675,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         Forward pass of the KG_LFM model.
         """
         
+        RVQ_loss = None
         if inputs_embeds is None:
             (
                 input_ids,
@@ -645,12 +710,13 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
             return_dict=return_dict,
         )
         
-        # If RVQ_loss is not None, add it to the output
-        if return_dict:
-            if hasattr(out, "loss"):
-                out.loss = out.loss + RVQ_loss if RVQ_loss is not None else out.loss
-        else:
-            out = (out[0] + RVQ_loss,) + out[1:] if RVQ_loss is not None else out
+        # If RVQ_loss is not None, add it to the model's loss for training
+        if return_dict and hasattr(out, "loss") and out.loss is not None:
+            if RVQ_loss is not None:
+                out["RVQ_loss"] = RVQ_loss
+        elif not return_dict and out[0] is not None:
+             if RVQ_loss is not None:
+                out = (out[0] + RVQ_loss,) + out[1:]
             
         return out
         
