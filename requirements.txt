@@ -14,3 +14,4 @@ pyyaml
 wandb
 torchbiggraph
 deepspeed
+psutil
