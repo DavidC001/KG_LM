@@ -3,17 +3,13 @@
 Training script for KG-LFM with wandb logging, checkpointing, and better validation.
 """
 
-import os
 import logging
 import argparse
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import gc
-import psutil
-import threading
-import time
 
 import torch
 import torch.nn as nn
@@ -23,13 +19,15 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 import wandb
 from tqdm.auto import tqdm
-import numpy as np
 
 # Assuming these are defined in your project structure
 from configuration import load_yaml_config, ProjectConfig
 from model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
 from utils.Dataloaders.pretrain_data import create_dataloader
 
+# silence warnings
+import warnings
+warnings.filterwarnings("ignore")
 
 class MetricsTracker:
     """Track and compute running averages of metrics using defaultdict."""
@@ -168,33 +166,19 @@ class KG_LFM_Trainer:
         # Check if we're using distributed training
         distributed = self.accelerator.num_processes > 1
         
-        # Create dataloader factory first
-        from utils.Dataloaders.pretrain_data import TriRexStarDataLoader
-        self.dataloader_factory = TriRexStarDataLoader(
+        train, val, test = create_dataloader(
             self.config.dataset,
             self.config.pretrain_conf.dataloader,
-            self.model.tokenizer,
-            distributed=distributed
+            tokenizer=self.model.tokenizer,
+            distributed=distributed,
+            split="all",
         )
         
-        # Get the dataloaders
-        self.train_dataloader = self.dataloader_factory.get_train_dataloader()
-        self.val_dataloader = self.dataloader_factory.get_val_dataloader()
-        self.test_dataloader = self.dataloader_factory.get_test_dataloader()
+        self.train_dataloader = train
+        self.val_dataloader = val
+        self.test_dataloader = test
         
-        if distributed:
-            self.accelerator.print(f"Using distributed dataloading with {self.accelerator.num_processes} processes")
-            self.accelerator.print(f"Train dataset size: {len(self.train_dataloader.dataset)} samples")
-            self.accelerator.print(f"Train batches per process: {len(self.train_dataloader)} batches")
-            self.accelerator.print(f"Validation dataset size: {len(self.val_dataloader.dataset)} samples") 
-            self.accelerator.print(f"Validation batches per process: {len(self.val_dataloader)} batches")
-        else:
-            self.accelerator.print("Using single-process dataloading")
-            self.accelerator.print(f"Train dataset size: {len(self.train_dataloader.dataset)} samples")
-            self.accelerator.print(f"Train batches: {len(self.train_dataloader)} batches")
-            self.accelerator.print(f"Validation dataset size: {len(self.val_dataloader.dataset)} samples")
-            self.accelerator.print(f"Validation batches: {len(self.val_dataloader)} batches")
-
+        
     def setup_optimizer_and_scheduler(self, num_epochs: int):
         """Setup optimizer and learning rate scheduler with warmup."""
         self.accelerator.print("Setting up optimizer and scheduler...")
@@ -277,18 +261,23 @@ class KG_LFM_Trainer:
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process)):
-                outputs = self.model(
-                    input_ids=batch['input_ids'],
-                    graphs=batch['graphs'],
-                    attention_mask=batch['attention_mask'],
-                    labels=batch['input_ids'],
-                    use_cache=False,
-                )
-                
-                # Gather loss across all devices
-                loss = self.accelerator.gather(outputs.loss).mean()
-                metrics = self.compute_metrics(loss)
-                metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                try:
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        graphs=batch['graphs'],
+                        attention_mask=batch['attention_mask'],
+                        labels=batch['input_ids'],
+                        use_cache=False,
+                    )
+                    
+                    # Gather loss across all devices
+                    loss = self.accelerator.gather(outputs.loss).mean()
+                    metrics = self.compute_metrics(loss)
+                    metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in evaluation step {batch_idx + 1}: {e}")
+                    continue
         
         # Wait for all processes to complete evaluation before returning
         self.accelerator.wait_for_everyone()
@@ -313,51 +302,78 @@ class KG_LFM_Trainer:
 
         loss = torch.tensor(0.0, device=self.device)
         
+        # Add periodic synchronization to prevent hanging
+        sync_frequency = max(1, len(self.train_dataloader) // 5)  # Sync every 20% of epoch
+
         for step, batch in enumerate(progress_bar):
-            
-            outputs = self.model(
-                input_ids=batch['input_ids'],
-                graphs=batch['graphs'],
-                attention_mask=batch['attention_mask'],
-                labels=batch['input_ids'],
-                use_cache=False,
-            )
-            
-            language_loss = outputs.loss
-            RVQ_loss = outputs.RVQ_loss
-            
-            # Check if any of the two is nan
-            if torch.isnan(language_loss) or torch.isnan(RVQ_loss) or torch.isinf(language_loss) or torch.isinf(RVQ_loss):
-                self.accelerator.print(f"NaN or inf detected in losses at step {step + 1}. Skipping this batch.")
-                continue
-            
-            loss += (language_loss + RVQ_loss) / self.grad_accumulation_steps
-            
-            if (step + 1) % self.grad_accumulation_steps == 0:
-                self.accelerator.backward(loss)
+            try:
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    graphs=batch['graphs'],
+                    attention_mask=batch['attention_mask'],
+                    labels=batch['input_ids'],
+                    use_cache=False,
+                )
                 
-                # Clip gradients to prevent exploding gradients
-                if self.config.pretrain_conf.clip_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.pretrain_conf.clip_grad_norm)
+                language_loss = outputs.loss
+                RVQ_loss = outputs.RVQ_loss
                 
-                self.optimizer.step()
-                self.update_learning_rate(self.global_step)
+                # Check if any of the two is nan
+                if torch.isnan(language_loss) or torch.isnan(RVQ_loss) or torch.isinf(language_loss) or torch.isinf(RVQ_loss):
+                    self.accelerator.print(f"NaN or inf detected in losses at step {step + 1}. Skipping this batch.")
+                    continue
+                
+                loss += (language_loss + RVQ_loss) / self.grad_accumulation_steps
+                
+                if (step + 1) % self.grad_accumulation_steps == 0:
+                    self.accelerator.backward(loss)
+                    
+                    # Clip gradients to prevent exploding gradients
+                    if self.config.pretrain_conf.clip_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.pretrain_conf.clip_grad_norm)
+                    
+                    self.optimizer.step()
+                    self.update_learning_rate(self.global_step)
+                    self.optimizer.zero_grad()
+                    
+                    if self.accelerator.sync_gradients:
+                        self.global_step += 1
+                        metrics = self.compute_metrics(loss)
+                        metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                        
+                        log_metrics = {f"train/{k}": v for k, v in metrics.items()}
+                        self.accelerator.log(log_metrics, step=self.global_step)
+                        
+                        progress_bar.set_postfix({
+                            'loss': f"{metrics['loss']:.4f}",
+                            'lr': f"{metrics['learning_rate']:.2e}",
+                        })
+
+                    loss = torch.tensor(0.0, device=self.device)
+                
+                # Periodic synchronization to prevent deadlocks
+                if (step + 1) % sync_frequency == 0:
+                    self.accelerator.wait_for_everyone()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+            except Exception as e:
+                self.logger.error(f"Error in training step {step + 1}: {e}")
+                self.accelerator.print(f"Skipping batch {step + 1} due to error: {e}")
+                
+                # Reset loss accumulation
+                loss = torch.tensor(0.0, device=self.device)
+                
+                # Clear any partially accumulated gradients
                 self.optimizer.zero_grad()
                 
-                if self.accelerator.sync_gradients:
-                    self.global_step += 1
-                    metrics = self.compute_metrics(loss)
-                    metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    
-                    log_metrics = {f"train/{k}": v for k, v in metrics.items()}
-                    self.accelerator.log(log_metrics, step=self.global_step)
-                    
-                    progress_bar.set_postfix({
-                        'loss': f"{metrics['loss']:.4f}",
-                        'lr': f"{metrics['learning_rate']:.2e}",
-                    })
-
-                loss = torch.tensor(0.0, device=self.device)
+                # Force synchronization after error
+                try:
+                    self.accelerator.wait_for_everyone()
+                except:
+                    pass
+                
+                continue
         
         return metrics_tracker.get_averages()
     
@@ -416,6 +432,44 @@ class KG_LFM_Trainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+    def handle_nccl_error(self, error: Exception, step: int) -> bool:
+        """
+        Handle NCCL communication errors gracefully.
+        Returns True if training should continue, False if it should stop.
+        """
+        error_str = str(error).lower()
+        
+        if 'nccl' in error_str or 'timeout' in error_str or 'collective' in error_str:
+            self.logger.error(f"NCCL communication error at step {step}: {error}")
+            self.accelerator.print(f"NCCL error detected at step {step}. Attempting recovery...")
+            
+            try:
+                # Clear any pending operations
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                
+                # Force cleanup of any hanging collective operations
+                if hasattr(torch.distributed, 'destroy_process_group'):
+                    try:
+                        torch.distributed.barrier(timeout=timedelta(seconds=30))
+                    except:
+                        pass
+                
+                # Reset optimizer state to clear any accumulated gradients
+                self.optimizer.zero_grad()
+                
+                self.accelerator.print("NCCL error recovery attempted. Continuing training...")
+                return True
+                
+            except Exception as recovery_error:
+                self.logger.error(f"Failed to recover from NCCL error: {recovery_error}")
+                self.accelerator.print("NCCL error recovery failed. Stopping training.")
+                return False
+        
+        # For non-NCCL errors, re-raise
+        raise error
 
     def train(self):
         """Main training loop."""
@@ -490,14 +544,18 @@ class KG_LFM_Trainer:
                 break
         
         self.accelerator.print("Training finished. Evaluating on the test set with the best model.")
-        self.run_test_evaluation()
+        # Wait for all processes before test evaluation
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self.run_test_evaluation()
+        self.accelerator.wait_for_everyone()
 
         self.accelerator.end_training()
         self.logger.info("Training process completed.")
 
     def run_test_evaluation(self):
         """Load the best model and evaluate on the test set."""
-        if self.test_dataloader and self.accelerator.is_main_process:
+        if self.test_dataloader:
             best_model_path = self.checkpoint_dir / "best_model"
             if best_model_path.exists():
                 self.accelerator.print(f"Loading best model from {best_model_path} for test evaluation.")
@@ -525,6 +583,8 @@ class KG_LFM_Trainer:
                 self.accelerator.log(final_log)
             else:
                 self.accelerator.print("No best model found to evaluate on the test set.")
+        else:
+            self.accelerator.print("Skipping test evaluation.")
 
 
 def main():
