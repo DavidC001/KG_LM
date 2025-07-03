@@ -1,17 +1,13 @@
-import json
-import random
 from typing import Dict, List, Optional, Union, Tuple, Any
-from dataclasses import dataclass
 import warnings
 
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from torch.nn.utils.rnn import pad_sequence
 import networkx as nx
 from datasets import Dataset as HFDataset
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from utils.Datasets.factory import trirex_factory, trex_star_factory, trex_star_graphs_factory
+from utils.Datasets.factory import trirex_factory, trex_star_graphs_factory
 from utils.BigGraphNodeEmb import BigGraphAligner
 
 from configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig
@@ -107,7 +103,7 @@ class TriRexStarDataset(Dataset):
             
         return result
     
-    def _process_graph(self, graph: nx.DiGraph) -> Data:
+    def _process_graph(self, graph: str) -> Data:
         """
         Process and potentially sample the graph based on configuration.
         

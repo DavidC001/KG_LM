@@ -47,16 +47,14 @@ class TRex_DatasetConfig:
     
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Is set to the same as the one used in the model config."""
-    big_graph_training_epochs: int = 0
-    """Number of epochs for training on big graphs. Originally 1000. Set to 0 to use untrained embeddings."""
+    
+    preload_nodes_embeddings: bool = True
+    """Whether to preload graph nodes embeddings into memory for faster access during training."""
     
     def __post_init__(self):
         # Ensure that the base path is set correctly
         assert os.path.exists(self.base_path), f"Base path {self.base_path} does not exist."
         assert os.path.exists(self.graph_embs_base_path), f"Graph embeddings path {self.graph_embs_base_path} does not exist."
-        
-        # Ensure that the graph nodes embedding model is set correctly
-        assert self.big_graph_training_epochs >= 0, "big_graph_training_epochs must be non-negative."
 
 @dataclass
 class TriRex_DataLoaderConfig():
@@ -68,7 +66,7 @@ class TriRex_DataLoaderConfig():
     shuffle: bool = True
     num_workers: int = 0
     
-    max_sequence_length: int = 512
+    max_sequence_length: int = None
     include_graphs: bool = True
     
     # Collation options
@@ -88,6 +86,7 @@ class TriRex_DataLoaderConfig():
     
     persistent_workers: bool = True
     """Whether to keep data loading workers alive between epochs to avoid startup overhead."""
+    
     
 @dataclass
 class ModelConfig:

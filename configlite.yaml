@@ -6,7 +6,7 @@ dataset:
   lite: True
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
-  big_graph_training_epochs: 0
+  preload_nodes_embeddings: False  # Use memory-mapped files instead of loading into memory
 
 pretrain_conf:
   run_name: "pretrain_trirex_lite"
@@ -22,7 +22,7 @@ pretrain_conf:
   weight_decay: 0.01
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
-  checkpoint_frequency: 1
+  checkpoint_frequency: 5
   
   resume : True
 

@@ -6,10 +6,10 @@ dataset:
   lite: False
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
-  big_graph_training_epochs: 0
+  preload_nodes_embeddings: False
 
 pretrain_conf:
-  run_name: "pretrain_trirex_lite"
+  run_name: "pretrain_trirex"
     
   epochs: 30
   early_stopping_patience: 3
@@ -22,14 +22,14 @@ pretrain_conf:
   weight_decay: 0.01
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
-  checkpoint_frequency: 1
+  checkpoint_frequency: 5
   
-  resume : True
+  resume : False
 
   dataloader:
     batch_size: 8
     shuffle: True
-    num_workers: 4
+    num_workers: 0
 
     include_graphs: True
     return_tensors: "pt"
@@ -44,10 +44,10 @@ model:
   
   # Graph Encoder Configuration
   graph_pooling: True
-  dropout: 0.2
-  num_heads: 5
-  num_quantizers: 5
-  codebook_size: 512
+  dropout: 0.3  # Increased for better regularization
+  num_heads: 4  # Reduced to save memory
+  num_quantizers: 4  # Reduced to save memory
+  codebook_size: 256  # Reduced to save memory
   shared_codebook: True
   
   # Training Configuration
