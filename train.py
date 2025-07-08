@@ -5,14 +5,17 @@ Training script for KG-LFM with wandb logging, checkpointing, and better validat
 
 import logging
 import argparse
+import os
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 import gc
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from accelerate import Accelerator
@@ -25,9 +28,7 @@ from configuration import load_yaml_config, ProjectConfig
 from model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
 from utils.Dataloaders.pretrain_data import create_dataloader
 
-# silence warnings
-import warnings
-warnings.filterwarnings("ignore")
+SYNC_FREQ = 5  # Sync every 20% of steps to prevent deadlocks
 
 class MetricsTracker:
     """Track and compute running averages of metrics using defaultdict."""
@@ -64,7 +65,9 @@ class KG_LFM_Trainer:
         self.resume = resume
 
         # Initialize Accelerator and set seed for reproducibility
-        self.accelerator = Accelerator(log_with="wandb")
+        self.accelerator = Accelerator(
+            log_with="wandb"
+        )
         set_seed(self.config.seed)
 
         self.device = self.accelerator.device
@@ -73,16 +76,15 @@ class KG_LFM_Trainer:
         self.setup_logging()
 
         # Initialize state
-        self.model = None
+        self.model : KG_LFM = None
         
         self.optimizer = None
         self.scheduler = None
         
         self.grad_accumulation_steps = self.config.pretrain_conf.gradient_accumulation_steps
-        
-        self.train_dataloader = None
-        self.val_dataloader = None
-        self.test_dataloader = None
+        self.train_dataloader: DataLoader = None
+        self.val_dataloader: DataLoader = None
+        self.test_dataloader: DataLoader = None
         self.dataloader_factory = None  # Store factory for epoch setting
         
         self.wandb_run_id = None
@@ -92,13 +94,28 @@ class KG_LFM_Trainer:
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         
+        self.steps_train = self.config.pretrain_conf.steps_train
+        self.clip_grad_norm = self.config.pretrain_conf.clip_grad_norm
+        
         # Checkpoint frequency to reduce I/O overhead
         self.checkpoint_frequency = self.config.pretrain_conf.checkpoint_frequency
         
         self.checkpoint_dir = Path(self.config.pretrain_conf.checkpoint_dir + f"/{self.run_name}")
 
         self.accelerator.print(f"Trainer initialized on device: {self.device}")
+        self.accelerator.print(f"World size: {self.accelerator.num_processes}")
+        self.accelerator.print(f"Local rank: {self.accelerator.local_process_index}")
+        self.accelerator.print(f"Is main process: {self.accelerator.is_main_process}")
         self.accelerator.print(f"Checkpoint frequency: every {self.checkpoint_frequency} epoch(s)")
+        self.accelerator.print(f"Training steps per evaluation: {self.steps_train}")
+        
+        # Calculate and display effective batch size
+        micro_batch_size = self.config.pretrain_conf.dataloader.batch_size
+        self.accelerator.print(f"Micro batch size per GPU: {micro_batch_size}")
+        
+        # Add safety check for distributed training
+        if self.accelerator.num_processes > 1:
+            self.accelerator.print(f"Distributed training with {self.accelerator.num_processes} processes")
 
     def setup_logging(self):
         """Setup logging configuration."""
@@ -114,16 +131,20 @@ class KG_LFM_Trainer:
 
     def setup_wandb(self):
         """Initialize wandb, potentially resuming a previous run."""
-        wandb_config = self.config.to_dict() # Assuming a method to convert config to dict
-        
-        run_id = self.wandb_run_id
-        
-        self.accelerator.init_trackers(
-            project_name="kg-lfm-training",
-            config=wandb_config,
-            init_kwargs={"wandb": {"name": self.run_name, "resume": "auto", "id": run_id}}
-        )
-        self.logger.info("Wandb initialized successfully")
+        if self.accelerator.is_main_process:
+            wandb_config = self.config.to_dict() # Assuming a method to convert config to dict
+            
+            run_id = self.wandb_run_id
+            
+            self.accelerator.init_trackers(
+                project_name="kg-lfm-training",
+                config=wandb_config,
+                init_kwargs={"wandb": {"name": self.run_name, "resume": "auto", "id": run_id}}
+            )
+            self.logger.info("Wandb initialized successfully")
+        else:
+            # For non-main processes, just wait
+            self.accelerator.wait_for_everyone()
 
     def setup_model(self):
         """Initialize the model with proper configuration."""
@@ -163,21 +184,17 @@ class KG_LFM_Trainer:
         """Setup data loaders with distributed support."""
         self.accelerator.print("Setting up data loaders...")
         
-        # Check if we're using distributed training
-        distributed = self.accelerator.num_processes > 1
-        
         train, val, test = create_dataloader(
             self.config.dataset,
             self.config.pretrain_conf.dataloader,
             tokenizer=self.model.tokenizer,
-            distributed=distributed,
             split="all",
         )
         
         self.train_dataloader = train
         self.val_dataloader = val
         self.test_dataloader = test
-        
+             
         
     def setup_optimizer_and_scheduler(self, num_epochs: int):
         """Setup optimizer and learning rate scheduler with warmup."""
@@ -238,19 +255,17 @@ class KG_LFM_Trainer:
 
     def compute_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
         """Compute metrics from loss."""
+        # Ensure loss is a scalar tensor and safely convert to float
+        if hasattr(loss, 'item'):
+            loss_val = loss.item()
+        else:
+            loss_val = float(loss)
+            
         metrics = {
-            'loss': loss.item(),
+            'loss': loss_val,
             'learning_rate': self.optimizer.param_groups[0]['lr']
         }
         
-        # Add memory metrics
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            metrics.update({
-                'gpu_memory_allocated_gb': allocated,
-                'gpu_memory_reserved_gb': reserved
-            })
         
         return metrics
 
@@ -259,9 +274,12 @@ class KG_LFM_Trainer:
         self.model.eval()
         metrics_tracker = MetricsTracker()
         
+        sync_frequency = len(dataloader) // SYNC_FREQ if len(dataloader) > SYNC_FREQ else 1
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process)):
                 try:
+                    # DeepSpeed handles mixed precision automatically 
                     outputs = self.model(
                         input_ids=batch['input_ids'],
                         graphs=batch['graphs'],
@@ -275,8 +293,16 @@ class KG_LFM_Trainer:
                     metrics = self.compute_metrics(loss)
                     metrics_tracker.update(metrics, batch['input_ids'].size(0))
                     
+                    # Add periodic synchronization to prevent timeouts
+                    if (batch_idx+1) % sync_frequency == 0:
+                        self.accelerator.wait_for_everyone()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
                 except Exception as e:
-                    self.logger.error(f"Error in evaluation step {batch_idx + 1}: {e}")
+                    self.accelerator.print(f"Error in evaluation batch {batch_idx}: {e}")
+                    # Ensure synchronization even on error
+                    self.accelerator.wait_for_everyone()
                     continue
         
         # Wait for all processes to complete evaluation before returning
@@ -284,29 +310,39 @@ class KG_LFM_Trainer:
         
         return metrics_tracker.get_averages()
 
-    def train_epoch(self, epoch: int):
-        """Train for one epoch."""
-        self.model.train()
+    def train_step(self):
+        """Train for one step."""
+        # Ensure model is in training mode and gradients are enabled
+        self.model.correct_train()
         
-        # Set epoch for distributed samplers to ensure proper shuffling
-        if hasattr(self, 'dataloader_factory') and self.dataloader_factory is not None:
-            self.dataloader_factory.set_epoch(epoch)
-        
+        # Clear any leftover gradients
+        self.optimizer.zero_grad()
+
         metrics_tracker = MetricsTracker()
 
+        # Create an iterator from the dataloader
+        dataloader_iter = iter(self.train_dataloader)
+        
         progress_bar = tqdm(
-            self.train_dataloader,
-            desc=f"Epoch {epoch + 1}",
-            disable=not self.accelerator.is_local_main_process
+            desc=f"Training Step {self.global_step // self.steps_train}",
+            disable=not self.accelerator.is_local_main_process,
+            total=self.steps_train
         )
 
         loss = torch.tensor(0.0, device=self.device)
-        
-        # Add periodic synchronization to prevent hanging
-        sync_frequency = max(1, len(self.train_dataloader) // 5)  # Sync every 20% of epoch
+        sync_frequency = self.steps_train // SYNC_FREQ 
 
-        for step, batch in enumerate(progress_bar):
+        for step in range(self.steps_train):
+            # check if the dataloader iterator is exhausted
             try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                # If we run out of data, create a new iterator
+                dataloader_iter = iter(self.train_dataloader)
+                batch = next(dataloader_iter)
+            
+            try:
+                self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
                 outputs = self.model(
                     input_ids=batch['input_ids'],
                     graphs=batch['graphs'],
@@ -318,44 +354,59 @@ class KG_LFM_Trainer:
                 language_loss = outputs.loss
                 RVQ_loss = outputs.RVQ_loss
                 
-                # Check if any of the two is nan
+                self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f} on process {self.accelerator.local_process_index}")
+                
                 if torch.isnan(language_loss) or torch.isnan(RVQ_loss) or torch.isinf(language_loss) or torch.isinf(RVQ_loss):
-                    self.accelerator.print(f"NaN or inf detected in losses at step {step + 1}. Skipping this batch.")
-                    continue
+                    self.accelerator.print(f"NaN or Inf detected in losses at step {step + 1} On process {self.accelerator.local_process_index}")
+                    step_loss = torch.tensor(0.0, device=self.device)
+                else:
+                    step_loss = (language_loss + RVQ_loss) / self.grad_accumulation_steps
                 
-                loss += (language_loss + RVQ_loss) / self.grad_accumulation_steps
+                with torch.no_grad():
+                    loss += step_loss
                 
-                if (step + 1) % self.grad_accumulation_steps == 0:
-                    self.accelerator.backward(loss)
-                    
-                    # Clip gradients to prevent exploding gradients
+                # backward pass
+                self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Loss: {step_loss.item():.4f} on process {self.accelerator.local_process_index}")
+                self.accelerator.backward(step_loss)
+                self.accelerator.print(f"Backward pass completed for step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
+                
+                if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
+                    self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Accumulated Loss: {loss.item():.4f}")
+
+                    # Clip gradients using accelerator's method
                     if self.config.pretrain_conf.clip_grad_norm is not None:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.pretrain_conf.clip_grad_norm)
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.pretrain_conf.clip_grad_norm)
+                        print(f"Gradient clipping applied with max norm {self.config.pretrain_conf.clip_grad_norm}")
                     
                     self.optimizer.step()
-                    self.update_learning_rate(self.global_step)
-                    self.optimizer.zero_grad()
+                    print(f"Optimizer step completed for step {step + 1}/{self.steps_train}")
                     
-                    if self.accelerator.sync_gradients:
-                        self.global_step += 1
-                        metrics = self.compute_metrics(loss)
-                        metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                        
-                        log_metrics = {f"train/{k}": v for k, v in metrics.items()}
-                        self.accelerator.log(log_metrics, step=self.global_step)
-                        
-                        progress_bar.set_postfix({
-                            'loss': f"{metrics['loss']:.4f}",
-                            'lr': f"{metrics['learning_rate']:.2e}",
-                        })
+                    self.update_learning_rate(self.global_step)
+                    print(f"Learning rate updated to {self.optimizer.param_groups[0]['lr']:.6f}")
+                    
+                    self.optimizer.zero_grad()
+                    print(f"Optimizer gradients reset for step {step + 1}/{self.steps_train}")
+                    
+                    # Log metrics and update progress bar
+                    self.global_step += 1
+                    metrics = self.compute_metrics(loss)
+                    metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    
+                    log_metrics = {f"train/{k}": v for k, v in metrics.items()}
+                    self.accelerator.log(log_metrics, step=self.global_step)
+                    
+                    progress_bar.set_postfix({
+                        'loss': f"{metrics['loss']:.4f}",
+                        'lr': f"{metrics['learning_rate']:.2e}",
+                    })
 
                     loss = torch.tensor(0.0, device=self.device)
                 
                 # Periodic synchronization to prevent deadlocks
                 if (step + 1) % sync_frequency == 0:
                     self.accelerator.wait_for_everyone()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                
+                progress_bar.update(1)  # Update progress bar
                         
             except Exception as e:
                 self.logger.error(f"Error in training step {step + 1}: {e}")
@@ -368,13 +419,11 @@ class KG_LFM_Trainer:
                 self.optimizer.zero_grad()
                 
                 # Force synchronization after error
-                try:
-                    self.accelerator.wait_for_everyone()
-                except:
-                    pass
+                self.accelerator.wait_for_everyone()
                 
                 continue
         
+        progress_bar.close()  # Close progress bar properly
         return metrics_tracker.get_averages()
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
@@ -433,44 +482,6 @@ class KG_LFM_Trainer:
             torch.cuda.empty_cache()
         gc.collect()
 
-    def handle_nccl_error(self, error: Exception, step: int) -> bool:
-        """
-        Handle NCCL communication errors gracefully.
-        Returns True if training should continue, False if it should stop.
-        """
-        error_str = str(error).lower()
-        
-        if 'nccl' in error_str or 'timeout' in error_str or 'collective' in error_str:
-            self.logger.error(f"NCCL communication error at step {step}: {error}")
-            self.accelerator.print(f"NCCL error detected at step {step}. Attempting recovery...")
-            
-            try:
-                # Clear any pending operations
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                
-                # Force cleanup of any hanging collective operations
-                if hasattr(torch.distributed, 'destroy_process_group'):
-                    try:
-                        torch.distributed.barrier(timeout=timedelta(seconds=30))
-                    except:
-                        pass
-                
-                # Reset optimizer state to clear any accumulated gradients
-                self.optimizer.zero_grad()
-                
-                self.accelerator.print("NCCL error recovery attempted. Continuing training...")
-                return True
-                
-            except Exception as recovery_error:
-                self.logger.error(f"Failed to recover from NCCL error: {recovery_error}")
-                self.accelerator.print("NCCL error recovery failed. Stopping training.")
-                return False
-        
-        # For non-NCCL errors, re-raise
-        raise error
-
     def train(self):
         """Main training loop."""
         num_epochs = self.config.pretrain_conf.epochs
@@ -481,7 +492,7 @@ class KG_LFM_Trainer:
         self.setup_optimizer_and_scheduler(num_epochs)
         self.prepare_for_training()
 
-        if self.resume:
+        if self.resume and os.path.exists(self.checkpoint_dir / "latest_checkpoint"):
             self.accelerator.print(f"Resuming training from: {self.checkpoint_dir}")
             self.accelerator.load_state(self.checkpoint_dir / "latest_checkpoint")
             
@@ -494,26 +505,59 @@ class KG_LFM_Trainer:
             self.epochs_without_improvement = state.get('epochs_without_improvement', 0)
             self.accelerator.print(f"Resuming from epoch {self.start_epoch + 1}, global step {self.global_step}")
             self.wandb_run_id = state.get('wandb_run_id', None)
+            
+            # skip to the correct batch in the dataloader
+            batches_seen_in_ep = self.global_step % len(self.train_dataloader)
+
+            # tell the sampler which epoch we're in (DDP needs this)
+            if hasattr(self.train_dataloader.sampler, 'set_epoch'):
+                self.train_dataloader.sampler.set_epoch(self.start_epoch)
+
+            # efficient, deterministic skip
+            self.train_dataloader = self.accelerator.skip_first_batches(
+                self.train_dataloader, batches_seen_in_ep
+            )
 
         self.setup_wandb()
         
         self.accelerator.print(f"Starting training for {num_epochs} epochs with patience {patience}")
         
-        for epoch in range(self.start_epoch, num_epochs):
-            self.accelerator.print(f"--- Starting epoch {epoch + 1}/{num_epochs} ---")
+        # Calculate total training steps needed
+        steps_per_epoch = len(self.train_dataloader) // self.steps_train
+        if len(self.train_dataloader) % self.steps_train != 0:
+            steps_per_epoch += 1  # Account for partial step at end of epoch
+        
+        total_training_steps = num_epochs * steps_per_epoch
+        steps_completed = self.global_step // self.steps_train
+        
+        self.accelerator.print(f"Total training steps: {total_training_steps}, Steps per epoch: {steps_per_epoch}")
+        
+        for step_idx in range(steps_completed, total_training_steps):
+            current_epoch = step_idx // steps_per_epoch
+            step_in_epoch = step_idx % steps_per_epoch
+            self.accelerator.print(f"--- Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) ---")
             
+            # Add timeout protection and better error handling
+            train_metrics = self.train_step()
             
-            train_metrics = self.train_epoch(epoch)
+            # Add explicit synchronization before validation
+            self.accelerator.wait_for_everyone()
+            
             val_metrics = self._evaluation_loop(self.val_dataloader, "Validation")
             
+            # Another synchronization after validation
+            self.accelerator.wait_for_everyone()
+            
             log_metrics = {
-                "epoch": epoch + 1,
+                "epoch": current_epoch + 1,
+                "step": step_idx + 1,
                 **{f"train_epoch/{k}": v for k, v in train_metrics.items()},
                 **{f"val_epoch/{k}": v for k, v in val_metrics.items()},
             }
+            
             self.accelerator.log(log_metrics, step=self.global_step)
             
-            self.accelerator.print(f"Epoch {epoch + 1} | Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+            self.accelerator.print(f"Step {step_idx + 1}/{total_training_steps} | Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
 
             is_best = val_metrics['loss'] < self.best_val_loss
             if is_best:
@@ -526,21 +570,16 @@ class KG_LFM_Trainer:
             # Save checkpoint with frequency control
             should_checkpoint = (
                 is_best or  # Always save best models
-                (epoch + 1) % self.checkpoint_frequency == 0 or  # Regular frequency
-                epoch == num_epochs - 1 or  # Last epoch
+                (step_idx + 1) % self.checkpoint_frequency == 0 or  # Regular frequency
+                step_idx == total_training_steps - 1 or  # Last step
                 self.epochs_without_improvement >= patience  # Before early stopping
             )
             
             if should_checkpoint:
-                try:
-                    self.save_checkpoint(epoch, is_best)
-                except Exception as e:
-                    self.logger.error(f"Failed to save checkpoint: {e}")
-                    self.accelerator.print(f"Warning: Checkpoint saving failed at epoch {epoch + 1}")
-                    # Continue training despite checkpoint failure
+                self.save_checkpoint(current_epoch, is_best)
 
             if self.epochs_without_improvement >= patience:
-                self.accelerator.print(f"Early stopping triggered after {patience} epochs.")
+                self.accelerator.print(f"Early stopping triggered after {patience} train loops without improvement.")
                 break
         
         self.accelerator.print("Training finished. Evaluating on the test set with the best model.")
@@ -600,11 +639,17 @@ def main():
     
     try:
         trainer.train()
+    except KeyboardInterrupt:
+        trainer.accelerator.print("Training interrupted by user.")
+        trainer.accelerator.end_training()
     except Exception as e:
+        trainer.accelerator.print(f"Training failed with error: {e}")
         logging.error(f"Training failed with an unexpected error: {e}", exc_info=True)
         # Ensure wandb run is closed on error
         if wandb.run:
             wandb.finish()
+        # Also end accelerator training
+        trainer.accelerator.end_training()
         raise
 
 if __name__ == "__main__":

@@ -19,11 +19,10 @@ module load cuda
 source ~/.bashrc
 conda activate CF
 
-# Set NCCL environment variables
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # 30 minutes
+# Set NCCL environment variables for better timeout and error handling
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600  # 60 minutes
 export TORCH_NCCL_ENABLE_MONITORING=1
-export NCCL_TIMEOUT=1800
-export NCCL_DEBUG=INFO
+export NCCL_TIMEOUT=3600  # 60 minutes in seconds
 export NCCL_ASYNC_ERROR_HANDLING=1
 export CUDA_LAUNCH_BLOCKING=0
 
@@ -34,10 +33,9 @@ export CUDA_LAUNCH_BLOCKING=0
 # Set OMP threads to avoid oversubscription
 export OMP_NUM_THREADS=1
 
-echo "Starting training with NCCL timeout settings..."
+echo "Starting training with enhanced NCCL timeout and DeepSpeed settings..."
 echo "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: $TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"
 echo "NCCL_TIMEOUT: $NCCL_TIMEOUT"
-
 
 # if no argument is provided, use default config
 if [ -z "$1" ]; then
@@ -47,4 +45,7 @@ else
     export CONFIG_FILE=$1
 fi
 
-srun accelerate launch train.py --config $CONFIG_FILE
+# Use accelerate launch with explicit deepspeed config
+srun accelerate launch \
+    --config_file accelerate_config.yaml \
+    train.py --config $CONFIG_FILE

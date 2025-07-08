@@ -75,12 +75,6 @@ class TriRex_DataLoaderConfig():
     
     return_tensors: str = "pt"
     
-    # Distributed training options
-    drop_last: bool = True
-    """Whether to drop the last incomplete batch in distributed training. 
-    Set to True for training to ensure consistent batch sizes across processes.
-    Set to False for validation/testing to process all samples."""
-    
     pin_memory: bool = True
     """Whether to use pinned memory for faster GPU transfers."""
     
@@ -133,6 +127,9 @@ class PretrainConfig:
     """
     run_name: str = "pretrain_trirex"
     
+    steps_train: int = 1000
+    """Number of training steps per training before validation. Defaults to 1000."""
+    
     epochs: int = 20
     """Number of epochs for pretraining. Defaults to 20."""
     
@@ -153,9 +150,6 @@ class PretrainConfig:
     
     clip_grad_norm: float = 1.0
     """Maximum gradient norm for clipping. Defaults to 1.0."""
-    
-    memory_log_interval: int = 50
-    """Interval for logging memory usage during training. Defaults to 50 steps."""
     
     dataloader: TriRex_DataLoaderConfig = field(default_factory=TriRex_DataLoaderConfig)
     

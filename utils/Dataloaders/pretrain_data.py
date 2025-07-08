@@ -121,7 +121,7 @@ class TriRexStarDataset(Dataset):
             neighbour_ids.append(neighbour_node_id)
             if contral_node_id is None:
                 contral_node_id = central_node_id
-    
+
         central_node_emb = self.big_graph_aligner.node_embedding(contral_node_id)
         neighbour_node_embs = self.big_graph_aligner.node_embedding_batch(neighbour_ids)
         edge_embs = self.big_graph_aligner.edge_embedding_batch(edge_ids)
@@ -240,13 +240,11 @@ class TriRexStarDataLoader:
         self,
         dataset_config: TRex_DatasetConfig,
         dataloader_config: Optional[TriRex_DataLoaderConfig] = None,
-        tokenizer: Optional[PreTrainedTokenizer] = None,
-        distributed: bool = False
+        tokenizer: Optional[PreTrainedTokenizer] = None
     ):
         self.dataset_config = dataset_config
         self.dataloader_config = dataloader_config or TriRex_DataLoaderConfig()
         self.tokenizer = tokenizer
-        self.distributed = distributed
         
         # Load datasets
         print("Loading TriREx and TRExStar datasets...")
@@ -276,30 +274,14 @@ class TriRexStarDataLoader:
             self.big_graph_aligner,
         )
         
-        # Create distributed sampler if distributed training is enabled
-        sampler = None
-        shuffle = self.dataloader_config.shuffle
-        if self.distributed:
-            sampler = DistributedSampler(
-                dataset,
-                shuffle=shuffle,
-                drop_last=self.dataloader_config.drop_last  # Use config setting
-            )
-            self._train_sampler = sampler  # Store for epoch setting
-            shuffle = False  # Shuffle is handled by DistributedSampler
-        else:
-            self._train_sampler = None
-        
         return DataLoader(
             dataset,
             batch_size=self.dataloader_config.batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
+            shuffle=True,
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
-            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            drop_last=self.dataloader_config.drop_last if not self.distributed else False  # Drop last handled by sampler in distributed mode
+            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0
         )
     
     def get_val_dataloader(self) -> DataLoader:
@@ -311,28 +293,14 @@ class TriRexStarDataLoader:
             self.big_graph_aligner,
         )
         
-        # For validation, we don't shuffle but still use DistributedSampler for distributed training
-        sampler = None
-        if self.distributed:
-            sampler = DistributedSampler(
-                dataset,
-                shuffle=False,
-                drop_last=False  # Don't drop last batch for validation
-            )
-            self._val_sampler = sampler  # Store for epoch setting
-        else:
-            self._val_sampler = None
-        
         return DataLoader(
             dataset,
             batch_size=self.dataloader_config.batch_size,
             shuffle=False,
-            sampler=sampler,
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
-            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            drop_last=False  # Never drop last for validation
+            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0
         )
     
     def get_test_dataloader(self) -> DataLoader:
@@ -344,28 +312,14 @@ class TriRexStarDataLoader:
             self.big_graph_aligner,
         )
         
-        # For testing, we don't shuffle but still use DistributedSampler for distributed training
-        sampler = None
-        if self.distributed:
-            sampler = DistributedSampler(
-                dataset,
-                shuffle=False,
-                drop_last=False  # Don't drop last batch for testing
-            )
-            self._test_sampler = sampler  # Store for epoch setting
-        else:
-            self._test_sampler = None
-        
         return DataLoader(
             dataset,
             batch_size=self.dataloader_config.batch_size,
             shuffle=False,
-            sampler=sampler,
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
-            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            drop_last=False  # Never drop last for testing
+            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0
         )
     
     def _get_collator(self):
@@ -385,27 +339,12 @@ class TriRexStarDataLoader:
             self.get_val_dataloader(),
             self.get_test_dataloader()
         )
-    
-    def set_epoch(self, epoch: int):
-        """
-        Set the epoch for distributed samplers to ensure proper shuffling.
-        This should be called at the beginning of each epoch during distributed training.
-        """
-        if self.distributed:
-            # Store samplers when creating dataloaders for epoch setting
-            if hasattr(self, '_train_sampler') and self._train_sampler is not None:
-                self._train_sampler.set_epoch(epoch)
-            if hasattr(self, '_val_sampler') and self._val_sampler is not None:
-                self._val_sampler.set_epoch(epoch)
-            if hasattr(self, '_test_sampler') and self._test_sampler is not None:
-                self._test_sampler.set_epoch(epoch)
 
 def create_dataloader(
     dataset_config: TRex_DatasetConfig,
     dataloader_config: Optional[TriRex_DataLoaderConfig] = None,
     tokenizer: Optional[PreTrainedTokenizer] = None,
-    split: str = "train",
-    distributed: bool = False
+    split: str = "train"
 ) -> DataLoader:
     """
     Convenience function to create a single dataloader with distributed support.
@@ -421,7 +360,7 @@ def create_dataloader(
         DataLoader for the specified split or a tuple of dataloaders for all splits.
     """
     print(f"Creating dataloader for split")
-    dataloader_factory = TriRexStarDataLoader(dataset_config, dataloader_config, tokenizer, distributed)
+    dataloader_factory = TriRexStarDataLoader(dataset_config, dataloader_config, tokenizer)
     
     if split == "train":
         return dataloader_factory.get_train_dataloader()
