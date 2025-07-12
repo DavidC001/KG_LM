@@ -1,6 +1,6 @@
 #!/bin/bash
 
-conda activate CF
+conda activate KG_LFM
 
 module load cuda
 

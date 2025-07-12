@@ -3,7 +3,7 @@
   "train_micro_batch_size_per_gpu": "auto",
   "gradient_accumulation_steps": "auto",
 
-  "ignore_unused_parameters": true,
+  "find_unused_parameters": true,
   
   "zero_optimization": {
     "stage": 2,
