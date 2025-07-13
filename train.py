@@ -70,7 +70,7 @@ class KG_LFM_Trainer:
         )
         self.accelerator = Accelerator(
             log_with="wandb",
-            gradient_accumulation_steps=self.config.pretrain_conf.gradient_accumulation_steps,
+            # gradient_accumulation_steps=self.config.pretrain_conf.gradient_accumulation_steps,
             kwargs_handlers=[kwargs]
         )
         set_seed(self.config.seed)
@@ -308,7 +308,7 @@ class KG_LFM_Trainer:
             total=self.steps_train
         )
 
-        loss = torch.tensor(0.0, device=self.device)
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
         sync_frequency = self.steps_train // SYNC_FREQ
 
         for step in range(self.steps_train):
@@ -322,32 +322,38 @@ class KG_LFM_Trainer:
 
             self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             
-            with self.accelerator.accumulate(self.model):
-                # Standard forward pass
-                outputs = self.model(
-                    input_ids=batch['input_ids'],
-                    graphs=batch['graphs'],
-                    attention_mask=batch['attention_mask'],
-                    labels=batch['input_ids'],
-                    use_cache=False,
-                )
-                language_loss = outputs.loss
-                RVQ_loss = outputs.RVQ_loss
-                total_loss = language_loss + RVQ_loss
-                
-                # print all processes' losses for debugging
-                self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {total_loss.item():.4f}")
-                
-                # Skip invalid losses
-                if torch.isnan(total_loss) or torch.isinf(total_loss):
-                    self.accelerator.print(f"NaN or Inf detected at step {step + 1}, skipping backward.")
-                    continue
-                
-                # Don't manually scale - accelerator handles this automatically
-                self.accelerator.backward(total_loss)
-                
-                # Clip gradients if configured - only when we're about to step
-                if self.accelerator.sync_gradients and self.clip_grad_norm is not None:
+            # Standard forward pass
+            outputs = self.model(
+                input_ids=batch['input_ids'],
+                graphs=batch['graphs'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['input_ids'],
+                use_cache=False,
+            )
+            language_loss = outputs.loss
+            RVQ_loss = outputs.RVQ_loss
+            loss = language_loss + RVQ_loss
+            
+            # print all processes' losses for debugging
+            self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+            
+            # Skip invalid losses
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.accelerator.print(f"NaN or Inf detected at step {step + 1}, skipping backward.")
+                loss = torch.tensor(0.0, device=self.device)
+            
+            self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
+            
+            loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
+            total_loss += loss
+            self.accelerator.backward(loss)
+            self.global_step += 1
+            
+            self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Backward pass completed, global step: {self.global_step}")
+            
+            if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
+                # Clip gradients if configured
+                if self.clip_grad_norm is not None:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
                     
                 self.optimizer.step()
@@ -355,17 +361,17 @@ class KG_LFM_Trainer:
                 self.optimizer.zero_grad()
                 
                 # update global step and logging
-                self.global_step += 1
                 metrics = self.compute_metrics(total_loss)
+                total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
                 metrics_tracker.update(metrics, batch['input_ids'].size(0))
                 log_metrics = {f"train/{k}": v for k, v in metrics.items()}
                 self.accelerator.log(log_metrics, step=self.global_step)
                 progress_bar.set_postfix({'loss': f"{metrics['loss']:.4f}", 'lr': f"{metrics['learning_rate']:.2e}"})
                 progress_bar.update(1)
 
-                # periodic synchronization to prevent deadlocks
-                if (step + 1) % sync_frequency == 0:
-                    self.accelerator.wait_for_everyone()
+            # periodic synchronization to prevent deadlocks
+            if (step + 1) % sync_frequency == 0:
+                self.accelerator.wait_for_everyone()
 
         progress_bar.close()  # Close progress bar properly
         return metrics_tracker.get_averages()
