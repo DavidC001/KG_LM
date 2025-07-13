@@ -280,6 +280,7 @@ class KG_LFMMetaForCausalLM(ABC):
         
         # Early return for cases where no multimodal processing is needed
         if graphs is None:
+            logging.info("No graphs provided, returning standard inputs and labels.")
             return (
                 input_ids,
                 position_ids,

@@ -22,11 +22,11 @@
   "gradient_clipping": 1.0,
   
   "bf16": {
-    "enabled": false
+    "enabled": true
   },
 
   "fp16": {
-    "enabled": true
+    "enabled": false
   },
   
   "activation_checkpointing": {

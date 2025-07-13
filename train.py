@@ -66,7 +66,7 @@ class KG_LFM_Trainer:
 
         # Initialize Accelerator and set seed for reproducibility
         kwargs = DistributedDataParallelKwargs(
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
         self.accelerator = Accelerator(
             log_with="wandb",
@@ -292,15 +292,12 @@ class KG_LFM_Trainer:
     def train_step(self):
         """Train for one step."""
         # Ensure model is in training mode and gradients are enabled
-        self.model.correct_train()
+        self.model.train()
         
         # Clear any leftover gradients
         self.optimizer.zero_grad()
 
         metrics_tracker = MetricsTracker()
-
-        # Create an iterator from the dataloader
-        dataloader_iter = iter(self.train_dataloader)
         
         progress_bar = tqdm(
             desc=f"Training Step {self.global_step // self.steps_train}",
@@ -311,14 +308,10 @@ class KG_LFM_Trainer:
         total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
         sync_frequency = self.steps_train // SYNC_FREQ
 
-        for step in range(self.steps_train):
-            # get batch, reset iterator if needed
-            try:
-                batch = next(dataloader_iter)
-            except StopIteration:
-                self.accelerator.print(f"Resetting dataloader iterator at step {step + 1}")
-                dataloader_iter = iter(self.train_dataloader)
-                batch = next(dataloader_iter)
+        for step, batch in enumerate(self.train_dataloader):
+            if step >= self.steps_train:
+                self.accelerator.print(f"Reached configured steps_train limit: {self.steps_train}, stopping early.")
+                break
 
             self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             
@@ -344,6 +337,9 @@ class KG_LFM_Trainer:
             
             self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
             
+            # self.accelerator.wait_for_everyone()
+            # self.accelerator.print("Waited for everyone")
+            
             loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
             total_loss += loss
             self.accelerator.backward(loss)
@@ -366,8 +362,9 @@ class KG_LFM_Trainer:
                 metrics_tracker.update(metrics, batch['input_ids'].size(0))
                 log_metrics = {f"train/{k}": v for k, v in metrics.items()}
                 self.accelerator.log(log_metrics, step=self.global_step)
-                progress_bar.set_postfix({'loss': f"{metrics['loss']:.4f}", 'lr': f"{metrics['learning_rate']:.2e}"})
-                progress_bar.update(1)
+            
+            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+            progress_bar.update(1)
 
             # periodic synchronization to prevent deadlocks
             if (step + 1) % sync_frequency == 0:
