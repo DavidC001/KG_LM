@@ -147,9 +147,9 @@ class KG_LFM_Trainer:
                 init_kwargs={"wandb": {"name": self.run_name, "resume": "auto", "id": run_id}}
             )
             self.logger.info("Wandb initialized successfully")
-        else:
-            # For non-main processes, just wait
-            self.accelerator.wait_for_everyone()
+        
+        # For non-main processes, just wait
+        self.accelerator.wait_for_everyone()
 
     def setup_model(self):
         """Initialize the model with proper configuration."""
@@ -299,6 +299,9 @@ class KG_LFM_Trainer:
 
         metrics_tracker = MetricsTracker()
         
+        # Create an iterator from the dataloader
+        dataloader_iter = iter(self.train_dataloader)
+        
         progress_bar = tqdm(
             desc=f"Training Step {self.global_step // self.steps_train}",
             disable=not self.accelerator.is_local_main_process,
@@ -308,10 +311,14 @@ class KG_LFM_Trainer:
         total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
         sync_frequency = self.steps_train // SYNC_FREQ
 
-        for step, batch in enumerate(self.train_dataloader):
-            if step >= self.steps_train:
-                self.accelerator.print(f"Reached configured steps_train limit: {self.steps_train}, stopping early.")
-                break
+        for step in range(self.steps_train):
+            # get batch, reset iterator if needed
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                self.accelerator.print(f"Resetting dataloader iterator at step {step + 1}")
+                dataloader_iter = iter(self.train_dataloader)
+                batch = next(dataloader_iter)
 
             self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             
@@ -333,7 +340,7 @@ class KG_LFM_Trainer:
             # Skip invalid losses
             if torch.isnan(loss) or torch.isinf(loss):
                 self.accelerator.print(f"NaN or Inf detected at step {step + 1}, skipping backward.")
-                loss = torch.tensor(0.0, device=self.device)
+                continue
             
             self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
             
