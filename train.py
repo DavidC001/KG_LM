@@ -316,11 +316,11 @@ class KG_LFM_Trainer:
             try:
                 batch = next(dataloader_iter)
             except StopIteration:
-                self.accelerator.print(f"Resetting dataloader iterator at step {step + 1}")
+                logging.info(f"Resetting dataloader iterator at step {step + 1}")
                 dataloader_iter = iter(self.train_dataloader)
                 batch = next(dataloader_iter)
 
-            self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
+            # self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             
             # Standard forward pass
             outputs = self.model(
@@ -335,15 +335,15 @@ class KG_LFM_Trainer:
             loss = language_loss + RVQ_loss
             
             # print all processes' losses for debugging
-            self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+            logging.debug(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
             
             # Skip invalid losses
             if torch.isnan(loss) or torch.isinf(loss):
-                self.accelerator.print(f"NaN or Inf detected at step {step + 1}, skipping backward.")
+                logging.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
                 continue
-            
-            self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
-            
+
+            logging.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
+
             # self.accelerator.wait_for_everyone()
             # self.accelerator.print("Waited for everyone")
             
@@ -351,8 +351,6 @@ class KG_LFM_Trainer:
             total_loss += loss
             self.accelerator.backward(loss)
             self.global_step += 1
-            
-            self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Backward pass completed, global step: {self.global_step}")
             
             if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
                 # Clip gradients if configured

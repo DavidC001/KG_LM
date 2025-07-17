@@ -223,25 +223,25 @@ class KGEncoder(nn.Module):
         Returns:
             torch.Tensor: The quantized representations of the graphs.
         """
-        logging.info("Forward into KG_encoder")
+        logging.debug("Forward into KG_encoder")
         x, edge_index, edge_attr = graphs.x, graphs.edge_index, graphs.edge_attr
         
-        logging.info("Got graph data")
+        logging.debug("Got graph data")
         
         x = x.to(dtype=self.conv.lin_l.weight.dtype)
         edge_attr = edge_attr.to(dtype=self.conv.lin_l.weight.dtype)
         
-        logging.info("Moved tensors")
+        logging.debug("Moved tensors")
         
         # Apply GATv2Conv
         x = self.conv(x, edge_index, edge_attr)
         
-        logging.info("Applied GATv2Conv")
+        logging.debug("Applied GATv2Conv")
         
         # average the output across all heads
         x = x.view(x.shape[0], self.num_heads, -1).mean(dim=1)
         
-        logging.info("reshaped tensors")
+        logging.debug("reshaped tensors")
         
         if self.graph_pooling:
             x = global_mean_pool(x, graphs.batch)
@@ -256,7 +256,7 @@ class KGEncoder(nn.Module):
             
             x = x[first_indices]
         
-        logging.info(f"Graph embeddings shape after GATv2Conv: {x.shape}") 
+        logging.debug(f"Graph embeddings shape after GATv2Conv: {x.shape}") 
         
         # Apply adapter layer
         x = self.adapter(x)
@@ -267,10 +267,10 @@ class KGEncoder(nn.Module):
         # Normalize the output
         x = self.norm(x)
         
-        logging.info(f"Output shape after adapter and normalization: {x.shape}")
+        logging.debug(f"Output shape after adapter and normalization: {x.shape}")
         # Apply residual vector quantization
         quantized_x, indices, loss = self.vq(x)
-        logging.info(f"Quantized output shape: {quantized_x.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
+        logging.debug(f"Quantized output shape: {quantized_x.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
         
         tokens = self.output_projection(quantized_x)
         
@@ -280,5 +280,5 @@ class KGEncoder(nn.Module):
         tokens = self.out_norm(tokens)
         
         # Return the quantized representations
-        logging.info(f"Quantized output shape: {tokens.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
+        logging.debug(f"Quantized output shape: {tokens.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
         return tokens, indices, loss

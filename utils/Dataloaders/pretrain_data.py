@@ -60,7 +60,7 @@ class TriRexStarDataset(Dataset):
             - object_graph: NetworkX graph for object entity (if available)
             - tokenized_input: Tokenized sentence (if tokenizer provided)
         """
-        print(f"Fetching sample {idx} from TriREx dataset")
+        # print(f"Fetching sample {idx} from TriREx dataset")
         sample = self.trirex_dataset[idx]
         
         # add to the sentence a special token for graph embedding after the subject

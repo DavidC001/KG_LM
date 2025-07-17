@@ -236,10 +236,10 @@ class KG_LFMMetaModel(ABC):
         
         if self.get_llm() and not getattr(self.config, "tune_language_model", False):
             self.get_llm().eval()
-            logging.info("Freezed llm model to eval mode.")
+            logging.debug("Freezed llm model to eval mode.")
         if self.get_kg_encoder() and not getattr(self.config, "tune_kg_encoder", False):
             self.get_kg_encoder().eval()
-            logging.info("Freezed kg_encoder model to eval mode.")
+            logging.debug("Freezed kg_encoder model to eval mode.")
     
     def encode_graphs(self, graphs):
         kg_encoder = self.get_kg_encoder()
@@ -280,7 +280,7 @@ class KG_LFMMetaForCausalLM(ABC):
         
         # Early return for cases where no multimodal processing is needed
         if graphs is None:
-            logging.info("No graphs provided, returning standard inputs and labels.")
+            logging.debug("No graphs provided, returning standard inputs and labels.")
             return (
                 input_ids,
                 position_ids,
@@ -291,13 +291,13 @@ class KG_LFMMetaForCausalLM(ABC):
                 RVQ_loss,
             )
 
-        logging.info(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
+        logging.debug(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
         # Encode the knowledge graphs into embeddings that will replace KG tokens
         graph_features, _, RVQ_loss = self.encode_graphs(graphs)
         graph_features = graph_features.to(self.llm.dtype)
         processed_graph = 0
         
-        logging.info(f"Graph features shape: {graph_features.shape}, RVQ loss: {RVQ_loss}")
+        logging.debug(f"Graph features shape: {graph_features.shape}, RVQ loss: {RVQ_loss}")
 
         # Store original inputs for later reference
         _labels = labels
@@ -477,7 +477,7 @@ class KG_LFMMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        logging.info(f"Processed input embeddings shape: {new_input_embeds_padded.shape}, Labels shape: {new_labels_padded.shape}, RVQ loss: {RVQ_loss}")
+        logging.debug(f"Processed input embeddings shape: {new_input_embeds_padded.shape}, Labels shape: {new_labels_padded.shape}, RVQ loss: {RVQ_loss}")
 
         # Return the processed inputs ready for the language model
         return (
@@ -656,7 +656,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         
         RVQ_loss = None
         if inputs_embeds is None:
-            logging.info("Preparing inputs and labels for multimodal processing...")
+            logging.debug("Preparing inputs and labels for multimodal processing...")
             (
                 input_ids,
                 position_ids,
@@ -677,7 +677,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds.to(dtype=self.llm.dtype)
 
-        logging.info(f"Forward pass to LLM")
+        logging.debug(f"Forward pass to LLM")
         out = self.llm(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -691,7 +691,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
             return_dict=return_dict,
         )
         
-        logging.info(f"Output from LLM: {out.keys()}")
+        logging.debug(f"Output from LLM: {out.keys()}")
         
         # If RVQ_loss is not None, add it to the model's loss for training
         if return_dict and hasattr(out, "loss") and out.loss is not None:
