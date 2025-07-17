@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 import wandb
 from tqdm.auto import tqdm
@@ -65,8 +65,13 @@ class KG_LFM_Trainer:
         self.resume = resume
 
         # Initialize Accelerator and set seed for reproducibility
+        kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=False,
+        )
         self.accelerator = Accelerator(
-            log_with="wandb"
+            log_with="wandb",
+            # gradient_accumulation_steps=self.config.pretrain_conf.gradient_accumulation_steps,
+            kwargs_handlers=[kwargs]
         )
         set_seed(self.config.seed)
 
@@ -81,7 +86,6 @@ class KG_LFM_Trainer:
         self.optimizer = None
         self.scheduler = None
         
-        self.grad_accumulation_steps = self.config.pretrain_conf.gradient_accumulation_steps
         self.train_dataloader: DataLoader = None
         self.val_dataloader: DataLoader = None
         self.test_dataloader: DataLoader = None
@@ -96,6 +100,7 @@ class KG_LFM_Trainer:
         
         self.steps_train = self.config.pretrain_conf.steps_train
         self.clip_grad_norm = self.config.pretrain_conf.clip_grad_norm
+        self.grad_accumulation_steps = self.config.pretrain_conf.gradient_accumulation_steps
         
         # Checkpoint frequency to reduce I/O overhead
         self.checkpoint_frequency = self.config.pretrain_conf.checkpoint_frequency
@@ -142,30 +147,27 @@ class KG_LFM_Trainer:
                 init_kwargs={"wandb": {"name": self.run_name, "resume": "auto", "id": run_id}}
             )
             self.logger.info("Wandb initialized successfully")
-        else:
-            # For non-main processes, just wait
-            self.accelerator.wait_for_everyone()
+        
+        # For non-main processes, just wait
+        self.accelerator.wait_for_everyone()
 
     def setup_model(self):
         """Initialize the model with proper configuration."""
         self.accelerator.print("Setting up model...")
         
         # Profile model initialization
-        def _setup_model_internal():
-            model_config = KG_LFMConfig.from_pretrained(
-                self.config.model.llm_model_name,
-                trust_remote_code=True,
-            )
-            model_config = set_KGLM_model_args(model_config, self.config.model)
-            self.model = KG_LFM(model_config)
-
-            # Freeze layers if configured
-            if not self.config.model.tune_language_model:
-                self.accelerator.print("Freezing language model parameters.")
-                for param in self.model.llm.parameters():
-                    param.requires_grad = False
-
-        _setup_model_internal()
+        model_config = KG_LFMConfig.from_pretrained(
+            self.config.model.llm_model_name,
+            trust_remote_code=True,
+        )
+        model_config = set_KGLM_model_args(model_config, self.config.model)
+        self.model = KG_LFM(model_config)
+        
+        # Freeze layers if configured
+        if not self.config.model.tune_language_model:
+            self.accelerator.print("Freezing language model parameters.")
+            for param in self.model.llm.parameters():
+                param.requires_grad = False
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -197,23 +199,19 @@ class KG_LFM_Trainer:
              
         
     def setup_optimizer_and_scheduler(self, num_epochs: int):
-        """Setup optimizer and learning rate scheduler with warmup."""
+        """Setup optimizer and learning rate scheduler."""
         self.accelerator.print("Setting up optimizer and scheduler...")
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
-        # Start with a lower learning rate for warmup
-        initial_lr = self.config.pretrain_conf.learning_rate * 0.1
-        
         self.optimizer = AdamW(
             trainable_params,
-            lr=initial_lr,
+            lr=self.config.pretrain_conf.learning_rate,
             weight_decay=self.config.pretrain_conf.weight_decay,
             eps=1e-8,  # Slightly higher epsilon for stability
             betas=(0.9, 0.999)
         )
 
         total_steps = len(self.train_dataloader) * num_epochs
-        warmup_steps = min(500, total_steps // 10)  # 10% of total steps or 500 steps max
         
         self.scheduler = CosineAnnealingLR(
             self.optimizer,
@@ -221,37 +219,18 @@ class KG_LFM_Trainer:
             eta_min=self.config.pretrain_conf.scheduler_eta_min
         )
         
-        self.warmup_steps = warmup_steps
         self.target_lr = self.config.pretrain_conf.learning_rate
-        self.initial_lr = initial_lr
-        
-        self.logger.info(f"Warmup steps: {warmup_steps}, Target LR: {self.target_lr}")
-
-    def update_learning_rate(self, step):
-        """Update learning rate with warmup."""
-        if step < self.warmup_steps:
-            # Linear warmup
-            lr = self.initial_lr + (self.target_lr - self.initial_lr) * (step / self.warmup_steps)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-        else:
-            # Use cosine annealing after warmup
-            self.scheduler.step()
 
     def prepare_for_training(self):
         """Prepare all components with accelerator."""
         self.accelerator.print("Preparing components with Accelerator...")
         
-        def _prepare_components():
-            return self.accelerator.prepare(
-                self.model, self.optimizer, self.train_dataloader, 
-                self.val_dataloader, self.test_dataloader, self.scheduler
+        (self.model, self.optimizer, self.scheduler,
+         self.train_dataloader,self.val_dataloader, self.test_dataloader, 
+        ) = self.accelerator.prepare(
+                self.model, self.optimizer,  self.scheduler,
+                self.train_dataloader, self.val_dataloader, self.test_dataloader
             )
-        
-        prepared_components = _prepare_components()
-            
-        (self.model, self.optimizer, self.train_dataloader, 
-         self.val_dataloader, self.test_dataloader, self.scheduler) = prepared_components
 
     def compute_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
         """Compute metrics from loss."""
@@ -313,13 +292,13 @@ class KG_LFM_Trainer:
     def train_step(self):
         """Train for one step."""
         # Ensure model is in training mode and gradients are enabled
-        self.model.correct_train()
+        self.model.train()
         
         # Clear any leftover gradients
         self.optimizer.zero_grad()
 
         metrics_tracker = MetricsTracker()
-
+        
         # Create an iterator from the dataloader
         dataloader_iter = iter(self.train_dataloader)
         
@@ -329,100 +308,73 @@ class KG_LFM_Trainer:
             total=self.steps_train
         )
 
-        loss = torch.tensor(0.0, device=self.device)
-        sync_frequency = self.steps_train // SYNC_FREQ 
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+        sync_frequency = self.steps_train // SYNC_FREQ
 
         for step in range(self.steps_train):
-            # check if the dataloader iterator is exhausted
+            # get batch, reset iterator if needed
             try:
                 batch = next(dataloader_iter)
             except StopIteration:
-                # If we run out of data, create a new iterator
+                logging.info(f"Resetting dataloader iterator at step {step + 1}")
                 dataloader_iter = iter(self.train_dataloader)
                 batch = next(dataloader_iter)
+
+            # self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             
-            try:
-                self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
-                outputs = self.model(
-                    input_ids=batch['input_ids'],
-                    graphs=batch['graphs'],
-                    attention_mask=batch['attention_mask'],
-                    labels=batch['input_ids'],
-                    use_cache=False,
-                )
-                
-                language_loss = outputs.loss
-                RVQ_loss = outputs.RVQ_loss
-                
-                self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f} on process {self.accelerator.local_process_index}")
-                
-                if torch.isnan(language_loss) or torch.isnan(RVQ_loss) or torch.isinf(language_loss) or torch.isinf(RVQ_loss):
-                    self.accelerator.print(f"NaN or Inf detected in losses at step {step + 1} On process {self.accelerator.local_process_index}")
-                    step_loss = torch.tensor(0.0, device=self.device)
-                else:
-                    step_loss = (language_loss + RVQ_loss) / self.grad_accumulation_steps
-                
-                with torch.no_grad():
-                    loss += step_loss
-                
-                # backward pass
-                self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Loss: {step_loss.item():.4f} on process {self.accelerator.local_process_index}")
-                self.accelerator.backward(step_loss)
-                self.accelerator.print(f"Backward pass completed for step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
-                
-                if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
-                    self.accelerator.print(f"Step {step + 1}/{self.steps_train} - Accumulated Loss: {loss.item():.4f}")
+            # Standard forward pass
+            outputs = self.model(
+                input_ids=batch['input_ids'],
+                graphs=batch['graphs'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['input_ids'],
+                use_cache=False,
+            )
+            language_loss = outputs.loss
+            RVQ_loss = outputs.RVQ_loss
+            loss = language_loss + RVQ_loss
+            
+            # print all processes' losses for debugging
+            logging.debug(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+            
+            # Skip invalid losses
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
+                continue
 
-                    # Clip gradients using accelerator's method
-                    if self.config.pretrain_conf.clip_grad_norm is not None:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.pretrain_conf.clip_grad_norm)
-                        print(f"Gradient clipping applied with max norm {self.config.pretrain_conf.clip_grad_norm}")
-                    
-                    self.optimizer.step()
-                    print(f"Optimizer step completed for step {step + 1}/{self.steps_train}")
-                    
-                    self.update_learning_rate(self.global_step)
-                    print(f"Learning rate updated to {self.optimizer.param_groups[0]['lr']:.6f}")
-                    
-                    self.optimizer.zero_grad()
-                    print(f"Optimizer gradients reset for step {step + 1}/{self.steps_train}")
-                    
-                    # Log metrics and update progress bar
-                    self.global_step += 1
-                    metrics = self.compute_metrics(loss)
-                    metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    
-                    log_metrics = {f"train/{k}": v for k, v in metrics.items()}
-                    self.accelerator.log(log_metrics, step=self.global_step)
-                    
-                    progress_bar.set_postfix({
-                        'loss': f"{metrics['loss']:.4f}",
-                        'lr': f"{metrics['learning_rate']:.2e}",
-                    })
+            logging.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
 
-                    loss = torch.tensor(0.0, device=self.device)
-                
-                # Periodic synchronization to prevent deadlocks
-                if (step + 1) % sync_frequency == 0:
-                    self.accelerator.wait_for_everyone()
-                
-                progress_bar.update(1)  # Update progress bar
-                        
-            except Exception as e:
-                self.logger.error(f"Error in training step {step + 1}: {e}")
-                self.accelerator.print(f"Skipping batch {step + 1} due to error: {e}")
-                
-                # Reset loss accumulation
-                loss = torch.tensor(0.0, device=self.device)
-                
-                # Clear any partially accumulated gradients
+            # self.accelerator.wait_for_everyone()
+            # self.accelerator.print("Waited for everyone")
+            
+            loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
+            total_loss += loss
+            self.accelerator.backward(loss)
+            self.global_step += 1
+            
+            if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
+                # Clip gradients if configured
+                if self.clip_grad_norm is not None:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+                    
+                self.optimizer.step()
+                self.scheduler.step()
                 self.optimizer.zero_grad()
                 
-                # Force synchronization after error
+                # update global step and logging
+                metrics = self.compute_metrics(total_loss)
+                total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                log_metrics = {f"train/{k}": v for k, v in metrics.items()}
+                self.accelerator.log(log_metrics, step=self.global_step)
+            
+            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+            progress_bar.update(1)
+
+            # periodic synchronization to prevent deadlocks
+            if (step + 1) % sync_frequency == 0:
                 self.accelerator.wait_for_everyone()
-                
-                continue
-        
+
         progress_bar.close()  # Close progress bar properly
         return metrics_tracker.get_averages()
     

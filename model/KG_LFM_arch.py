@@ -169,7 +169,7 @@ class KG_LFMMetaModel(ABC):
         if osp.exists(kg_encoder_path):
             logging.info(f"Loading pretrained KG Encoder from {kg_encoder_path}")
             kg_encoder_state_dict = torch.load(kg_encoder_path, map_location='cpu')
-            model.get_kg_encoder().load_state_dict(kg_encoder_state_dict)
+            model.kg_encoder.load_state_dict(kg_encoder_state_dict)
         else:
             warnings.warn(
                 f"KG Encoder weights not found at {kg_encoder_path}. "
@@ -218,8 +218,6 @@ class KG_LFMMetaModel(ABC):
 
     def get_llm(self):
         llm = getattr(self, "llm", None)
-        if type(llm) is list:
-            llm = llm[0]
         return llm
 
     def get_lm_head(self):
@@ -228,8 +226,6 @@ class KG_LFMMetaModel(ABC):
 
     def get_kg_encoder(self):
         kg_encoder = getattr(self, "kg_encoder", None)
-        if type(kg_encoder) is list:
-            kg_encoder = kg_encoder[0]
         return kg_encoder
 
     def correct_train(self):
@@ -240,10 +236,10 @@ class KG_LFMMetaModel(ABC):
         
         if self.get_llm() and not getattr(self.config, "tune_language_model", False):
             self.get_llm().eval()
-            logging.info("Freezed llm model to eval mode.")
+            logging.debug("Freezed llm model to eval mode.")
         if self.get_kg_encoder() and not getattr(self.config, "tune_kg_encoder", False):
             self.get_kg_encoder().eval()
-            logging.info("Freezed kg_encoder model to eval mode.")
+            logging.debug("Freezed kg_encoder model to eval mode.")
     
     def encode_graphs(self, graphs):
         kg_encoder = self.get_kg_encoder()
@@ -280,11 +276,11 @@ class KG_LFMMetaForCausalLM(ABC):
         3. Properly padding and aligning sequences for batch processing
         4. Managing attention masks and position IDs for the modified sequences
         """
-        kg_encoder = self.get_kg_encoder()
         RVQ_loss = None
         
         # Early return for cases where no multimodal processing is needed
-        if kg_encoder is None or graphs is None or not any(self.special_kg_token in x for x in input_ids):
+        if graphs is None:
+            logging.debug("No graphs provided, returning standard inputs and labels.")
             return (
                 input_ids,
                 position_ids,
@@ -295,27 +291,13 @@ class KG_LFMMetaForCausalLM(ABC):
                 RVQ_loss,
             )
 
-        # Handle generation case (input_ids.shape[1] == 1)
-        if input_ids.shape[1] == 1:
-            if past_key_values is not None:
-                 # In generation, graph embeddings are already in the cache, so just process the new token
-                return (
-                    input_ids,
-                    position_ids,
-                    attention_mask,
-                    past_key_values,
-                    None,
-                    labels,
-                    RVQ_loss,
-                )
-            else:
-                 # This branch should not be hit in typical autoregressive generation after the first step
-                 pass
-
-
+        logging.debug(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
         # Encode the knowledge graphs into embeddings that will replace KG tokens
-        graph_features, _, RVQ_loss = kg_encoder(graphs)
+        graph_features, _, RVQ_loss = self.encode_graphs(graphs)
         graph_features = graph_features.to(self.llm.dtype)
+        processed_graph = 0
+        
+        logging.debug(f"Graph features shape: {graph_features.shape}, RVQ loss: {RVQ_loss}")
 
         # Store original inputs for later reference
         _labels = labels
@@ -376,8 +358,9 @@ class KG_LFMMetaForCausalLM(ABC):
             # Find positions of KG tokens and create segments between them
             # Add -1 at start and sequence length at end to handle boundaries
             kg_token_indices = (
-                [-1] + torch.where(cur_input_ids == self.special_kg_token)[0].tolist()
+                [-1] + torch.where(cur_input_ids == self.special_kg_token)[0].tolist() + [cur_input_ids.shape[0]]
             )
+            
             cur_labels = labels_unpadded[batch_idx]
 
             # Split the sequence into segments: text before first KG token, between KG tokens, after last KG token
@@ -385,21 +368,11 @@ class KG_LFMMetaForCausalLM(ABC):
             label_segments = []
             
             # Extract text segments
-            for i in range(len(kg_token_indices)):
+            for i in range(len(kg_token_indices) - 1):
                 start_idx = kg_token_indices[i] + 1
-                end_idx = kg_token_indices[i+1] if i + 1 < len(kg_token_indices) else cur_input_ids.shape[0]
+                end_idx = kg_token_indices[i+1]
                 text_segments.append(cur_input_embeds[start_idx:end_idx])
                 label_segments.append(cur_labels[start_idx:end_idx])
-            
-            # Handle text after the last KG token
-            last_kg_idx = kg_token_indices[-1]
-            if last_kg_idx + 1 < cur_input_ids.shape[0]:
-                text_segments.append(cur_input_embeds[last_kg_idx + 1:])
-                label_segments.append(cur_labels[last_kg_idx + 1:])
-            else: # Append empty tensors to maintain structure
-                text_segments.append(torch.tensor([], device=cur_input_embeds.device, dtype=cur_input_embeds.dtype).reshape(0, cur_input_embeds.shape[1]))
-                label_segments.append(torch.tensor([], device=cur_labels.device, dtype=cur_labels.dtype))
-
 
             # Reconstruct the sequence by interleaving text segments with graph embeddings
             cur_new_input_embeds = []
@@ -410,7 +383,8 @@ class KG_LFMMetaForCausalLM(ABC):
                 cur_new_labels.append(label_segments[i])
                 
                 # Insert graph embedding
-                cur_graph_feature = graph_features[batch_idx] # Select graph for this sample
+                cur_graph_feature = graph_features[processed_graph]
+                processed_graph += 1
                 cur_new_input_embeds.append(cur_graph_feature)
                 
                 # Mark graph embedding positions to be ignored in loss calculation
@@ -496,9 +470,14 @@ class KG_LFMMetaForCausalLM(ABC):
 
         if _attention_mask is None:
             attention_mask = None
+        else:
+            # Ensure attention mask has the same dtype as the original
+            attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 
         if _position_ids is None:
             position_ids = None
+
+        logging.debug(f"Processed input embeddings shape: {new_input_embeds_padded.shape}, Labels shape: {new_labels_padded.shape}, RVQ loss: {RVQ_loss}")
 
         # Return the processed inputs ready for the language model
         return (
@@ -677,6 +656,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         
         RVQ_loss = None
         if inputs_embeds is None:
+            logging.debug("Preparing inputs and labels for multimodal processing...")
             (
                 input_ids,
                 position_ids,
@@ -697,6 +677,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds.to(dtype=self.llm.dtype)
 
+        logging.debug(f"Forward pass to LLM")
         out = self.llm(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -709,6 +690,8 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
+        logging.debug(f"Output from LLM: {out.keys()}")
         
         # If RVQ_loss is not None, add it to the model's loss for training
         if return_dict and hasattr(out, "loss") and out.loss is not None:
