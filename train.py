@@ -340,7 +340,7 @@ class KG_LFM_Trainer:
             # Skip invalid losses
             if torch.isnan(loss) or torch.isinf(loss):
                 logging.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
-                continue
+                loss = torch.tensor(0.0, device=self.device, requires_grad=False)
 
             logging.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
 
@@ -370,10 +370,6 @@ class KG_LFM_Trainer:
             
             progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
             progress_bar.update(1)
-
-            # periodic synchronization to prevent deadlocks
-            if (step + 1) % sync_frequency == 0:
-                self.accelerator.wait_for_everyone()
 
         progress_bar.close()  # Close progress bar properly
         return metrics_tracker.get_averages()
@@ -549,19 +545,16 @@ class KG_LFM_Trainer:
         if self.test_dataloader:
             best_model_path = self.checkpoint_dir / "best_model"
             if best_model_path.exists():
-                self.accelerator.print(f"Loading best model from {best_model_path} for test evaluation.")
-                
-                def _load_model():
-                    cpu_model = KG_LFM.from_pretrained(best_model_path)
-                    cpu_model.to(self.device)
-                    return self.accelerator.prepare(cpu_model)
-                
-                self.model = _load_model()
+                logging.info(f"Loading best model from {best_model_path} for test evaluation.")
+
+                model = KG_LFM.from_pretrained(best_model_path)
+                self.model = self.accelerator.prepare(model)  # Prepare model for evaluation
+
+                logging.info("Best model loaded successfully.")
 
                 test_metrics = self._evaluation_loop(self.test_dataloader, "Testing")
 
-                
-                self.accelerator.print(f"Test Set Evaluation | Loss: {test_metrics['loss']:.4f}")
+                logging.info(f"Test metrics: {test_metrics}")
                 
                 final_log = {
                     "test/final_loss": test_metrics['loss'],
@@ -569,13 +562,13 @@ class KG_LFM_Trainer:
                 
                 if 'perplexity' in test_metrics:
                     final_log["test/final_perplexity"] = test_metrics['perplexity']
-                    self.accelerator.print(f"Perplexity: {test_metrics['perplexity']:.2f}")
+                    logging.info(f"Perplexity: {test_metrics['perplexity']:.2f}")
                 
                 self.accelerator.log(final_log)
             else:
-                self.accelerator.print("No best model found to evaluate on the test set.")
+                logging.warning("No best model found to evaluate on the test set.")
         else:
-            self.accelerator.print("Skipping test evaluation.")
+            logging.warning("Skipping test evaluation.")
 
 
 def main():

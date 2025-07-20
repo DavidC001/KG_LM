@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source ~/.bashrc
+
 conda activate KG_LFM
 
 module load cuda

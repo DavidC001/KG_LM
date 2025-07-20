@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Dict
@@ -129,7 +130,7 @@ class BigGraphAligner:
             # if any is nan breakpoint
             if torch.isnan(batch_embeddings).any():
                 # send warning
-                print(f"NaN found in batch {i // self.batch_size}, substituting with zero vector.")
+                logging.warning(f"NaN found in batch {i // self.batch_size}, substituting with zero vector.")
                 batch_embeddings = torch.nan_to_num(batch_embeddings, nan=0.0)
             all_embeddings.append(batch_embeddings.cpu())
         
@@ -228,7 +229,7 @@ class BigGraphAligner:
         
         # Check for NaN values
         if torch.isnan(emb).any():
-            print(f"NaN found in entity ID {entity_id}, Substituting with zero vector.")
+            logging.warning(f"NaN found in entity ID {entity_id}, Substituting with zero vector.")
             return torch.zeros(self.embedder_dim)
             
         return emb

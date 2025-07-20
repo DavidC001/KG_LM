@@ -13,6 +13,7 @@ pretrain_conf:
     
   epochs: 30
   early_stopping_patience: 3
+  steps_train: 10000  # Number of training steps before validation
 
   gradient_accumulation_steps: 16
   clip_grad_norm: 1.0
@@ -24,12 +25,12 @@ pretrain_conf:
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  resume : False
+  resume : True
 
   dataloader:
-    batch_size: 8
+    batch_size: 32
     shuffle: True
-    num_workers: 0
+    num_workers: 6
 
     include_graphs: True
     return_tensors: "pt"
@@ -55,4 +56,4 @@ model:
   kg_encoder_lr: 0.0001
   
   # Graph Node Embedding Configuration
-  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-0.6B"
+  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"
