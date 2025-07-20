@@ -25,7 +25,7 @@ pretrain_conf:
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  resume : True
+  resume : False
 
   dataloader:
     batch_size: 64

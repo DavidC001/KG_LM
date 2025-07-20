@@ -28,8 +28,6 @@ from configuration import load_yaml_config, ProjectConfig
 from model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
 from utils.Dataloaders.pretrain_data import create_dataloader
 
-SYNC_FREQ = 5  # Sync every 20% of steps to prevent deadlocks
-
 class MetricsTracker:
     """Track and compute running averages of metrics using defaultdict."""
 
@@ -142,9 +140,13 @@ class KG_LFM_Trainer:
             run_id = self.wandb_run_id
             
             self.accelerator.init_trackers(
-                project_name="kg-lfm-training",
+                project_name="kg-lfm-pretraining",
                 config=wandb_config,
-                init_kwargs={"wandb": {"name": self.run_name, "resume": "auto", "id": run_id}}
+                init_kwargs={"wandb": {
+                    "name": self.run_name,
+                    "resume": "auto", 
+                    "id": run_id
+                    }}
             )
             self.logger.info("Wandb initialized successfully")
         
@@ -206,9 +208,7 @@ class KG_LFM_Trainer:
         self.optimizer = AdamW(
             trainable_params,
             lr=self.config.pretrain_conf.learning_rate,
-            weight_decay=self.config.pretrain_conf.weight_decay,
-            eps=1e-8,  # Slightly higher epsilon for stability
-            betas=(0.9, 0.999)
+            weight_decay=self.config.pretrain_conf.weight_decay
         )
 
         total_steps = len(self.train_dataloader) * num_epochs
@@ -253,8 +253,6 @@ class KG_LFM_Trainer:
         self.model.eval()
         metrics_tracker = MetricsTracker()
         
-        sync_frequency = len(dataloader) // SYNC_FREQ if len(dataloader) > SYNC_FREQ else 1
-        
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process)):
                 try:
@@ -271,12 +269,6 @@ class KG_LFM_Trainer:
                     loss = self.accelerator.gather(outputs.loss).mean()
                     metrics = self.compute_metrics(loss)
                     metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    
-                    # Add periodic synchronization to prevent timeouts
-                    if (batch_idx+1) % sync_frequency == 0:
-                        self.accelerator.wait_for_everyone()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                     
                 except Exception as e:
                     self.accelerator.print(f"Error in evaluation batch {batch_idx}: {e}")
@@ -300,7 +292,8 @@ class KG_LFM_Trainer:
         metrics_tracker = MetricsTracker()
         
         # Create an iterator from the dataloader
-        dataloader_iter = iter(self.train_dataloader)
+        if self.train_iter is None:
+            self.train_iter = iter(self.train_dataloader)
         
         progress_bar = tqdm(
             desc=f"Training Step {self.global_step // self.steps_train}",
@@ -309,16 +302,15 @@ class KG_LFM_Trainer:
         )
 
         total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-        sync_frequency = self.steps_train // SYNC_FREQ
 
         for step in range(self.steps_train):
             # get batch, reset iterator if needed
             try:
-                batch = next(dataloader_iter)
+                batch = next(self.train_iter)
             except StopIteration:
                 logging.info(f"Resetting dataloader iterator at step {step + 1}")
-                dataloader_iter = iter(self.train_dataloader)
-                batch = next(dataloader_iter)
+                self.train_iter = iter(self.train_dataloader)
+                batch = next(self.train_iter)
 
             # self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             
@@ -337,15 +329,17 @@ class KG_LFM_Trainer:
             # print all processes' losses for debugging
             logging.debug(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
             
+            # create a tensor to accumulate from all processes to skip all backward passes if loss is NaN or Inf
+            is_valid_loss = torch.tensor(not (torch.isnan(loss) or torch.isinf(loss)), device=self.device, dtype=torch.bool)
+
+            # Gather across all processes to check for NaN/Inf
+            is_valid_loss = self.accelerator.gather(is_valid_loss).all()
             # Skip invalid losses
-            if torch.isnan(loss) or torch.isinf(loss):
+            if not is_valid_loss:
                 logging.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
-                loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                continue
 
             logging.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
-
-            # self.accelerator.wait_for_everyone()
-            # self.accelerator.print("Waited for everyone")
             
             loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
             total_loss += loss

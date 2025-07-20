@@ -25,7 +25,7 @@ pretrain_conf:
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  resume : True
+  resume : False
 
   dataloader:
     batch_size: 32
@@ -44,16 +44,17 @@ model:
   
   # Graph Encoder Configuration
   graph_pooling: True
-  dropout: 0.3  # Increased for better regularization
-  num_heads: 4  # Reduced to save memory
-  num_quantizers: 4  # Reduced to save memory
-  codebook_size: 256  # Reduced to save memory
-  shared_codebook: True
+
+  dropout: 0.3  
+  num_heads: 4
+  num_quantizers: 4
+  codebook_size: 256
+  shared_codebook: False
   
   # Training Configuration
   tune_language_model: False
   tune_kg_encoder: True
-  kg_encoder_lr: 0.0001
+  kg_encoder_lr: 0.001
   
   # Graph Node Embedding Configuration
   graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"
