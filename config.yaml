@@ -11,16 +11,17 @@ dataset:
 pretrain_conf:
   run_name: "pretrain_trirex"
     
-  epochs: 30
-  early_stopping_patience: 3
-  steps_train: 10000  # Number of training steps before validation
+  epochs: 50
+  early_stopping_patience: 5
+  steps_train: 4000  # Number of training steps before validation
+  eval_perc: 0.1
 
   gradient_accumulation_steps: 16
   clip_grad_norm: 1.0
 
-  learning_rate: 1e-4
-  scheduler_eta_min: 1e-5
-  weight_decay: 0.01
+  learning_rate: 1e-3
+  scheduler_eta_min: 1e-6
+  weight_decay: 0.05
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
@@ -45,16 +46,15 @@ model:
   # Graph Encoder Configuration
   graph_pooling: True
 
-  dropout: 0.3  
+  dropout: 0.2  
   num_heads: 4
   num_quantizers: 4
-  codebook_size: 256
+  codebook_size: 512
   shared_codebook: False
   
   # Training Configuration
   tune_language_model: False
   tune_kg_encoder: True
-  kg_encoder_lr: 0.001
   
   # Graph Node Embedding Configuration
   graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"

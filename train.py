@@ -57,17 +57,18 @@ class KG_LFM_Trainer:
     Advanced trainer for KG-LFM with comprehensive features for robust and reproducible training.
     """
 
-    def __init__(self, config: ProjectConfig, run_name: Optional[str] = None, resume: Optional[bool] = False):
+    def __init__(self, config: ProjectConfig, run_name: Optional[str] = None, resume: Optional[bool] = False, enable_wandb: bool = True):
         self.config = config
         self.run_name = run_name or f"kg_lfm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.resume = resume
+        self.enable_wandb = enable_wandb
 
         # Initialize Accelerator and set seed for reproducibility
         kwargs = DistributedDataParallelKwargs(
             find_unused_parameters=False,
         )
         self.accelerator = Accelerator(
-            log_with="wandb",
+            log_with="wandb" if enable_wandb else None,
             # gradient_accumulation_steps=self.config.pretrain_conf.gradient_accumulation_steps,
             kwargs_handlers=[kwargs]
         )
@@ -99,6 +100,10 @@ class KG_LFM_Trainer:
         self.steps_train = self.config.pretrain_conf.steps_train
         self.clip_grad_norm = self.config.pretrain_conf.clip_grad_norm
         self.grad_accumulation_steps = self.config.pretrain_conf.gradient_accumulation_steps
+        
+        self.train_iter = None  # Iterator for training dataloader
+        
+        self.percentage_eval = self.config.pretrain_conf.eval_perc # Percentage of evaluation dataset to use for validation after each training step
         
         # Checkpoint frequency to reduce I/O overhead
         self.checkpoint_frequency = self.config.pretrain_conf.checkpoint_frequency
@@ -134,7 +139,7 @@ class KG_LFM_Trainer:
 
     def setup_wandb(self):
         """Initialize wandb, potentially resuming a previous run."""
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and self.enable_wandb:
             wandb_config = self.config.to_dict() # Assuming a method to convert config to dict
             
             run_id = self.wandb_run_id
@@ -248,13 +253,18 @@ class KG_LFM_Trainer:
         
         return metrics
 
-    def _evaluation_loop(self, dataloader: torch.utils.data.DataLoader, description: str) -> Dict[str, float]:
+    def _evaluation_loop(self, dataloader: torch.utils.data.DataLoader, description: str, percentage_eval: float) -> Dict[str, float]:
         """Generic evaluation loop for validation or testing with distributed support."""
         self.model.eval()
         metrics_tracker = MetricsTracker()
         
+        num_samples = int(len(dataloader.dataset) * percentage_eval)
+        if num_samples <= 0:
+            self.accelerator.print(f"Warning: Evaluation dataset is empty or too small ({len(dataloader.dataset)} samples). Skipping evaluation.")
+            return {'loss': float('inf'), 'perplexity': float('inf')}
+        
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process)):
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process, total=num_samples)):
                 try:
                     # DeepSpeed handles mixed precision automatically 
                     outputs = self.model(
@@ -269,6 +279,10 @@ class KG_LFM_Trainer:
                     loss = self.accelerator.gather(outputs.loss).mean()
                     metrics = self.compute_metrics(loss)
                     metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    
+                    # Log metrics only from the main process
+                    if batch_idx >= num_samples:
+                        break
                     
                 except Exception as e:
                     self.accelerator.print(f"Error in evaluation batch {batch_idx}: {e}")
@@ -294,6 +308,8 @@ class KG_LFM_Trainer:
         # Create an iterator from the dataloader
         if self.train_iter is None:
             self.train_iter = iter(self.train_dataloader)
+            if self.steps_train == -1:
+                self.steps_train = len(self.train_dataloader)  # Use full dataset if steps_train is -1
         
         progress_bar = tqdm(
             desc=f"Training Step {self.global_step // self.steps_train}",
@@ -485,7 +501,7 @@ class KG_LFM_Trainer:
             # Add explicit synchronization before validation
             self.accelerator.wait_for_everyone()
             
-            val_metrics = self._evaluation_loop(self.val_dataloader, "Validation")
+            val_metrics = self._evaluation_loop(self.val_dataloader, "Validation", self.percentage_eval)
             
             # Another synchronization after validation
             self.accelerator.wait_for_everyone()
@@ -527,8 +543,7 @@ class KG_LFM_Trainer:
         self.accelerator.print("Training finished. Evaluating on the test set with the best model.")
         # Wait for all processes before test evaluation
         self.accelerator.wait_for_everyone()
-        if self.accelerator.is_main_process:
-            self.run_test_evaluation()
+        self.run_test_evaluation()
         self.accelerator.wait_for_everyone()
 
         self.accelerator.end_training()
@@ -541,12 +556,16 @@ class KG_LFM_Trainer:
             if best_model_path.exists():
                 logging.info(f"Loading best model from {best_model_path} for test evaluation.")
 
+                # to avoid OOM errors, unload the current model
+                if self.model is not None:
+                    del self.model
+                    torch.cuda.empty_cache()
                 model = KG_LFM.from_pretrained(best_model_path)
                 self.model = self.accelerator.prepare(model)  # Prepare model for evaluation
 
                 logging.info("Best model loaded successfully.")
 
-                test_metrics = self._evaluation_loop(self.test_dataloader, "Testing")
+                test_metrics = self._evaluation_loop(self.test_dataloader, "Testing", self.percentage_eval)
 
                 logging.info(f"Test metrics: {test_metrics}")
                 

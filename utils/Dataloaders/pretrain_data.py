@@ -297,7 +297,7 @@ class TriRexStarDataLoader:
         return DataLoader(
             dataset,
             batch_size=self.dataloader_config.batch_size,
-            shuffle=False,
+            shuffle=True, # to allow to only use a subset of the validation dataset during training we want to do sample it with iid
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
@@ -345,7 +345,7 @@ def create_dataloader(
     dataset_config: TRex_DatasetConfig,
     dataloader_config: Optional[TriRex_DataLoaderConfig] = None,
     tokenizer: Optional[PreTrainedTokenizer] = None,
-    split: str = "train"
+    split: str = "train",
 ) -> DataLoader:
     """
     Convenience function to create a single dataloader with distributed support.

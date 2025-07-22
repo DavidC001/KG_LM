@@ -10,6 +10,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=480GB
 #SBATCH --chdir=.                       # start from current directory
+#SBATCH --mail-type=END,FAIL            # email notification on job end or failure
+#SBATCH --mail-user=davide.cavicchini@studenti.unitn.it
 
 source ./prepare_env.sh
 

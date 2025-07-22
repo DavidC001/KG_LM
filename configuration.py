@@ -113,9 +113,6 @@ class ModelConfig:
     tune_kg_encoder: bool = True
     """Whether to tune the knowledge graph encoder during training. Defaults to True."""
     
-    kg_encoder_lr: Optional[float] = 1e-4
-    """Learning rate for the KG encoder optimizer. Defaults to 1e-4."""
-    
     # Graph Node Embedding Configuration
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Defaults to 'Qwen/Qwen3-Embedding-0.6B'."""
@@ -127,8 +124,10 @@ class PretrainConfig:
     """
     run_name: str = "pretrain_trirex"
     
-    steps_train: int = 1000
-    """Number of training steps per training before validation. Defaults to 1000."""
+    steps_train: int = -1
+    """Number of training steps per training before validation. Defaults to -1 (no limit)."""
+    eval_perc: float = 1
+    """Percentage of the evaluation dataset to use for validation after each training step. Defaults to 1 (100%)."""
     
     epochs: int = 20
     """Number of epochs for pretraining. Defaults to 20."""
