@@ -1,5 +1,5 @@
-from utils.Datasets.factory import trex_factory, trex_star_factory, trex_bite_factory, trirex_factory, trex_star_graphs_factory
-from configuration import load_yaml_config
+from KG_LFM.utils.Datasets.factory import trex_factory, trex_star_factory, trex_bite_factory, trirex_factory, trex_star_graphs_factory
+from KG_LFM.configuration import load_yaml_config
 from argparse import ArgumentParser
 
 def main(config):

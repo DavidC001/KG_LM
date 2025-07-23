@@ -3,25 +3,25 @@
 seed: 42
 
 dataset:
-  lite: False
+  lite: True
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
-  preload_nodes_embeddings: False
+  preload_nodes_embeddings: False  # Use memory-mapped files instead of loading into memory
 
-pretrain_conf:
-  run_name: "pretrain_trirex"
+train_conf:
+  run_name: "pretrain_trirex_lite_small"
     
-  epochs: 50
-  early_stopping_patience: 5
-  steps_train: 4000  # Number of training steps before validation
-  eval_perc: 0.1
+  epochs: 30
+  early_stopping_patience: 3
 
   gradient_accumulation_steps: 16
+  steps_train: -1  # Number of training steps before validation
+  eval_perc: 1  # Percentage of the evaluation dataset to use for validation after each training step
   clip_grad_norm: 1.0
 
-  learning_rate: 1e-3
-  scheduler_eta_min: 1e-6
-  weight_decay: 0.05
+  learning_rate: 1e-4
+  scheduler_eta_min: 1e-5
+  weight_decay: 0.01
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
@@ -29,7 +29,7 @@ pretrain_conf:
   resume : False
 
   dataloader:
-    batch_size: 32
+    batch_size: 64
     shuffle: True
     num_workers: 6
 
@@ -45,16 +45,16 @@ model:
   
   # Graph Encoder Configuration
   graph_pooling: True
-
-  dropout: 0.2  
-  num_heads: 4
-  num_quantizers: 4
+  dropout: 0.2
+  num_heads: 5
+  num_quantizers: 5
   codebook_size: 512
-  shared_codebook: False
+  shared_codebook: True
   
   # Training Configuration
   tune_language_model: False
   tune_kg_encoder: True
+  kg_encoder_lr: 0.0001
   
   # Graph Node Embedding Configuration
-  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"
+  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-0.6B"

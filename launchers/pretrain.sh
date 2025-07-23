@@ -2,7 +2,7 @@
 #SBATCH --job-name=pretrain                # job name
 #SBATCH --nodes=1                       # number of nodes
 #SBATCH --ntasks-per-node=1             # number of tasks per node
-#SBATCH --time=12:00:00                 # time limits
+#SBATCH --time=1-00:00:00                 # time limits
 #SBATCH --output=out/pretrain_%j.out                # standard output file
 #SBATCH --account=iscrc_kg-lfm        # account name
 #SBATCH --partition=boost_usr_prod      # partition name
@@ -22,12 +22,12 @@ echo "NCCL_TIMEOUT: $NCCL_TIMEOUT"
 # if no argument is provided, use default config
 if [ -z "$1" ]; then
     echo "No config file provided, using default config."
-    export CONFIG_FILE="config.yaml"
+    export CONFIG_FILE="configs/pretrain_config.yaml"
 else
     export CONFIG_FILE=$1
 fi
 
 # Use accelerate launch with explicit deepspeed config
 srun accelerate launch \
-    --config_file accelerate_config.yaml \
+    --config_file configs/accelerate_config.yaml \
     train.py --config $CONFIG_FILE

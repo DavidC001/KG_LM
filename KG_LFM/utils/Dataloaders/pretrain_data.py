@@ -7,10 +7,10 @@ import networkx as nx
 from datasets import Dataset as HFDataset
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from utils.Datasets.factory import trirex_factory, trex_star_graphs_factory
-from utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory
+from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig
+from KG_LFM.configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig
 
 from torch_geometric.data import Data, Batch
 
@@ -374,7 +374,7 @@ def create_dataloader(
         train_loader, val_loader, test_loader = dataloader_factory.get_all_dataloaders()
         return train_loader, val_loader, test_loader
     else:
-        raise ValueError(f"Unknown split: {split}. Use 'train', 'val', or 'test'.")
+        raise ValueError(f"Unknown split: {split}. Use 'train', 'val', 'test', or 'all'.")
 
 def create_datasets(
     dataset_config: TRex_DatasetConfig,

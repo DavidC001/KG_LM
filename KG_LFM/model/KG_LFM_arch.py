@@ -16,12 +16,12 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import torch
-from model.KG_encoder import KGEncoder
+from KG_LFM.model.KG_encoder import KGEncoder
 
 from torch_geometric.data import Batch
 
 # Constants
-from configuration import IGNORE_INDEX, ModelConfig
+from KG_LFM.configuration import IGNORE_INDEX, ModelConfig
 
 def infer_stop_tokens(tokenizer):
     """Simple implementation of infer_stop_tokens for KG_LFM"""

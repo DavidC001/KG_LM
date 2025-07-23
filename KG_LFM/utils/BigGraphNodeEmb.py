@@ -1,5 +1,4 @@
 import csv
-import json
 import logging
 import os
 from pathlib import Path
@@ -9,19 +8,12 @@ import h5py
 import networkx as nx
 import numpy as np
 import torch
-import wandb
 from tqdm import tqdm
-from torchbiggraph.converters.importers import TSVEdgelistReader
 from torchbiggraph.graph_storages import FORMAT_VERSION_ATTR, FORMAT_VERSION
-from torchbiggraph.config import ConfigSchema, EntitySchema, RelationSchema
-from torchbiggraph.converters.importers import convert_input_data
-from torchbiggraph.train import train
-from torchbiggraph.util import SubprocessInitializer
 
 from sentence_transformers import SentenceTransformer
 from transformers import AutoConfig
-from configuration import TRex_DatasetConfig
-import socket
+from KG_LFM.configuration import TRex_DatasetConfig
 
 
 class BigGraphAligner:

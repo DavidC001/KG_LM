@@ -1,6 +1,6 @@
-from utils.BigGraphNodeEmb import BigGraphAligner
-from utils.Datasets.factory import trex_star_graphs_factory
-from configuration import load_yaml_config, ProjectConfig
+from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LFM.utils.Datasets.factory import trex_star_graphs_factory
+from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from argparse import ArgumentParser
 
 def main(config: ProjectConfig, batch_size: int = 128):

@@ -4,7 +4,7 @@
   "gradient_accumulation_steps": "auto",
   
   "zero_optimization": {
-    "stage": 3,
+    "stage": 2,
     
     "overlap_comm": true,
     "contiguous_gradients": true,

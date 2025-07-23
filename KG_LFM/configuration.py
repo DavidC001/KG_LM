@@ -174,7 +174,7 @@ class ProjectConfig:
     dataset: TRex_DatasetConfig = field(default_factory=TRex_DatasetConfig)
     """General configuration for the datasets."""
     
-    pretrain_conf: PretrainConfig = field(default_factory=PretrainConfig)
+    train_conf: PretrainConfig = field(default_factory=PretrainConfig)
     """Configuration for pretraining on Tri-REx."""
     
     model: ModelConfig = field(default_factory=ModelConfig)
