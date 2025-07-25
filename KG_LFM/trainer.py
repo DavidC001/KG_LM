@@ -13,6 +13,8 @@ from datetime import datetime
 from collections import defaultdict
 import gc
 
+import psutil
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader 
@@ -28,7 +30,25 @@ from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
 from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
 
-class MetricsTracker:
+# import abstract class abc
+from abc import ABC, abstractmethod
+
+class MetricsTracker(ABC):
+
+    @abstractmethod
+    def update(self, metrics: Dict[str, float], count: int = 1):
+        pass
+
+    @abstractmethod
+    def get_averages(self) -> Dict[str, float]:
+        pass
+
+    @abstractmethod
+    def reset(self):
+        pass
+    
+
+class DefaultMetricsTracker(MetricsTracker):
     """Track and compute running averages of metrics using defaultdict."""
 
     def __init__(self):
@@ -51,17 +71,26 @@ class MetricsTracker:
         return {key: self.values[key] / self.counts[key]
                 for key in self.values if self.counts[key] > 0}
 
-
 class KG_LFM_Trainer:
     """
     Advanced trainer for KG-LFM with comprehensive features for robust and reproducible training.
     """
 
-    def __init__(self, config: ProjectConfig, run_name: Optional[str] = None, resume: Optional[bool] = False, enable_wandb: bool = True):
+    def __init__(self, 
+                 config: ProjectConfig, 
+                 run_name: Optional[str] = None, 
+                 resume: Optional[bool] = False, 
+                 enable_wandb: bool = True,
+                 save_checkpoints: bool = True,
+                 metrics_tracker: Optional[MetricsTracker] = DefaultMetricsTracker()
+                ):
         self.config = config
         self.run_name = run_name or f"kg_lfm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.resume = resume
         self.enable_wandb = enable_wandb
+        self.save_checkpoints = save_checkpoints
+
+        self.metrics_tracker : MetricsTracker = metrics_tracker
 
         # Initialize Accelerator and set seed for reproducibility
         kwargs = DistributedDataParallelKwargs(
@@ -85,6 +114,7 @@ class KG_LFM_Trainer:
         self.optimizer = None
         self.scheduler = None
         
+        self.skip_train_dataloader = None  # Used to skip initial batches in the training dataloader
         self.train_dataloader: DataLoader = None
         self.val_dataloader: DataLoader = None
         self.test_dataloader: DataLoader = None
@@ -96,6 +126,7 @@ class KG_LFM_Trainer:
         self.start_epoch = 0
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
+        self.last_best_model_save_step = -1  # Track when we last saved a best model
         
         self.steps_train = self.config.train_conf.steps_train
         self.clip_grad_norm = self.config.train_conf.clip_grad_norm
@@ -208,14 +239,16 @@ class KG_LFM_Trainer:
             weight_decay=self.config.train_conf.weight_decay
         )
 
-        total_steps = len(self.train_dataloader) * num_epochs
-        
-        self.scheduler = CosineAnnealingLR(
+        total_steps = (len(self.train_dataloader) * num_epochs) // self.accelerator.num_processes
+
+        self.scheduler = ReduceLROnPlateau(
             self.optimizer,
-            T_max=total_steps,
-            eta_min=self.config.train_conf.scheduler_eta_min
+            mode="min",
+            factor=0.1,
+            patience=self.config.train_conf.early_stopping_patience // 2,
+            verbose=True
         )
-        
+
         self.target_lr = self.config.train_conf.learning_rate
 
     def prepare_for_training(self):
@@ -235,7 +268,7 @@ class KG_LFM_Trainer:
             torch.cuda.empty_cache()
         gc.collect()
 
-    def compute_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
+    def compute_train_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
         """Compute metrics from loss."""
         # Ensure loss is a scalar tensor and safely convert to float
         if hasattr(loss, 'item'):
@@ -244,16 +277,30 @@ class KG_LFM_Trainer:
             loss_val = float(loss)
             
         metrics = {
-            'loss': loss_val,
+            'training_loss': loss_val,
             'learning_rate': self.optimizer.param_groups[0]['lr']
         }
         
+        return metrics
+    
+    def compute_val_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
+        """Compute validation metrics from loss."""
+        # Ensure loss is a scalar tensor and safely convert to float
+        if hasattr(loss, 'item'):
+            loss_val = loss.item()
+        else:
+            loss_val = float(loss)
+
+        metrics = {
+            'validation_loss': loss_val,
+            'learning_rate': self.optimizer.param_groups[0]['lr']
+        }
+
         return metrics
 
     def _evaluation_loop(self, dataloader: torch.utils.data.DataLoader, description: str, percentage_eval: float) -> Dict[str, float]:
         """Generic evaluation loop for validation or testing with distributed support."""
         self.model.eval()
-        metrics_tracker = MetricsTracker()
         
         # Calculate number of batches to process instead of samples
         total_batches = len(dataloader)
@@ -278,8 +325,8 @@ class KG_LFM_Trainer:
                     
                     # Gather loss across all devices
                     loss = self.accelerator.gather(outputs.loss).mean()
-                    metrics = self.compute_metrics(loss)
-                    metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    metrics = self.compute_val_metrics(loss)
+                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
                     
                     # Delete outputs to free memory immediately
                     del outputs, loss
@@ -291,10 +338,6 @@ class KG_LFM_Trainer:
                     # Ensure synchronization even on error
                     self.accelerator.wait_for_everyone()
                     continue
-
-                # Force garbage collection every 1000 batches to prevent memory buildup
-                if (batch_idx + 1) % 1000 == 0:
-                    self.clear_memory()
         
         # Final cleanup
         self.clear_memory()
@@ -302,7 +345,10 @@ class KG_LFM_Trainer:
         # Wait for all processes to complete evaluation before returning
         self.accelerator.wait_for_everyone()
         
-        return metrics_tracker.get_averages()
+        averages = self.metrics_tracker.get_averages()
+        self.metric_tracker.reset()  # Reset tracker for next evaluation
+        
+        return averages
 
     def train_step(self):
         """Train for one step."""
@@ -311,12 +357,14 @@ class KG_LFM_Trainer:
         
         # Clear any leftover gradients
         self.optimizer.zero_grad()
-
-        metrics_tracker = MetricsTracker()
         
         # Create an iterator from the dataloader
         if self.train_iter is None:
-            self.train_iter = iter(self.train_dataloader)
+            if self.skip_train_dataloader is not None:
+                self.train_iter = iter(self.skip_train_dataloader)
+            else:
+                self.train_iter = iter(self.train_dataloader)
+            
             if self.steps_train == -1:
                 self.steps_train = len(self.train_dataloader)  # Use full dataset if steps_train is -1
         
@@ -335,7 +383,9 @@ class KG_LFM_Trainer:
                 batch = next(self.train_iter)
             except StopIteration:
                 self.logger.info(f"Resetting dataloader iterator at step {step + 1}")
+                self.train_iter.close()
                 self.train_iter = iter(self.train_dataloader)
+                self.skip_train_dataloader = None  # Reset skip dataloader
                 batch = next(self.train_iter)
 
             # self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
@@ -357,51 +407,69 @@ class KG_LFM_Trainer:
             
             # create a tensor to accumulate from all processes to skip all backward passes if loss is NaN or Inf
             is_valid_loss = torch.tensor(not (torch.isnan(loss) or torch.isinf(loss)), device=self.device, dtype=torch.bool)
-
+            
             # Gather across all processes to check for NaN/Inf
             is_valid_loss = self.accelerator.gather(is_valid_loss).all()
             # Skip invalid losses
             if not is_valid_loss:
                 self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
-                continue
+            else:
+                loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
+                total_loss += loss
+                self.accelerator.backward(loss)
             
-            self.global_step += 1
             self.logger.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
 
-            loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
-            total_loss += loss
-            self.accelerator.backward(loss)
-            
             if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
                 # Clip gradients if configured
                 if self.clip_grad_norm is not None:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
                     
                 self.optimizer.step()
-                self.scheduler.step()
+                # self.scheduler.step()
                 self.optimizer.zero_grad()
                 
                 # update global step and logging
-                metrics = self.compute_metrics(total_loss)
+                metrics = self.compute_train_metrics(total_loss)
                 total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-                metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
                 log_metrics = {f"train/{k}": v for k, v in metrics.items()}
                 self.accelerator.log(log_metrics, step=self.global_step)
-            
-            # Force garbage collection every 1000 steps to prevent memory buildup
-            if (step + 1) % 1000 == 0:
-                self.clear_memory()
-            
-            step += 1
+
+            self.global_step += 1
             progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
             progress_bar.update(1)
-
+            step += 1
+            
         progress_bar.close()  # Close progress bar properly
         
         # Clear memory after training step
         self.clear_memory()
+
+        averages = self.metrics_tracker.get_averages()
+        self.metric_tracker.reset()  # Reset tracker for next step
         
-        return metrics_tracker.get_averages()
+        return averages
+
+    def save_model(self, sub_path: Optional[Path] = None):
+        """Save the model and training state.
+        Args:
+            sub_path (Optional[Path]): Subdirectory to save the model in.
+        """
+        if self.accelerator.is_main_process:
+            self.accelerator.print(f"Saving model to {self.checkpoint_dir}")
+        
+        # Ensure checkpoint directory exists
+        model_dir = self.checkpoint_dir if sub_path is None else self.checkpoint_dir / sub_path
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            unwrapped_model: KG_LFM = self.accelerator.unwrap_model(self.model)
+            unwrapped_model.save_pretrained(model_dir)
+            self.logger.info(f"Model saved successfully to {model_dir}")
+        except Exception as e:
+            self.logger.error(f"Error saving model: {e}")
+            raise
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint with proper distributed coordination."""
@@ -417,8 +485,15 @@ class KG_LFM_Trainer:
         # Wait for directory creation to complete
         self.accelerator.wait_for_everyone()
         
-        # Save the full training state with accelerator (handles distributed coordination)
         self.logger.info(f"Saving checkpoint for epoch {epoch + 1}...")
+        
+        # Clear memory before saving checkpoint to prevent OOM
+        self.clear_memory()
+        
+        # show RAM usage before saving
+        cpu_ram = psutil.virtual_memory().percent
+        self.logger.info(f"CPU RAM usage before saving checkpoint: {cpu_ram}%")
+        
         try:
             self.accelerator.save_state(checkpoint_dir / "latest_checkpoint")
             self.logger.info(f"Latest training state saved at epoch {epoch + 1}")
@@ -434,17 +509,26 @@ class KG_LFM_Trainer:
                 'global_step': self.global_step,
                 'best_val_loss': self.best_val_loss,
                 'epochs_without_improvement': self.epochs_without_improvement,
+                'last_best_model_save_step': self.last_best_model_save_step,
                 'wandb_run_id': wandb.run.id if wandb.run else None,
             }
             torch.save(other_state, checkpoint_dir / "training_state.pth")
             self.logger.info(f"Training state saved: {other_state}")
 
             if is_best:
+                self.last_best_model_save_step = self.global_step
                 best_path = checkpoint_dir / "best_model"
                 
-                unwrapped_model : KG_LFM = self.accelerator.unwrap_model(self.model)
-                unwrapped_model.save_pretrained(best_path)
-                self.logger.info(f"New best model saved to {best_path}")
+                # Clear memory before saving best model to prevent OOM
+                self.clear_memory()
+                
+                try:
+                    unwrapped_model : KG_LFM = self.accelerator.unwrap_model(self.model)
+                    unwrapped_model.save_pretrained(best_path)
+                    self.logger.info(f"New best model saved to {best_path}")
+                except Exception as e:
+                    self.logger.error(f"Error saving best model: {e}")
+                    raise
 
                 # Log the best model as a wandb Artifact
                 # artifact = wandb.Artifact(f"{self.run_name}-best-model", type="model")
@@ -455,10 +539,8 @@ class KG_LFM_Trainer:
         self.accelerator.wait_for_everyone()
         
         # Memory cleanup after checkpoint
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
+        self.clear_memory()
+        
     def train(self):
         """Main training loop."""
         num_epochs = self.config.train_conf.epochs
@@ -480,6 +562,7 @@ class KG_LFM_Trainer:
             self.global_step = state.get('global_step', 0)
             self.best_val_loss = state.get('best_val_loss', float('inf'))
             self.epochs_without_improvement = state.get('epochs_without_improvement', 0)
+            self.last_best_model_save_step = state.get('last_best_model_save_step', -1)
             self.accelerator.print(f"Resuming from epoch {self.start_epoch + 1}, global step {self.global_step}")
             self.wandb_run_id = state.get('wandb_run_id', None)
             
@@ -491,7 +574,7 @@ class KG_LFM_Trainer:
                 self.train_dataloader.sampler.set_epoch(self.start_epoch)
 
             # efficient, deterministic skip
-            self.train_dataloader = self.accelerator.skip_first_batches(
+            self.skip_train_dataloader = self.accelerator.skip_first_batches(
                 self.train_dataloader, batches_seen_in_ep
             )
 
@@ -522,6 +605,8 @@ class KG_LFM_Trainer:
             
             val_metrics = self._evaluation_loop(self.val_dataloader, "Validation", self.percentage_eval)
             
+            self.scheduler.step(val_metrics['validation_loss'])  # Step scheduler based on validation loss
+            
             # Another synchronization after validation
             self.accelerator.wait_for_everyone()
             
@@ -551,8 +636,8 @@ class KG_LFM_Trainer:
                 step_idx == total_training_steps - 1 or  # Last step
                 self.epochs_without_improvement >= patience  # Before early stopping
             )
-            
-            if should_checkpoint:
+
+            if should_checkpoint and self.save_checkpoints:
                 self.save_checkpoint(current_epoch, is_best)
 
             if self.epochs_without_improvement >= patience:
@@ -578,19 +663,26 @@ class KG_LFM_Trainer:
                 # to avoid OOM errors, unload the current model
                 if self.model is not None:
                     del self.model
-                    torch.cuda.empty_cache()
-                model = KG_LFM.from_pretrained(best_model_path)
-                self.model = self.accelerator.prepare(model)  # Prepare model for evaluation
+                    self.clear_memory()
+                
+                try:
+                    model = KG_LFM.from_pretrained(best_model_path)
+                    self.model = self.accelerator.prepare(model)  # Prepare model for evaluation
+                    self.logger.info("Best model loaded successfully.")
+                except Exception as e:
+                    self.logger.error(f"Error loading best model: {e}")
+                    raise
 
-                self.logger.info("Best model loaded successfully.")
+                test_metrics = self._evaluation_loop(self.test_dataloader, "Testing", 1)
 
-                test_metrics = self._evaluation_loop(self.test_dataloader, "Testing", self.percentage_eval)
-
+                
                 self.logger.info(f"Test metrics: {test_metrics}")
                 
                 final_log = {
                     "test/final_loss": test_metrics['loss'],
                 }
+                
+                self.metrics_tracker.update(final_log, 1)
                 
                 if 'perplexity' in test_metrics:
                     final_log["test/final_perplexity"] = test_metrics['perplexity']

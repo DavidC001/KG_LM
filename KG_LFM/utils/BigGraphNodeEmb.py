@@ -246,6 +246,7 @@ class BigGraphAligner:
         for i, entity_id in enumerate(entity_ids):
             batch_embedding[i, :] = self.node_embedding(entity_id)
         
+        self.close_files()  # Close files after use if not preloading
         return batch_embedding
 
     def edge_embedding_batch(self, predicate_ids: List[str]) -> torch.Tensor:
@@ -254,7 +255,17 @@ class BigGraphAligner:
         for i, predicate_id in enumerate(predicate_ids):
             batch_embedding[i, :] = self.edge_embedding(predicate_id)
 
+        self.close_files()  # Close files after use if not preloading
         return batch_embedding 
+    
+    def close_files(self):
+        """Close memory-mapped files if they are open."""
+        if self.entity_mmap_file is not None:
+            self.entity_mmap_file.close()
+            self.entity_mmap_file = None
+        if self.relation_mmap_file is not None:
+            self.relation_mmap_file.close()
+            self.relation_mmap_file = None
     
     def __del__(self):
         """Clean up memory-mapped files when object is destroyed."""

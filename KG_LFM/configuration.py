@@ -75,10 +75,10 @@ class TriRex_DataLoaderConfig():
     
     return_tensors: str = "pt"
     
-    pin_memory: bool = True
+    pin_memory: bool = False
     """Whether to use pinned memory for faster GPU transfers."""
-    
-    persistent_workers: bool = True
+
+    persistent_workers: bool = False
     """Whether to keep data loading workers alive between epochs to avoid startup overhead."""
     
     
