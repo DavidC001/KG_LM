@@ -11,10 +11,10 @@ dataset:
 train_conf:
   run_name: "pretrain_trirex"
     
-  epochs: 10
+  epochs: 2
   early_stopping_patience: 6
-  steps_train: 4000  # Number of training steps before validation
-  eval_perc: 0.25
+  steps_train: 1000  # Number of training steps before validation
+  eval_perc: 0.1
 
   gradient_accumulation_steps: 16
   clip_grad_norm: 1.0
