@@ -619,11 +619,11 @@ class KG_LFM_Trainer:
             
             self.accelerator.log(log_metrics, step=self.global_step)
             
-            self.accelerator.print(f"Step {step_idx + 1}/{total_training_steps} | Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+            self.accelerator.print(f"Step {step_idx + 1}/{total_training_steps} | Train Loss: {train_metrics['training_loss']:.4f} | Val Loss: {val_metrics['validation_loss']:.4f} | LR: {train_metrics['learning_rate']:.6f}")
 
-            is_best = val_metrics['loss'] < self.best_val_loss
+            is_best = val_metrics['validation_loss'] < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_metrics['loss']
+                self.best_val_loss = val_metrics['validation_loss']
                 self.epochs_without_improvement = 0
                 self.accelerator.print(f"New best validation loss: {self.best_val_loss:.4f}")
             else:
@@ -659,15 +659,9 @@ class KG_LFM_Trainer:
             best_model_path = self.checkpoint_dir / "best_model"
             if best_model_path.exists():
                 self.logger.info(f"Loading best model from {best_model_path} for test evaluation.")
-
-                # to avoid OOM errors, unload the current model
-                if self.model is not None:
-                    del self.model
-                    self.clear_memory()
                 
                 try:
-                    model = KG_LFM.from_pretrained(best_model_path)
-                    self.model = self.accelerator.prepare(model)  # Prepare model for evaluation
+                    self.model.load_pretrained(best_model_path)
                     self.logger.info("Best model loaded successfully.")
                 except Exception as e:
                     self.logger.error(f"Error loading best model: {e}")
@@ -679,7 +673,7 @@ class KG_LFM_Trainer:
                 self.logger.info(f"Test metrics: {test_metrics}")
                 
                 final_log = {
-                    "test/final_loss": test_metrics['loss'],
+                    "test/final_loss": test_metrics['validation_loss'],
                 }
                 
                 self.metrics_tracker.update(final_log, 1)
