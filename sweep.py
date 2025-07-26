@@ -13,7 +13,6 @@ from ray.tune.schedulers import AsyncHyperBandScheduler
 
 from typing import Dict
 
-from ray.tune.search.bayesopt import BayesOptSearch
 from ray.tune.stopper import MaximumIterationStopper, TimeoutStopper
 
 class RayTuneMetricsTracker(DefaultMetricsTracker):
@@ -24,19 +23,22 @@ class RayTuneMetricsTracker(DefaultMetricsTracker):
 
     def reset(self):
         """Resets the tracker."""
+         # Only report to Ray Tune if we have validation_loss
+        # This prevents premature reporting of only training_loss
+        if 'validation_loss' in self.values:
+            # Get current averages and report them
+            averages = self.get_averages()
+            session.report(averages)
+        
         super().reset()
 
     def update(self, metrics: Dict[str, float], count: int = 1):
         """Update metrics."""
         super().update(metrics, count)
-        
-        # Report metrics to Ray Tune session
-        for key, value in metrics.items():
-            session.report({key: value})
 
     def get_averages(self) -> Dict[str, float]:
         """Get the current average of all tracked metrics."""
-        super().get_averages()
+        return super().get_averages()
 
 
 def train_kg_lfm(sweep_config):
@@ -45,14 +47,12 @@ def train_kg_lfm(sweep_config):
     config = load_yaml_config(sweep_config["base_config"])
     
     # Update the configuration with the sweep parameters
-    config.update({
-        "learning_rate": sweep_config["learning_rate"],
-        "gradient_accumulation_steps": sweep_config["gradient_accumulation_steps"],
-        "num_heads": sweep_config["num_heads"],
-        "num_quantizers": sweep_config["num_quantizers"],
-        "codebook_size": sweep_config["codebook_size"],
-        "shared_codebook": sweep_config["shared_codebook"]
-    })
+    config.train_conf.learning_rate = sweep_config["learning_rate"]
+    config.train_conf.gradient_accumulation_steps = sweep_config["gradient_accumulation_steps"]
+    config.model.num_heads = sweep_config["num_heads"]
+    config.model.num_quantizers = sweep_config["num_quantizers"]
+    config.model.codebook_size = sweep_config["codebook_size"]
+    config.model.shared_codebook = sweep_config["shared_codebook"]
     
     # Initialize the trainer with the updated config
     trainer = KG_LFM_Trainer(
@@ -88,20 +88,6 @@ def main():
     
     sched = AsyncHyperBandScheduler()
     
-    algo = BayesOptSearch(
-        random_search_steps=4,
-        points_to_evaluate=[
-            {
-                "learning_rate": 1e-3,
-                "gradient_accumulation_steps": 16,
-                "num_heads": 8,
-                "num_quantizers": 4,
-                "codebook_size": 128,
-                "shared_codebook": False
-            }
-        ]
-    )
-    
     resources_per_trial = {"cpu": 8, "gpu": 1}  # Adjust based on your total resources
     tuner = tune.Tuner(
         tune.with_resources(
@@ -111,13 +97,12 @@ def main():
         tune_config=tune.TuneConfig(
             metric="validation_loss",
             mode="min",
-            search_alg=algo,
             scheduler=sched,
-            time_budget_s=3600*23,  # 23 hours
+            time_budget_s=time_budget, 
         ),
         run_config=air.RunConfig(
             name="kg_lfm_hyperparameter_sweep",
-            stop=TimeoutStopper(time_budget),  # Stop after time_budget
+            stop=TimeoutStopper(time_budget//4),  # Stop after time_budget
         ),
         param_space={
             "learning_rate": tune.loguniform(1e-4, 1e-2),

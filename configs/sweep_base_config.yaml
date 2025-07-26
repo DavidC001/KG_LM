@@ -3,7 +3,7 @@
 seed: 42
 
 dataset:
-  lite: False
+  lite: True
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
   preload_nodes_embeddings: False
@@ -12,7 +12,7 @@ train_conf:
   run_name: "pretrain_trirex"
     
   epochs: 2
-  early_stopping_patience: 6
+  early_stopping_patience: 4
   steps_train: 1000  # Number of training steps before validation
   eval_perc: 0.1
 
@@ -29,7 +29,7 @@ train_conf:
   resume : False
 
   dataloader:
-    batch_size: 32
+    batch_size: 16
     shuffle: True
     num_workers: 2
 
