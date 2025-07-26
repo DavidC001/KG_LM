@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --nodes=10                       # number of nodes
+#SBATCH --nodes=5                       # number of nodes
 
 #SBATCH --job-name=ray_sweep            # job name
 #SBATCH --time=1-00:00:00               # time limits
@@ -13,15 +13,15 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=480GB
 
-#SBATCH --mail-type=END,FAIL            # email notification on job end or failure
+#SBATCH --mail-type=START,END,FAIL            # email notification on job end or failure
 #SBATCH --mail-user=davide.cavicchini@studenti.unitn.it
 
 source ./prepare_env.sh
 
 # Parse command line arguments
 base_conf=$1
-num_samples=${2:-50}
-max_concurrent_trials=${3:-4}
+# get as time budget the --time flag -1 h
+time_budget=$((SECONDS - 3600))
 
 if [ -z "$base_conf" ]; then
     echo "No base config file provided, using default config."
@@ -63,6 +63,6 @@ sleep 5
 ##############################################################################################
 
 #### call your code below
-python sweep.py --base_config $base_conf
-
-exit
+python sweep.py \
+    --base_conf $base_conf \
+    --time_budget $time_budget \

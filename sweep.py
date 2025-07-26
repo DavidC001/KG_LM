@@ -14,6 +14,7 @@ from ray.tune.schedulers import AsyncHyperBandScheduler
 from typing import Dict
 
 from ray.tune.search.bayesopt import BayesOptSearch
+from ray.tune.stopper import MaximumIterationStopper, TimeoutStopper
 
 class RayTuneMetricsTracker(DefaultMetricsTracker):
     """Metrics tracker for Ray Tune that reports metrics to the session."""
@@ -64,7 +65,7 @@ def train_kg_lfm(sweep_config):
     )
     
     trainer.train()
-    
+
     # Print the results
     logging.info(f"Training completed for trial {session.get_trial_id()}.")
     logging.info(f"Final metrics: {trainer.metrics_tracker.get_averages()} for config: {sweep_config}")
@@ -74,11 +75,14 @@ def main():
     parser = argparse.ArgumentParser(description="Ray Tune hyperparameter sweep for KG-LFM model")
     parser.add_argument("--base_config", type=str, default="configs/sweep_base_config.yaml", 
                        help="Path to base configuration file.")
-    
+    parser.add_argument("--time_budget", type=int, default=3600*23,
+                       help="Time budget for the sweep in seconds.")
+
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     
     base_config_path = args.base_config
+    time_budget = args.time_budget
     
     ray.init()
     
@@ -98,7 +102,7 @@ def main():
         ]
     )
     
-    resources_per_trial = {"cpu": 32, "gpu": 4}
+    resources_per_trial = {"cpu": 8, "gpu": 1}  # Adjust based on your total resources
     tuner = tune.Tuner(
         tune.with_resources(
             train_kg_lfm,
@@ -108,14 +112,12 @@ def main():
             metric="validation_loss",
             mode="min",
             search_alg=algo,
-            scheduler=sched
+            scheduler=sched,
+            time_budget_s=3600*23,  # 23 hours
         ),
         run_config=air.RunConfig(
             name="kg_lfm_hyperparameter_sweep",
-            stop={
-                "validation_loss": 0.01,
-                "training_iteration": 1000
-            },
+            stop=TimeoutStopper(time_budget),  # Stop after time_budget
         ),
         param_space={
             "learning_rate": tune.loguniform(1e-4, 1e-2),
