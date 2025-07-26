@@ -49,14 +49,15 @@ echo "STARTING HEAD at $head_node"
 echo "Head node IP: $head_node_ip"
 
 # Start the head node
-srun --nodes=1 --ntasks=1 -w $head_node start-head.sh $head_node_ip &
+srun --nodes=1 --ntasks=1 -w $head_node launchers/ray/start-head.sh $head_node_ip &
+
 # Wait for the head node to start
 sleep 10
 
 worker_num=$(($SLURM_JOB_NUM_NODES - 1)) #number of nodes other than the head node
 
 # Start worker nodes
-srun -n $worker_num --nodes=$worker_num --ntasks-per-node=1 --exclude $head_node start-worker.sh $head_node_ip:$port &
+srun -n $worker_num --nodes=$worker_num --ntasks-per-node=1 --exclude $head_node launchers/ray/start-worker.sh $head_node_ip:$port &
 # Wait for all workers to start
 sleep 5
 ##############################################################################################
