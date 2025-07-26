@@ -346,7 +346,7 @@ class KG_LFM_Trainer:
         self.accelerator.wait_for_everyone()
         
         averages = self.metrics_tracker.get_averages()
-        self.metric_tracker.reset()  # Reset tracker for next evaluation
+        self.metrics_tracker.reset()  # Reset tracker for next evaluation
         
         return averages
 
@@ -447,7 +447,7 @@ class KG_LFM_Trainer:
         self.clear_memory()
 
         averages = self.metrics_tracker.get_averages()
-        self.metric_tracker.reset()  # Reset tracker for next step
+        self.metrics_tracker.reset()  # Reset tracker for next step
         
         return averages
 
