@@ -286,7 +286,7 @@ class KG_LFMMetaForCausalLM(ABC):
                 position_ids,
                 attention_mask,
                 past_key_values,
-                self.get_input_embeddings()(input_ids), # Return standard embeddings
+                None, # Return standard embeddings
                 labels,
                 RVQ_loss,
             )
