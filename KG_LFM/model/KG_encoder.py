@@ -231,6 +231,11 @@ class KGEncoder(nn.Module):
         x = x.to(dtype=self.conv.lin_l.weight.dtype)
         edge_attr = edge_attr.to(dtype=self.conv.lin_l.weight.dtype)
         
+        #TODO: check if this works in a distributed setting
+        x = x.to(self.conv.lin_l.weight.device)
+        edge_index = edge_index.to(self.conv.lin_l.weight.device)
+        edge_attr = edge_attr.to(self.conv.lin_l.weight.device)
+        
         logging.debug("Moved tensors")
         
         # Apply GATv2Conv
@@ -244,7 +249,7 @@ class KGEncoder(nn.Module):
         logging.debug("reshaped tensors")
         
         if self.graph_pooling:
-            x = global_mean_pool(x, graphs.batch)
+            x = global_mean_pool(x, graphs.batch.to(x.device))
         else:
             # Find the first occurrence of each batch index
             num_graphs = graphs.batch.max().item() + 1
