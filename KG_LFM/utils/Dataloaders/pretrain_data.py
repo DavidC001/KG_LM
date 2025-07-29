@@ -36,12 +36,12 @@ class TriRexStarDataset(Dataset):
         self.big_graph_aligner = big_graph_aligner
         
         # add to tokenizer a special token <KG_EMBEDDING> for graph embeddings
-        if "<KG_EMBEDDING>" not in self.tokenizer.get_vocab():
+        if " <KG_EMBEDDING>" not in self.tokenizer.get_vocab():
             warnings.warn(
                 "The <KG_EMBEDDING> token is not in the tokenizer vocabulary. "
                 "Adding it to the tokenizer. This may lead to unexpected behavior."
             )
-            self.tokenizer.add_special_tokens({'additional_special_tokens': ['<KG_EMBEDDING>']})
+            self.tokenizer.add_special_tokens({'additional_special_tokens': [' <KG_EMBEDDING>']})
     
     def __len__(self) -> int:
         return len(self.trirex_dataset)
@@ -71,7 +71,7 @@ class TriRexStarDataset(Dataset):
         # Insert <KG_EMBEDDING> token after the subject
         sample['sentence'] = (
             sample['sentence'][:end_subject] +
-            ' <KG_EMBEDDING> ' +
+            ' <KG_EMBEDDING>' +
             sample['sentence'][end_subject:]
         )
         
@@ -104,7 +104,7 @@ class TriRexStarDataset(Dataset):
             
         return result
     
-    def _process_graph(self, graph: str) -> Data:
+    def _process_graph(self, graph: nx.DiGraph) -> Data:
         """
         Process and potentially sample the graph based on configuration.
         

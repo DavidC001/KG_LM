@@ -610,12 +610,12 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if "<KG_EMBEDDING>" not in self.tokenizer.get_vocab():
-            self.tokenizer.add_special_tokens({"additional_special_tokens": ["<KG_EMBEDDING>"]})
+        if " <KG_EMBEDDING>" not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [" <KG_EMBEDDING>"]})
             # Important: resize token embeddings in the LLM to account for the new token
             self.llm.resize_token_embeddings(len(self.tokenizer))
             
-        self.special_kg_token = self.tokenizer.convert_tokens_to_ids("<KG_EMBEDDING>")
+        self.special_kg_token = self.tokenizer.convert_tokens_to_ids(" <KG_EMBEDDING>")
         
         
     @classmethod
@@ -694,12 +694,10 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         logging.debug(f"Output from LLM: {out.keys()}")
         
         # If RVQ_loss is not None, add it to the model's loss for training
-        if return_dict and hasattr(out, "loss") and out.loss is not None:
-            if RVQ_loss is not None:
-                out["RVQ_loss"] = RVQ_loss
-        elif not return_dict and out[0] is not None:
-             if RVQ_loss is not None:
-                out = (out[0] + RVQ_loss,) + out[1:]
+        if return_dict:
+            out["RVQ_loss"] = RVQ_loss
+        else:
+            out = (out[0] + RVQ_loss,) + out[1:]
             
         return out
         
