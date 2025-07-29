@@ -47,6 +47,8 @@ from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from accelerate.utils import set_seed
 
+from copy import deepcopy
+
 class KGLFMEvaluator:
     """Comprehensive evaluator for KG-LFM model."""
     
@@ -68,6 +70,7 @@ class KGLFMEvaluator:
         # Load configuration
         self.config = load_yaml_config(config_path)
         self.model_path = Path(self.config.train_conf.checkpoint_dir) / self.config.train_conf.run_name / "best_model"
+        self.config.train_conf.dataloader.batch_size = batch_size
         
         set_seed(self.config.seed)
         
@@ -86,6 +89,7 @@ class KGLFMEvaluator:
         """Remove KG-related tokens from input_ids and attention_mask."""
         
         sentences = []
+        batch_sentences = []
         for sample_idx in range(len(batch["input_ids"])):
             sentence : str = batch["sentences"][sample_idx]
             
@@ -93,6 +97,13 @@ class KGLFMEvaluator:
             kg_token = self.tokenizer.decode(self.model.special_kg_token, add_special_tokens=False)
             while kg_token in sentence:
                 sentence = sentence.replace(kg_token, "")
+                # move the boundaries of the object
+                batch["objects"][sample_idx]["boundaries"] = (
+                    batch["objects"][sample_idx]["boundaries"][0] - len(kg_token),
+                    batch["objects"][sample_idx]["boundaries"][1] - len(kg_token)
+                )
+            
+            sentences.append(sentence)
             
             # if tokenizer has a apply_chat_template method, use it
             if hasattr(self.clean_tokenizer, 'apply_chat_template'):
@@ -108,24 +119,30 @@ class KGLFMEvaluator:
                 enable_thinking=False,
             )
             
-            sentences.append(sentence)
+            batch_sentences.append(sentence)
         
         tokenized = self.clean_tokenizer(
-            sentences,
+            batch_sentences,
             padding=True,
             return_tensors='pt',
         )
         
-        batch["input_ids"] = tokenized['input_ids']
-        batch["attention_mask"] = tokenized['attention_mask']
-
-        batch["graphs"] = None  # No graphs needed for textualization
+        out = {
+            "sentences": sentences,
+            "objects": batch["objects"],
+            "input_ids": tokenized['input_ids'],
+            "attention_mask": tokenized['attention_mask'],
+            "graphs": batch["graphs"]
+        }
         
-        return batch
+        return out
 
     def kg_textualization(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         """Convert KG graphs to textual format for model input."""
         # Convert graphs to textual representation
+        
+        # deep copy to avoid modifying original batch
+        batch = deepcopy(batch)
         
         for sample_idx in range(len(batch["sentences"])):
             sentence: str = batch["sentences"][sample_idx]
@@ -260,6 +277,11 @@ class KGLFMEvaluator:
 
     def _align_logits_with_labels(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Align logits with labels by removing KG tokens from the GNN."""
+        
+        # if size already matches, return logits
+        if logits.size(1) == labels.size(1):
+            return logits
+        
         pos_kg_token = torch.where(labels == self.model.special_kg_token)
         new_logits = torch.ones((labels.size(0), labels.size(1), logits.size(2)), dtype=logits.dtype, device=logits.device)
         
@@ -280,16 +302,15 @@ class KGLFMEvaluator:
         """Get token positions of the object in the sentence."""
         obj_start, obj_end = object_boundaries
         # Tokenize the object text to get its tokens
-        object_text = sentence[obj_start:obj_end]
+        object_text = sentence[obj_start-1:obj_end] # keep the space before the object
         object_tokens_num = len(self.tokenizer.encode(object_text, add_special_tokens=False))
         
         # Find the position of object tokens in the input sequence
         tokens = self.tokenizer.encode(sentence[:obj_end], add_special_tokens=False, return_tensors='pt')[0].to(self.device)
         sentence_tokens = len(tokens)
         
-        breakpoint()
-        # Finding start index of the sentence in the tokenized sequence
-        end_index = next((i for i in range(sentence_tokens, len(labels) + 1) if (labels[i - sentence_tokens:i] == tokens).all()), -1) 
+        # Finding start index of the sentence in the tokenized sequence (reversed to avoid matching the textualization of the KG)
+        end_index = next((i for i in range(len(labels), sentence_tokens-1, -1) if (labels[i - sentence_tokens:i] == tokens).all()), -1) 
         
         if end_index == -1:
             self.logger.warning(f"Sentence tokens not found in sequence: {sentence}. Skipping.")
@@ -368,7 +389,6 @@ class KGLFMEvaluator:
                             sentence, 
                             sample_boundaries
                         )
-                        breakpoint()
                         
                         if not object_positions:
                             self.logger.warning(f"No object tokens found for sample {sample_idx} in batch {batch_idx}. Skipping.")
