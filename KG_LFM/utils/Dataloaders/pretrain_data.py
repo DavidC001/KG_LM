@@ -104,9 +104,24 @@ class TriRexStarDataset(Dataset):
         # Tokenize the sentence
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
-            
+        
+        sentence = sample['sentence']
+        # if tokenizer has chat template, use it
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            sentence = self.tokenizer.apply_chat_template(
+                conversation=[
+                    {
+                        'role': 'assistant',
+                        'content': sentence
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+        
         tokenized = self.tokenizer(
-            sample['sentence'],
+            sentence,
             return_tensors='pt'
         )
         result['input_ids'] = tokenized['input_ids'].squeeze(0)
