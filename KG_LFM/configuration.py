@@ -8,6 +8,7 @@ from typing import Optional, Union
 import yaml
 
 IGNORE_INDEX = -100
+SPECIAL_KG_TOKEN = "<KG_EMBEDDING>"
 
 def dataclass(*args, **kwargs):
     """

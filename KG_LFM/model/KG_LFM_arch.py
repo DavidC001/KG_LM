@@ -21,7 +21,7 @@ from KG_LFM.model.KG_encoder import KGEncoder
 from torch_geometric.data import Batch
 
 # Constants
-from KG_LFM.configuration import IGNORE_INDEX, ModelConfig
+from KG_LFM.configuration import IGNORE_INDEX, SPECIAL_KG_TOKEN, ModelConfig
 
 def infer_stop_tokens(tokenizer):
     """Simple implementation of infer_stop_tokens for KG_LFM"""
@@ -610,12 +610,12 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if " <KG_EMBEDDING>" not in self.tokenizer.get_vocab():
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [" <KG_EMBEDDING>"]})
+        if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [SPECIAL_KG_TOKEN]})
             # Important: resize token embeddings in the LLM to account for the new token
             self.llm.resize_token_embeddings(len(self.tokenizer))
-            
-        self.special_kg_token = self.tokenizer.convert_tokens_to_ids(" <KG_EMBEDDING>")
+
+        self.special_kg_token = self.tokenizer.convert_tokens_to_ids(SPECIAL_KG_TOKEN)
         
         
     @classmethod
