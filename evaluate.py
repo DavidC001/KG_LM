@@ -2,6 +2,11 @@ from KG_LFM.evaluator import KGLFMEvaluator
 import argparse
 import logging
 
+def none_or_int(value):
+    if value == 'None':
+        return None
+    return int(value)
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate KG-LFM model")
     parser.add_argument("--config", type=str, default="configs/pretrain_config.yaml",
@@ -10,9 +15,9 @@ def main():
                        help="Path to save evaluation results JSON")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use for evaluation")
-    parser.add_argument("--batch_size", type=int, default=32,
+    parser.add_argument("--batch_size", type=int, default=16,
                        help="Batch size for evaluation")
-    parser.add_argument("--max_samples", type=int, default=None,
+    parser.add_argument("--max_samples", type=none_or_int, default=None,
                        help="Maximum number of samples to evaluate (for quick testing)")
     
     args = parser.parse_args()

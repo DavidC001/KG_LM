@@ -23,4 +23,18 @@ else
     export CONFIG_FILE=$1
 fi
 
-python evaluate.py --config $CONFIG_FILE
+if [ -z "$2" ]; then
+    echo "No batch size provided, using default batch size of 16."
+    export BATCH_SIZE=16
+else
+    export BATCH_SIZE=$2
+fi
+
+if [ -z "$3" ]; then
+    echo "No max samples provided, using default max samples of None."
+    export MAX_SAMPLES="None"
+else
+    export MAX_SAMPLES=$3
+fi
+
+python evaluate.py --config $CONFIG_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES
