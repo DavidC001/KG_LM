@@ -1,3 +1,4 @@
+import random
 from typing import Dict, List, Optional, Union, Tuple, Any
 import warnings
 
@@ -75,6 +76,15 @@ class TriRexStarDataset(Dataset):
             sample['sentence'][end_subject:]
         )
         
+        new_chars = len(' <KG_EMBEDDING>')
+        # add to the object boundaries the " <KG_EMBEDDING>" token
+        object_boundaries = sample["object"]['boundaries']
+        start_object = object_boundaries[0] + new_chars
+        end_object = object_boundaries[1] + new_chars
+        
+        # Insert <KG_EMBEDDING> token after the object
+        sample["object"]['boundaries'] = [start_object, end_object]
+
         result = {
             'sentence': sample['sentence'],
             'subject': sample['subject'],
@@ -117,11 +127,21 @@ class TriRexStarDataset(Dataset):
         # Convert NetworkX graph to a format suitable for PyTorch Geometric
         neighbour_ids, edge_ids = [], []
         contral_node_id = None
+        
+        neighbour_node_labels, edge_labels = [], []
+        central_node_label = None
+        
+        nodes = graph.nodes(data=True)
         for central_node_id, neighbour_node_id, edge in graph.edges(data=True):
             edge_ids.append(edge['id'])
             neighbour_ids.append(neighbour_node_id)
             if contral_node_id is None:
                 contral_node_id = central_node_id
+                central_node_label = nodes[central_node_id]['label']
+                
+            edge_labels.append(edge['label'])
+            neighbour_node_labels.append(nodes[neighbour_node_id]['label'])
+        
 
         central_node_emb = self.big_graph_aligner.node_embedding(contral_node_id)
         neighbour_node_embs = self.big_graph_aligner.node_embedding_batch(neighbour_ids)
@@ -145,13 +165,16 @@ class TriRexStarDataset(Dataset):
         
         # Edge features: duplicate for bidirectional edges (neighbors->central and central->neighbors)
         edge_features = torch.cat([edge_embs, edge_embs], dim=0)
-
+        
         # Create a PyTorch Geometric graph data object
         graph_data = Data(
             x=node_features,
             edge_index=edge_index,
             edge_attr=edge_features,
-            num_nodes=node_features.shape[0]
+            num_nodes=node_features.shape[0],
+            central_node_label=central_node_label,
+            neighbour_node_labels=neighbour_node_labels,
+            edge_labels=edge_labels,
         )
         
         return graph_data
