@@ -639,7 +639,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
     def forward(
         self, 
         input_ids : torch.Tensor, 
-        graphs: Batch,
+        graphs: Batch = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[torch.Tensor] = None,
