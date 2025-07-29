@@ -44,6 +44,8 @@ from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM
 from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
 
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from accelerate.utils import set_seed
 
 class KGLFMEvaluator:
     """Comprehensive evaluator for KG-LFM model."""
@@ -67,6 +69,8 @@ class KGLFMEvaluator:
         self.config = load_yaml_config(config_path)
         self.model_path = Path(self.config.train_conf.checkpoint_dir) / self.config.train_conf.run_name / "best_model"
         
+        set_seed(self.config.seed)
+        
         # Initialize model
         self.model = None
         self.tokenizer = None
@@ -78,6 +82,77 @@ class KGLFMEvaluator:
         self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
         self.smoothing = SmoothingFunction().method1
         
+    def remove_kg_stuff(self, batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Remove KG-related tokens from input_ids and attention_mask."""
+        
+        sentences = []
+        for sample_idx in range(len(batch["input_ids"])):
+            sentence : str = batch["sentences"][sample_idx]
+            
+            # remove special KG token if present
+            kg_token = self.tokenizer.decode(self.model.special_kg_token, add_special_tokens=False)
+            while kg_token in sentence:
+                sentence = sentence.replace(kg_token, "")
+            
+            # if tokenizer has a apply_chat_template method, use it
+            if hasattr(self.clean_tokenizer, 'apply_chat_template'):
+                sentence = self.clean_tokenizer.apply_chat_template(
+                conversation=[
+                    {
+                        'role': 'assistant',
+                        'content': sentence
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+            
+            sentences.append(sentence)
+        
+        tokenized = self.clean_tokenizer(
+            sentences,
+            padding=True,
+            return_tensors='pt',
+        )
+        
+        batch["input_ids"] = tokenized['input_ids']
+        batch["attention_mask"] = tokenized['attention_mask']
+
+        batch["graphs"] = None  # No graphs needed for textualization
+        
+        return batch
+
+    def kg_textualization(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert KG graphs to textual format for model input."""
+        # Convert graphs to textual representation
+        
+        for sample_idx in range(len(batch["sentences"])):
+            sentence: str = batch["sentences"][sample_idx]
+            
+            graph = batch["graphs"][sample_idx]
+            
+            graph_text = "Information from the knowledge graph: "
+            
+            central_node_label = graph["central_node_label"]
+            neighbors = graph["neighbour_node_labels"]
+            edges = graph["edge_labels"]
+            
+            for neighbor, edge in zip(neighbors, edges):
+                # Create a textual representation of the graph
+                graph_text += f"{central_node_label} {edge} {neighbor}. "
+
+            graph_text += "\n"
+
+            len_graph = len(graph_text)
+            batch["sentences"][sample_idx] = graph_text+sentence
+            batch["objects"][sample_idx]["boundaries"] = (
+                batch["objects"][sample_idx]["boundaries"][0] + len_graph,
+                batch["objects"][sample_idx]["boundaries"][1] + len_graph
+            )
+            
+        return self.remove_kg_stuff(batch)
+        
     def load_model(self):
         """Load the best trained model."""
         self.logger.info(f"Loading model from {self.model_path}")
@@ -88,9 +163,32 @@ class KGLFMEvaluator:
             self.model.eval()
             self.tokenizer = self.model.tokenizer
             self.logger.info("Model loaded successfully")
+            
+            # if the config requires to tune the model also load clean model
+            if self.config.model.tune_language_model:
+                self.clean_model = AutoModelForCausalLM.from_pretrained(
+                    self.config.model.llm_model_name,
+                    cache_dir=self.config.train_conf.cache_dir
+                )
+                self.clean_tokenizer = AutoTokenizer.from_pretrained(
+                    self.config.model.llm_model_name,
+                    cache_dir=self.config.train_conf.cache_dir
+                )
+                self.clean_model.to(self.device)
+                self.clean_model.eval()
+            else:
+                self.clean_model = self.model
+                self.clean_tokenizer = self.tokenizer
+            self.logger.info("Clean model loaded successfully")
         except Exception as e:
             self.logger.error(f"Error loading model: {e}")
             raise
+        
+        self.tests = {
+            "original_LLM": (self.remove_kg_stuff, self.clean_model),
+            "textualization": (self.kg_textualization, self.clean_model),
+            "KG_LFM": (lambda x: x, self.model),  # No preprocessing needed for KG_LFM
+        }
     
     def setup_data(self, split: str = "test"):
         """Setup data loaders for evaluation."""
@@ -105,204 +203,107 @@ class KGLFMEvaluator:
         
         self.logger.info(f"Data loader setup complete. {len(self.dataloader)} batches available.")
     
-    def compute_perplexity(self) -> float:
+    def compute_perplexity(self, ) -> float:
         """Compute perplexity on the test set."""
         self.logger.info("Computing perplexity...")
         
-        total_loss = 0.0
-        total_tokens = 0
-        num_batches = 0
+        results = {}
         
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing perplexity")):
-                if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
-                    break
-                
-                try:
+        for name, (preprocess_func, model) in self.tests.items():
+            self.logger.info(f"Evaluating {name} model...")
+            
+            total_loss = 0.0
+            total_tokens = 0
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing perplexity")):
+                    if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
+                        break
+                    
+                    batch = preprocess_func(batch)
+                    
                     # Move batch to device
                     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                             for k, v in batch.items()}
-
-                    outputs = self.model(
-                        input_ids=batch['input_ids'],
-                        graphs=batch['graphs'],
-                        attention_mask=batch['attention_mask'],
-                        labels=batch['input_ids'],
-                        use_cache=False,
-                    )
                     
+                    model_input = {
+                        'input_ids': batch['input_ids'],
+                        'attention_mask': batch['attention_mask'],
+                        "labels": batch['input_ids'],
+                    }
+                    if batch['graphs']: model_input['graphs'] = batch['graphs']
+
+                    outputs = model(**model_input)
+
                     # Extract loss and count valid tokens
                     loss = outputs.loss
                     
                     if loss is not None and not torch.isnan(loss):
                         # Count valid tokens (non-padded)
-                        valid_tokens = (batch['attention_mask'] == 1).sum().item()
+                        valid_tokens = (batch['attention_mask'] == 1).sum().item() 
+                        # remove special token ignored during loss computation
+                        valid_tokens -= torch.sum(batch['input_ids'] == self.model.special_kg_token).item()
                         total_loss += loss.item() * valid_tokens
                         total_tokens += valid_tokens
-                        num_batches += 1
-                
-                except Exception as e:
-                    self.logger.warning(f"Error in batch {batch_idx}: {e}")
-                    continue
-        
-        if total_tokens > 0:
-            avg_loss = total_loss / total_tokens
-            perplexity = math.exp(avg_loss)
-            self.logger.info(f"Perplexity: {perplexity:.4f}")
-            return perplexity
-        else:
-            self.logger.warning("No valid tokens found for perplexity computation")
-            return float('inf')
-    
-    def compute_generation_metrics(self, num_samples: int = 100) -> Dict[str, float]:
-        """Compute text generation metrics (BLEU, ROUGE)."""
-        self.logger.info(f"Computing generation metrics on {num_samples} samples...")
-        
-        bleu_scores = []
-        rouge_scores = defaultdict(list)
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing generation metrics")):
-                if batch_idx >= num_samples // self.batch_size:
-                    break
-                
-                try:
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch.items()}
-                    
-                    # Use first part of sequence as prompt, rest as target
-                    input_ids = batch['input_ids']
-                    attention_mask = batch['attention_mask']
-                    
-                    # Split sequence: first 70% as prompt, rest as target
-                    seq_len = input_ids.size(1)
-                    prompt_len = int(seq_len * 0.7)
-                    
-                    prompt_ids = input_ids[:, :prompt_len]
-                    target_ids = input_ids[:, prompt_len:]
-                    prompt_attention = attention_mask[:, :prompt_len]
-                    
-                    # Generate continuation
-                    generated = self.model.generate(
-                        input_ids=prompt_ids,
-                        graphs=batch['graphs'],
-                        attention_mask=prompt_attention,
-                        max_new_tokens=target_ids.size(1),
-                        do_sample=False,  # Greedy decoding for reproducibility
-                        pad_token_id=self.tokenizer.eos_token_id,
-                    )
-                    
-                    # Extract only the generated part
-                    generated_new = generated[:, prompt_len:]
-                    
-                    # Decode texts
-                    for i in range(input_ids.size(0)):
-                        try:
-                            target_text = self.tokenizer.decode(target_ids[i], skip_special_tokens=True).strip()
-                            generated_text = self.tokenizer.decode(generated_new[i], skip_special_tokens=True).strip()
-                            
-                            if target_text and generated_text:
-                                # BLEU score
-                                reference = [target_text.split()]
-                                candidate = generated_text.split()
-                                bleu = sentence_bleu(reference, candidate, smoothing_function=self.smoothing)
-                                bleu_scores.append(bleu)
-                                
-                                # ROUGE scores
-                                rouge_scores_sample = self.rouge_scorer.score(target_text, generated_text)
-                                for metric, score in rouge_scores_sample.items():
-                                    rouge_scores[metric].append(score.fmeasure)
-                        
-                        except Exception as e:
-                            self.logger.warning(f"Error processing sample {i} in batch {batch_idx}: {e}")
-                            continue
-                
-                except Exception as e:
-                    self.logger.warning(f"Error in generation batch {batch_idx}: {e}")
-                    continue
-        
-        # Compute averages
-        metrics = {}
-        if bleu_scores:
-            metrics['bleu'] = np.mean(bleu_scores)
-            metrics['bleu_std'] = np.std(bleu_scores)
-        
-        for metric, scores in rouge_scores.items():
-            if scores:
-                metrics[f'{metric}_f'] = np.mean(scores)
-                metrics[f'{metric}_f_std'] = np.std(scores)
-        
-        self.logger.info(f"Generation metrics computed on {len(bleu_scores)} samples")
-        return metrics
-    
-    def compute_kg_embedding_metrics(self) -> Dict[str, float]:
-        """Compute KG-specific metrics related to graph embeddings."""
-        self.logger.info("Computing KG embedding metrics...")
-        
-        graph_embeddings = []
-        rq_losses = []
-        graph_similarities = []
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing KG metrics")):
-                if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
-                    break
-                
-                try:
-                    # Move graphs to device
-                    graphs = batch['graphs'].to(self.device)
-                    
-                    # Extract graph embeddings and quantization info
-                    graph_features, indices, rvq_loss = self.model.encode_graphs(graphs)
-                    
-                    if rvq_loss is not None and not torch.isnan(rvq_loss):
-                        rq_losses.append(rvq_loss.item())
-                    
-                    # Store embeddings for similarity analysis
-                    graph_embeddings.append(graph_features.cpu().numpy())
-                    
-                    # Compute pairwise similarities within batch
-                    if graph_features.size(0) > 1:
-                        similarities = F.cosine_similarity(
-                            graph_features.unsqueeze(1), 
-                            graph_features.unsqueeze(0), 
-                            dim=-1
-                        )
-                        # Get upper triangular part (excluding diagonal)
-                        mask = torch.triu(torch.ones_like(similarities, dtype=torch.bool), diagonal=1)
-                        batch_similarities = similarities[mask].cpu().numpy()
-                        graph_similarities.extend(batch_similarities)
-                
-                except Exception as e:
-                    self.logger.warning(f"Error in KG metrics batch {batch_idx}: {e}")
-                    continue
-        
-        # Compute metrics
-        metrics = {}
-        
-        if rq_losses:
-            metrics['avg_rvq_loss'] = np.mean(rq_losses)
-            metrics['std_rvq_loss'] = np.std(rq_losses)
-        
-        if graph_similarities:
-            metrics['avg_graph_similarity'] = np.mean(graph_similarities)
-            metrics['std_graph_similarity'] = np.std(graph_similarities)
-            metrics['min_graph_similarity'] = np.min(graph_similarities)
-            metrics['max_graph_similarity'] = np.max(graph_similarities)
-        
-        # Global embedding statistics
-        if graph_embeddings:
-            all_embeddings = np.concatenate(graph_embeddings, axis=0)
-            metrics['embedding_dim'] = all_embeddings.shape[-1]
-            metrics['avg_embedding_norm'] = np.mean(np.linalg.norm(all_embeddings, axis=-1))
-            metrics['std_embedding_norm'] = np.std(np.linalg.norm(all_embeddings, axis=-1))
             
-            # Embedding diversity (variance across dimensions)
-            metrics['embedding_variance'] = np.mean(np.var(all_embeddings, axis=0))
+            if total_tokens > 0:
+                avg_loss = total_loss / total_tokens
+                perplexity = math.exp(avg_loss)
+                self.logger.info(f"Perplexity: {perplexity:.4f}")
+                results[name] = perplexity
+            else:
+                self.logger.warning("No valid tokens found for perplexity computation")
+                results[name] = float('inf')
+
+        # Return the results for all preprocessing methods
+        return results
+
+    def _align_logits_with_labels(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Align logits with labels by removing KG tokens from the GNN."""
+        pos_kg_token = torch.where(labels == self.model.special_kg_token)
+        new_logits = torch.ones((labels.size(0), labels.size(1), logits.size(2)), dtype=logits.dtype, device=logits.device)
         
-        return metrics
-    
+        # Remove special tokens from GNN
+        for i in range(pos_kg_token[0].size(0)):
+            batch_pos = pos_kg_token[0][i]
+            new_logits[batch_pos] = torch.concat(
+                [
+                    logits[batch_pos, :pos_kg_token[1][i]+1, :], 
+                    logits[batch_pos, pos_kg_token[1][i] + self.config.model.num_quantizers:, :],
+                ], 
+                dim=0
+            )
+            
+        return new_logits
+
+    def _obj_token_positions(self, labels:torch.Tensor, sentence: str, object_boundaries: List[int]) -> List[int]:
+        """Get token positions of the object in the sentence."""
+        obj_start, obj_end = object_boundaries
+        # Tokenize the object text to get its tokens
+        object_text = sentence[obj_start:obj_end]
+        object_tokens_num = len(self.tokenizer.encode(object_text, add_special_tokens=False))
+        
+        # Find the position of object tokens in the input sequence
+        tokens = self.tokenizer.encode(sentence[:obj_end], add_special_tokens=False, return_tensors='pt')[0].to(self.device)
+        sentence_tokens = len(tokens)
+        
+        breakpoint()
+        # Finding start index of the sentence in the tokenized sequence
+        end_index = next((i for i in range(sentence_tokens, len(labels) + 1) if (labels[i - sentence_tokens:i] == tokens).all()), -1) 
+        
+        if end_index == -1:
+            self.logger.warning(f"Sentence tokens not found in sequence: {sentence}. Skipping.")
+            return []
+        
+        obj_end = end_index
+        obj_start = obj_end - object_tokens_num
+        
+        # Object token positions in the sequence
+        object_positions = [i for i in range(obj_start, obj_end)]
+        
+        return object_positions
+        
+
     def compute_hit_k_metrics(self, k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, float]:
         """Compute Hit@k metrics for object label prediction.
         
@@ -315,85 +316,63 @@ class KGLFMEvaluator:
         """
         self.logger.info(f"Computing Hit@k metrics for k={k_values}...")
         
-        hit_k_correct = {k: 0 for k in k_values}
-        total_objects = 0
+        results = {}
         
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing Hit@k metrics")):
-                if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
-                    break
-                
-                try:
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch.items()}
-                    
-                    # shift from adding " special_kg_token "
-                    special_kg_token_len = len(self.tokenizer.decode(self.model.special_kg_token, add_special_tokens=False))+1
-                    # Retrieve character boundaries for the objects in the batch
-                    object_boundaries = [
-                        (obj["boundaries"][0] + special_kg_token_len, obj["boundaries"][1] + special_kg_token_len)
-                        for obj in batch['objects']
-                    ]
+        for name, (preprocess_func, model) in self.tests.items():
+            self.logger.info(f"Evaluating {name} model for Hit@k metrics...")
+            
+            hit_k_correct = {k: 0 for k in k_values}
+            total_objects = 0
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing Hit@k metrics")):
+                    if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
+                        break
 
-                    outputs = self.model(
-                        input_ids=batch['input_ids'],
-                        graphs=batch['graphs'],
-                        attention_mask=batch['attention_mask'],
-                        use_cache=False,
-                    )
+                    batch = preprocess_func(batch)
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                             for k, v in batch.items()}
+
+                    object_boundaries = [obj["boundaries"] for obj in batch['objects']]
                     
+                    model_input = {
+                        'input_ids': batch['input_ids'],
+                        'attention_mask': batch['attention_mask'],
+                        "labels": batch['input_ids'],
+                    }
+                    if batch['graphs']: model_input['graphs'] = batch['graphs']
+
+                    outputs = model(**model_input)
+                    # Get logits and labels
                     logits = outputs.logits
                     labels = batch['input_ids']
                     
-                    # Find special KG tokens and remove them from logits
-                    pos_kg = torch.where(labels == self.model.special_kg_token)
-                    
-                    attention_mask = batch['attention_mask']
-                    new_logits = torch.ones((labels.size(0), labels.size(1), logits.size(2)), dtype=logits.dtype, device=logits.device)
-                    # Remove special KG tokens from GNN
-                    for i in range(pos_kg[0].size(0)):
-                        batch_pos = pos_kg[0][i]
-                        new_logits[batch_pos] = torch.concat([logits[batch_pos, :pos_kg[1][i]+1:, :], logits[batch_pos, pos_kg[1][i] + self.config.model.num_quantizers:, :]], dim=0)
-                    logits = new_logits
+                    # Align logits with labels by removing KG tokens
+                    logits = self._align_logits_with_labels(logits, labels)
                     
                     # Shift for causal LM: predict next token
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-                    attention_mask = attention_mask[..., 1:]
                     
                     # Process each sample in the batch
                     for sample_idx in range(labels.size(0)):
                         sample_logits = shift_logits[sample_idx]  # (seq_len, vocab_size)
                         sample_labels = shift_labels[sample_idx]  # (seq_len,)
-                        sample_attention = attention_mask[sample_idx]  # (seq_len,)
                         
                         sentence = batch["sentences"][sample_idx]  # Original sentence
                         
                         sample_boundaries = object_boundaries[sample_idx]
-                        obj_start = sample_boundaries[0] # character start index
-                        obj_end = sample_boundaries[1] # character end index
                         
-                        # Extract the object substring from the sentence
-                        object_text = sentence[obj_start:obj_end]
+                        object_positions = self._obj_token_positions(
+                            sample_labels, 
+                            sentence, 
+                            sample_boundaries
+                        )
+                        breakpoint()
                         
-                        # Tokenize the object text to get its tokens
-                        object_tokens_num = len(self.tokenizer.encode(object_text, add_special_tokens=False))
-
-                        # Find the position of object tokens in the input sequence
-                        # We need to map character positions to token positions
-                        prefix_text = sentence[:obj_start-1] # remove the space that gets tokenized otherwise
-                        prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False, return_tensors='pt')[0].to(sample_labels.device)
-                        len_prefix_tokens = len(prefix_tokens)
-                        
-                        # Finding first occurrence using next()  
-                        index = next((i for i in range(len(sample_labels) - len_prefix_tokens + 1) if (sample_labels[i:i + len_prefix_tokens] == prefix_tokens).all()), -1)
-                        if index == -1:
-                            self.logger.warning(f"Prefix tokens not found in sample {sample_idx} of batch {batch_idx}. Skipping.")
+                        if not object_positions:
+                            self.logger.warning(f"No object tokens found for sample {sample_idx} in batch {batch_idx}. Skipping.")
                             continue
-                        end_object_index = index + len_prefix_tokens
-                        
-                        object_positions = [i for i in range(end_object_index, end_object_index + object_tokens_num)]
                         
                         total_objects += 1
                         
@@ -403,10 +382,10 @@ class KGLFMEvaluator:
                         
                         # Compute ranks for each token
                         token_ranks = []
-                        for token_idx, (logits, true_label) in enumerate(zip(object_logits, object_labels)):
+                        for logits, true_label in zip(object_logits, object_labels):
                             # Get the rank of the true label in the sorted logits (descending order)
                             sorted_indices = torch.argsort(logits, descending=True)
-                            rank = (sorted_indices == true_label).nonzero(as_tuple=True)[0].item() + 1  # 1-indexed rank
+                            rank = (sorted_indices == true_label).nonzero(as_tuple=True)[0].item() + 1  # +1 for 1-based rank
                             token_ranks.append(rank)
                         
                         # Sequence rank is the maximum of all token ranks
@@ -416,101 +395,27 @@ class KGLFMEvaluator:
                         for k in k_values:
                             if sequence_rank <= k:
                                 hit_k_correct[k] += 1
-                        
-                except Exception as e:
-                    self.logger.warning(f"Error in Hit@k batch {batch_idx}: {e}")
-                    continue
-        
-        # Compute Hit@k metrics
-        metrics = {}
-        if total_objects > 0:
-            for k in k_values:
-                metrics[f'hit_at_{k}'] = hit_k_correct[k] / total_objects
             
-            self.logger.info(f"Hit@k computed on {total_objects} objects")
-            for k in k_values:
-                self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
-        else:
-            self.logger.warning("No valid objects found for Hit@k computation")
-            for k in k_values:
-                metrics[f'hit_at_{k}'] = 0.0
-        
-        return metrics
-    
-    def compute_knowledge_utilization_metrics(self) -> Dict[str, float]:
-        """Compute metrics related to how well the model utilizes KG information."""
-        self.logger.info("Computing knowledge utilization metrics...")
-        
-        # Compare performance with and without KG information
-        with_kg_losses = []
-        without_kg_losses = []
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing knowledge utilization")):
-                if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
-                    break
+            # Compute Hit@k metrics
+            metrics = {}
+            if total_objects > 0:
+                for k in k_values:
+                    metrics[f'hit_at_{k}'] = hit_k_correct[k] / total_objects
                 
-                try:
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch.items()}
+                    self.logger.info(f"Hit@k computed on {total_objects} objects")
+                for k in k_values:
+                    self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
+            else:
+                self.logger.warning("No valid objects found for Hit@k computation")
+                for k in k_values:
+                    metrics[f'hit_at_{k}'] = 0.0
                     
-                    # Performance with KG
-                    outputs_with_kg = self.model(
-                        input_ids=batch['input_ids'],
-                        graphs=batch['graphs'],
-                        attention_mask=batch['attention_mask'],
-                        labels=batch['input_ids'],
-                        use_cache=False,
-                    )
-                    
-                    if outputs_with_kg.loss is not None:
-                        with_kg_losses.append(outputs_with_kg.loss.item())
-                    
-                    # remove from input_ids the special token for the kg
-                    pos_kg = torch.where(batch['input_ids'] == self.model.special_kg_token)
-                    new_input_ids = torch.ones((batch['input_ids'].size(0), batch['input_ids'].size(1) - 1), dtype=batch['input_ids'].dtype, device=batch['input_ids'].device)
-                    new_attention_mask = torch.ones((batch['attention_mask'].size(0), batch['attention_mask'].size(1) - 1), dtype=batch['attention_mask'].dtype, device=batch['attention_mask'].device)
-                    for i in range(pos_kg[0].size(0)):
-                        batch_pos = pos_kg[0][i]
-                        new_input_ids[batch_pos] = torch.concat([batch['input_ids'][batch_pos, :pos_kg[1][i]], batch['input_ids'][batch_pos, pos_kg[1][i] + 1:]], dim=0)
-                        new_attention_mask[batch_pos] = torch.concat([batch['attention_mask'][batch_pos, :pos_kg[1][i]], batch['attention_mask'][batch_pos, pos_kg[1][i] + 1:]], dim=0)
-                    batch['attention_mask'] = new_attention_mask
-                    batch['input_ids'] = new_input_ids
-                    
-                    # Performance without KG (pass None for graphs)
-                    outputs_without_kg = self.model(
-                        input_ids=batch['input_ids'],
-                        graphs=None,  # No KG information
-                        attention_mask=batch['attention_mask'],
-                        labels=batch['input_ids'],
-                        use_cache=False,
-                    )
-                    
-                    if outputs_without_kg.loss is not None:
-                        without_kg_losses.append(outputs_without_kg.loss.item())
-                
-                except Exception as e:
-                    self.logger.warning(f"Error in knowledge utilization batch {batch_idx}: {e}")
-                    continue
-        
-        # Compute metrics
-        metrics = {}
-        if with_kg_losses and without_kg_losses:
-            metrics['avg_loss_with_kg'] = np.mean(with_kg_losses)
-            metrics['avg_loss_without_kg'] = np.mean(without_kg_losses)
-            metrics['kg_improvement'] = np.mean(without_kg_losses) - np.mean(with_kg_losses)
-            metrics['relative_kg_improvement'] = metrics['kg_improvement'] / np.mean(without_kg_losses)
-            
-            # Perplexity comparison
-            metrics['perplexity_with_kg'] = math.exp(np.mean(with_kg_losses))
-            metrics['perplexity_without_kg'] = math.exp(np.mean(without_kg_losses))
-            
-            self.logger.info(f"KG improvement: {metrics['kg_improvement']:.4f} ({metrics['relative_kg_improvement']:.2%})")
-        
-        return metrics
-    
-    def run_comprehensive_evaluation(self, output_file: Optional[str] = None) -> Dict[str, Any]:
+            # Store results for this preprocessing method
+            results[name] = metrics
+
+        return results
+
+    def evaluate(self, output_file: Optional[str] = None) -> Dict[str, Any]:
         """Run all evaluation metrics and return comprehensive results."""
         self.logger.info("Starting comprehensive evaluation...")
         
@@ -520,26 +425,19 @@ class KGLFMEvaluator:
         
         # Run all evaluations
         evaluations = {
-            'perplexity': lambda: {'perplexity': self.compute_perplexity()},
-            'hit_at_k_metrics': self.compute_hit_k_metrics,
-            'kg_embedding_metrics': self.compute_kg_embedding_metrics,
-            'knowledge_utilization': self.compute_knowledge_utilization_metrics,
-            'generation_metrics': self.compute_generation_metrics,
+            'perplexity': self.compute_perplexity,
+            'hit_at_k': self.compute_hit_k_metrics,
         }
         
         # Run evaluations
         for eval_name, eval_func in evaluations.items():
-            try:
-                self.logger.info(f"Running {eval_name}...")
-                self.results[eval_name] = eval_func()
-                # Clear GPU memory after each evaluation
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-            except Exception as e:
-                self.logger.error(f"Error in {eval_name}: {e}")
-                self.results[eval_name] = {'error': str(e)}
-        
+            self.logger.info(f"Running {eval_name}...")
+            self.results[eval_name] = eval_func()
+            # Clear GPU memory after each evaluation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
         # Add metadata
         self.results['metadata'] = {
             'model_path': str(self.model_path),
@@ -623,7 +521,7 @@ def main():
     )
     
     # Run evaluation
-    results = evaluator.run_comprehensive_evaluation(args.output_file)
+    results = evaluator.evaluate(args.output_file)
     
     # Print summary
     evaluator.print_summary()

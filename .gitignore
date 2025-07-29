@@ -172,4 +172,5 @@ cython_debug/
 out/
 vila-u/
 wandb/
+eval/
 .vscode/
