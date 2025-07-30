@@ -8,6 +8,7 @@ from typing import Optional, Union
 import yaml
 
 IGNORE_INDEX = -100
+SPECIAL_KG_TOKEN = "<KG_EMBEDDING>"
 
 def dataclass(*args, **kwargs):
     """
@@ -124,9 +125,9 @@ class PretrainConfig:
     """
     run_name: str = "pretrain_trirex"
     
-    steps_train: int = -1
-    """Number of training steps per training before validation. Defaults to -1 (no limit)."""
-    eval_perc: float = 1
+    steps_train: float = 1.0
+    """Number of training steps per training before validation. Can be a float representing a percentage of the dataset. Defaults to 1.0 (100%)."""
+    eval_perc: float = 1.0
     """Percentage of the evaluation dataset to use for validation after each training step. Defaults to 1 (100%)."""
     
     epochs: int = 20

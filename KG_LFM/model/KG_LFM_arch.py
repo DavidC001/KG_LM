@@ -21,7 +21,7 @@ from KG_LFM.model.KG_encoder import KGEncoder
 from torch_geometric.data import Batch
 
 # Constants
-from KG_LFM.configuration import IGNORE_INDEX, ModelConfig
+from KG_LFM.configuration import IGNORE_INDEX, SPECIAL_KG_TOKEN, ModelConfig
 
 def infer_stop_tokens(tokenizer):
     """Simple implementation of infer_stop_tokens for KG_LFM"""
@@ -610,12 +610,12 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if "<KG_EMBEDDING>" not in self.tokenizer.get_vocab():
-            self.tokenizer.add_special_tokens({"additional_special_tokens": ["<KG_EMBEDDING>"]})
+        if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [SPECIAL_KG_TOKEN]})
             # Important: resize token embeddings in the LLM to account for the new token
             self.llm.resize_token_embeddings(len(self.tokenizer))
-            
-        self.special_kg_token = self.tokenizer.convert_tokens_to_ids("<KG_EMBEDDING>")
+
+        self.special_kg_token = self.tokenizer.convert_tokens_to_ids(SPECIAL_KG_TOKEN)
         
         
     @classmethod
@@ -639,7 +639,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
     def forward(
         self, 
         input_ids : torch.Tensor, 
-        graphs: Batch,
+        graphs: Batch = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[torch.Tensor] = None,
@@ -694,12 +694,10 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         logging.debug(f"Output from LLM: {out.keys()}")
         
         # If RVQ_loss is not None, add it to the model's loss for training
-        if return_dict and hasattr(out, "loss") and out.loss is not None:
-            if RVQ_loss is not None:
-                out["RVQ_loss"] = RVQ_loss
-        elif not return_dict and out[0] is not None:
-             if RVQ_loss is not None:
-                out = (out[0] + RVQ_loss,) + out[1:]
+        if return_dict:
+            out["RVQ_loss"] = RVQ_loss
+        else:
+            out = (out[0] + RVQ_loss,) + out[1:]
             
         return out
         

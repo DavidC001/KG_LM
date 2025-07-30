@@ -226,6 +226,11 @@ class KG_LFM_Trainer:
         self.train_dataloader = train
         self.val_dataloader = val
         self.test_dataloader = test
+        
+        # if steps_train is float, convert to int
+        if isinstance(self.steps_train, float):
+            self.steps_train = int(len(self.train_dataloader) * self.steps_train)
+            self.accelerator.print(f"Converted steps_train to {self.steps_train} based on dataset size.")
              
         
     def setup_optimizer_and_scheduler(self, num_epochs: int):
@@ -364,9 +369,6 @@ class KG_LFM_Trainer:
                 self.train_iter = iter(self.skip_train_dataloader)
             else:
                 self.train_iter = iter(self.train_dataloader)
-            
-            if self.steps_train == -1:
-                self.steps_train = len(self.train_dataloader)  # Use full dataset if steps_train is -1
         
         progress_bar = tqdm(
             desc=f"Training Step {self.global_step // self.steps_train}",
