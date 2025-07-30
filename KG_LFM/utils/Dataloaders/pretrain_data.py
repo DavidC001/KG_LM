@@ -8,7 +8,7 @@ import networkx as nx
 from datasets import Dataset as HFDataset
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory
+from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
 from KG_LFM.configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig, SPECIAL_KG_TOKEN
@@ -286,8 +286,14 @@ class TriRexStarDataLoader:
         self.tokenizer = tokenizer
         
         # Load datasets
-        print("Loading TriREx and TRExStar datasets...")
-        self.train_dataset, self.val_dataset, self.test_dataset = trirex_factory(dataset_config)
+        print(f"Loading {dataset_config.name} and TRExStar datasets...")
+        
+        dataset_factory = {
+            "trirex": trirex_factory,
+            "trirex-bite": trex_bite_factory,
+        }
+        
+        self.train_dataset, self.val_dataset, self.test_dataset = dataset_factory[dataset_config.name](dataset_config)
         self.star_graphs = trex_star_graphs_factory(dataset_config)
         
         self.collator = self._get_collator()

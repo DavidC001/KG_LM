@@ -8,7 +8,7 @@ from typing import Optional, Union
 import yaml
 
 IGNORE_INDEX = -100
-SPECIAL_KG_TOKEN = "<KG_EMBEDDING>"
+SPECIAL_KG_TOKEN = " <KG_EMBEDDING>"
 
 def dataclass(*args, **kwargs):
     """
@@ -35,6 +35,12 @@ def dataclass(*args, **kwargs):
 
 @dataclass
 class TRex_DatasetConfig:
+    name: str = "trirex"
+    """
+    Type of the dataset. Defaults to 'trirex'.
+    Options are 'trirex', 'trirex-bite', ...
+    """
+    
     lite: bool = False
     """Whether to use the lite version of the dataset. Defaults to False."""
     
