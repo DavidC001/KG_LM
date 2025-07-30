@@ -25,6 +25,9 @@ from accelerate.utils import set_seed
 import wandb
 from tqdm.auto import tqdm
 
+# PEFT imports for LoRA support
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+
 # Assuming these are defined in your project structure
 from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
@@ -203,6 +206,15 @@ class KG_LFM_Trainer:
             self.accelerator.print("Freezing language model parameters.")
             for param in self.model.llm.parameters():
                 param.requires_grad = False
+        
+        if self.config.model.use_lora:
+            # Setup LoRA before freezing any parameters
+            self.setup_lora()
+            # If using LoRA, we freeze the base model parameters but keep LoRA parameters trainable
+            self.logger.info("Freezing base language model parameters (LoRA parameters remain trainable).")
+            for name, param in self.model.llm.named_parameters():
+                if "lora_" not in name:
+                    param.requires_grad = False
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -216,6 +228,28 @@ class KG_LFM_Trainer:
                 "model/total_parameters": total_params,
                 "model/trainable_parameters": trainable_params,
             }, step=0)
+
+    def setup_lora(self):
+        """Setup LoRA for the language model if configured."""
+        if not self.config.model.use_lora:
+            return
+            
+        self.logger.info("Setting up LoRA for language model...")
+        
+        target_modules = ["q_proj", "k_proj"]
+        
+        # Create LoRA configuration
+        lora_config = LoraConfig(
+            # r=self.config.model.lora_r,
+            # lora_alpha=self.config.model.lora_alpha,
+            lora_dropout=self.config.model.dropout,
+            target_modules=target_modules,
+        )
+        
+        # Apply LoRA to the language model
+        self.model.llm = get_peft_model(self.model.llm, lora_config)
+        
+        self.logger.info(f"LoRA setup complete:")
 
     def setup_data(self):
         """Setup data loaders with distributed support."""
@@ -254,7 +288,7 @@ class KG_LFM_Trainer:
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode="min",
-            factor=0.1,
+            factor=0.5,
             patience=self.config.train_conf.early_stopping_patience // 2,
             verbose=True
         )
