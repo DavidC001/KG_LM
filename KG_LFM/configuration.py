@@ -164,6 +164,9 @@ class PretrainConfig:
     checkpoint_frequency: int = 1
     """Frequency of saving checkpoints during pretraining. Defaults to every epoch."""
     
+    start_from_checkpoint: Optional[str] = None
+    """Path to a checkpoint to load model weights from before training. Defaults to None."""
+    
     resume : bool = False
     
     def __post_init__(self):
