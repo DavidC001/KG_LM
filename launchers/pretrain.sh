@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=pretrain                # job name
+#SBATCH --job-name=pretrain             # job name
 #SBATCH --nodes=1                       # number of nodes
-#SBATCH --time=1-00:00:00                 # time limits
-#SBATCH --output=out/pretrain_%j.out                # standard output file
-#SBATCH --account=iscrc_kg-lfm        # account name
+#SBATCH --time=1-00:00:00               # time limits
+#SBATCH --output=out/pretrain_%j.out    # standard output file
+#SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
-#SBATCH --gpus-per-node=4            # number of GPUs per node
+#SBATCH --gpus-per-node=4               # number of GPUs per node
 #SBATCH --cpus-per-gpu=8                # number of CPU cores per GPU
-#SBATCH --mem-per-cpu=15G          # memory per CPU core
+#SBATCH --mem=480GB
 #SBATCH --chdir=.                       # start from current directory
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure
 #SBATCH --mail-user=davide.cavicchini@studenti.unitn.it
