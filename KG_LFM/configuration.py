@@ -153,9 +153,6 @@ class PretrainConfig:
     learning_rate: float = 1e-4
     """Learning rate for the pretraining optimizer. Defaults to 1e-4."""
     
-    scheduler_eta_min: float = 1e-5
-    """Minimum learning rate for the scheduler. Defaults to 1e-5."""
-    
     weight_decay: float = 0.01
     """Weight decay for the pretraining optimizer. Defaults to 0.01."""
     
@@ -181,7 +178,6 @@ class PretrainConfig:
         # Ensure that learning rate and weight decay are numbers
         self.learning_rate = float(self.learning_rate)
         self.weight_decay = float(self.weight_decay)
-        self.scheduler_eta_min = float(self.scheduler_eta_min)
 
 
 @dataclass

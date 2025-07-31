@@ -20,7 +20,6 @@ train_conf:
   clip_grad_norm: 1.0
 
   learning_rate: 1e-3
-  scheduler_eta_min: 1e-6
   weight_decay: 0.05
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
