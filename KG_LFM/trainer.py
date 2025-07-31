@@ -198,12 +198,6 @@ class KG_LFM_Trainer:
             self.logger.info(f"Loading model from checkpoint: {self.config.train_conf.start_from_checkpoint}")
             self.model = KG_LFM.from_pretrained(self.config.train_conf.start_from_checkpoint)
 
-        # Freeze layers if configured
-        if not self.config.model.tune_language_model:
-            self.accelerator.print("Freezing language model parameters.")
-            for param in self.model.llm.parameters():
-                param.requires_grad = False
-
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
@@ -254,7 +248,7 @@ class KG_LFM_Trainer:
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode="min",
-            factor=0.1,
+            factor=0.5,
             patience=self.config.train_conf.early_stopping_patience // 2,
             verbose=True
         )
