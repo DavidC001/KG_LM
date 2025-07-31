@@ -24,6 +24,7 @@ if [ -z "$1" ]; then
     export CONFIG_FILE="configs/pretrain_config.yaml"
 else
     export CONFIG_FILE=$1
+    echo "Using provided config file: $CONFIG_FILE"
 fi
 
 # Use accelerate launch with explicit deepspeed config

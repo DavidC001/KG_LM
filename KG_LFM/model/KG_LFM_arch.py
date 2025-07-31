@@ -11,7 +11,7 @@ from typing import Optional, Tuple, Union, List
 from transformers import (
     AutoConfig, AutoModel, AutoModelForCausalLM,
     AutoTokenizer, PreTrainedTokenizer,
-    PreTrainedModel, GenerationConfig
+    PreTrainedModel, GenerationConfig,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -19,6 +19,9 @@ import torch
 from KG_LFM.model.KG_encoder import KGEncoder
 
 from torch_geometric.data import Batch
+
+# PEFT imports for LoRA support
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 # Constants
 from KG_LFM.configuration import IGNORE_INDEX, SPECIAL_KG_TOKEN, ModelConfig
@@ -104,13 +107,25 @@ class KG_LFMMetaModel(ABC):
     def init_KGLM(self, config: KG_LFMConfig = None, *args, **kwargs):
         if hasattr(self, "llm") or hasattr(self, "kg_encoder"):
             return 
-        
-        model_dtype = getattr(config, "model_dtype", "torch.float16")
-        if not hasattr(config, "model_dtype"):
-            warnings.warn("model_dtype not found in config, defaulting to torch.float16.")
-            config.model_dtype = model_dtype
 
         self.llm = AutoModelForCausalLM.from_pretrained(config.llm_model_name, trust_remote_code=True)
+        
+        # Freeze layers if configured
+        if not config.tune_language_model:
+            logging.info("Freezing language model parameters.")
+            for param in self.llm.parameters():
+                param.requires_grad = False
+        
+        # Apply lora if configured
+        if config.use_lora:
+            logging.info("Applying LoRA to the language model.")
+            lora_config = LoraConfig(
+                r=config.lora_r,
+                lora_alpha=config.lora_alpha,
+                target_modules=config.lora_target_modules,
+                task_type=TaskType.CAUSAL_LM
+            )
+            self.llm : PeftModel = get_peft_model(self.llm, lora_config)
         
         self.text_embs_std = self.llm.get_input_embeddings().weight.std().item()
         
@@ -151,7 +166,7 @@ class KG_LFMMetaModel(ABC):
             raise ValueError(f"The path '{model_path_or_config}' is not a valid directory.")
 
         # Load the main configuration file for the KG_LFM model
-        config = KG_LFMConfig.from_pretrained(model_path_or_config, **kwargs)
+        config : KG_LFMConfig = KG_LFMConfig.from_pretrained(model_path_or_config, **kwargs)
 
         # Initialize the model instance (e.g., KG_LFM) using the loaded config.
         # This will call `init_KGLM` and create the base architecture.
@@ -208,8 +223,7 @@ class KG_LFMMetaModel(ABC):
                 self.tokenizer.save_pretrained(llm_dir)
             
             self.llm.config._name_or_path = llm_dir
-            llm_state_dict = OrderedDict({k.split("llm.")[-1]: v for k, v in state_dict.items() if "llm." in k})
-            self.llm.save_pretrained(llm_dir, state_dict=llm_state_dict)
+            self.llm.save_pretrained(llm_dir)
 
         # Save KG encoder weights
         if self.get_kg_encoder():
@@ -223,7 +237,6 @@ class KG_LFMMetaModel(ABC):
         self.config._name_or_path = output_dir
         self.config.architectures = [self.__class__.__name__]
         self.config.save_pretrained(output_dir)
-
 
     def get_llm(self):
         llm = getattr(self, "llm", None)

@@ -15,3 +15,4 @@ wandb
 torchbiggraph @ git+https://github.com/joelbarmettlerUZH/PyTorch-BigGraph.git@7faa89d6ae034332b1836d2f6a0e51bdc931afe8
 psutil
 flash-attn
+peft
