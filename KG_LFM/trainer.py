@@ -183,21 +183,20 @@ class KG_LFM_Trainer:
 
     def setup_model(self):
         """Initialize the model with proper configuration."""
-        self.accelerator.print("Setting up model...")
+        self.logger.info("Setting up model...")
         
         # Profile model initialization
-        model_config = KG_LFMConfig.from_pretrained(
-            self.config.model.llm_model_name,
-            trust_remote_code=True,
-        )
-        model_config = set_KGLM_model_args(model_config, self.config.model)
-        self.model = KG_LFM(model_config)
-        
-        # Freeze layers if configured
-        if not self.config.model.tune_language_model:
-            self.accelerator.print("Freezing language model parameters.")
-            for param in self.model.llm.parameters():
-                param.requires_grad = False
+        if not self.config.train_conf.start_from_checkpoint:
+            self.logger.info("Loading fresh model configuration from pretrained model.")
+            model_config = KG_LFMConfig.from_pretrained(
+                self.config.model.llm_model_name,
+                trust_remote_code=True,
+            )
+            model_config = set_KGLM_model_args(model_config, self.config.model)
+            self.model = KG_LFM(model_config)
+        else:
+            self.logger.info(f"Loading model from checkpoint: {self.config.train_conf.start_from_checkpoint}")
+            self.model = KG_LFM.from_pretrained(self.config.train_conf.start_from_checkpoint)
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -229,7 +228,7 @@ class KG_LFM_Trainer:
         
         # if steps_train is float, convert to int
         if isinstance(self.steps_train, float):
-            self.steps_train = int(len(self.train_dataloader) * self.steps_train)
+            self.steps_train = int(len(self.train_dataloader) * self.steps_train / self.accelerator.num_processes)
             self.accelerator.print(f"Converted steps_train to {self.steps_train} based on dataset size.")
              
         
@@ -249,7 +248,7 @@ class KG_LFM_Trainer:
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode="min",
-            factor=0.1,
+            factor=0.5,
             patience=self.config.train_conf.early_stopping_patience // 2,
             verbose=True
         )

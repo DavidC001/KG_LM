@@ -9,14 +9,14 @@ dataset:
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "pretrain_trirex"
+  run_name: "pretrain_trirex_big"
     
   epochs: 10
-  early_stopping_patience: 6
-  steps_train: 4000  # Number of training steps before validation
-  eval_perc: 0.25
+  early_stopping_patience: 4
+  steps_train: 0.2  # Number of training steps before validation
+  eval_perc: 0.2
 
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 4
   clip_grad_norm: 1.0
 
   learning_rate: 1e-3
@@ -25,7 +25,7 @@ train_conf:
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  resume : False
+  resume : True
 
   dataloader:
     batch_size: 32
@@ -46,8 +46,8 @@ model:
   graph_pooling: True
 
   dropout: 0.2  
-  num_heads: 4
-  num_quantizers: 4
+  num_heads: 16
+  num_quantizers: 10
   codebook_size: 128
   shared_codebook: False
   

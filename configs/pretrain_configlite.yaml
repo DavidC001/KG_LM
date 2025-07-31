@@ -3,6 +3,7 @@
 seed: 42
 
 dataset:
+  name: "trirex"
   lite: True
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
@@ -12,24 +13,24 @@ train_conf:
   run_name: "pretrain_trirex"
     
   epochs: 10
-  early_stopping_patience: 6
-  steps_train: 4000  # Number of training steps before validation
-  eval_perc: 0.25
+  early_stopping_patience: 4
+  steps_train: 0.5  # Number of training steps before validation
+  eval_perc: 0.5
 
   gradient_accumulation_steps: 16
   clip_grad_norm: 1.0
 
   learning_rate: 1e-3
-  scheduler_eta_min: 1e-6
   weight_decay: 0.05
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  resume : True
+  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/pretrain_trirex_2/best_model"
+  resume : False
 
   dataloader:
-    batch_size: 32
+    batch_size: 8
     shuffle: True
     num_workers: 0
 
