@@ -53,6 +53,11 @@ class KG_LFMConfig(AutoConfig):
     
     tune_language_model: bool = False  # Whether to tune the language model
     tune_kg_encoder: bool = False  # Whether to tune the knowledge graph encoder
+    
+    use_lora: bool = True  # Whether to use LoRA for training
+    lora_r: int = 8  # Rank for LoRA
+    lora_alpha: int = 16  # Alpha for LoRA scaling
+    lora_target_modules: List[str] = ["q_proj", "k_proj"]
 
 def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     """
@@ -87,6 +92,10 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.shared_codebook = model_args.shared_codebook
     config.tune_language_model = model_args.tune_language_model
     config.tune_kg_encoder = model_args.tune_kg_encoder
+    config.use_lora = model_args.use_lora
+    config.lora_r = model_args.lora_r
+    config.lora_alpha = model_args.lora_alpha
+    config.lora_target_modules = model_args.lora_target_modules
     
     return config
 

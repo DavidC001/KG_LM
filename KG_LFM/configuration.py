@@ -115,7 +115,15 @@ class ModelConfig:
     
     # Training Configuration
     tune_language_model: bool = False
-    """Whether to tune the language model during training. Defaults to False."""
+    """Whether to tune the language model base parameters (does not affect lora params) during training. Defaults to False."""
+    
+    use_lora: bool = True
+    """Whether to use LoRA for training. Defaults to True."""
+    lora_r: int = 8
+    """Rank for LoRA. Defaults to 8."""
+    lora_alpha: int = 16
+    """Alpha for LoRA scaling. Defaults to 16."""
+    lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj"])
     
     tune_kg_encoder: bool = True
     """Whether to tune the knowledge graph encoder during training. Defaults to True."""
