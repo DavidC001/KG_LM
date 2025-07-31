@@ -1,4 +1,8 @@
 sentence-transformers
+filelock
+pandas
+matplotlib
+seabornrs
 transformers
 torch
 scikit-learn
@@ -16,3 +20,4 @@ torchbiggraph @ git+https://github.com/joelbarmettlerUZH/PyTorch-BigGraph.git@7f
 psutil
 flash-attn
 peft
+ray[data,train,tune,serve]

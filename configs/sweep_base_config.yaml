@@ -3,20 +3,21 @@
 seed: 42
 
 dataset:
-  lite: False
+  name: "trirex"
+  lite: True
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "pretrain_trirex"
+  run_name: "pretrain_trirex_lora"
     
   epochs: 10
-  early_stopping_patience: 6
-  steps_train: 4000  # Number of training steps before validation
-  eval_perc: 0.25
+  early_stopping_patience: 4
+  steps_train: 0.2  # Number of training steps before validation
+  eval_perc: 0.5
 
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 4
   clip_grad_norm: 1.0
 
   learning_rate: 1e-3
@@ -28,9 +29,9 @@ train_conf:
   resume : False
 
   dataloader:
-    batch_size: 32
+    batch_size: 8
     shuffle: True
-    num_workers: 2
+    num_workers: 0
 
     include_graphs: True
     return_tensors: "pt"
@@ -47,13 +48,18 @@ model:
 
   dropout: 0.2  
   num_heads: 4
-  num_quantizers: 4
+  num_quantizers: 10
   codebook_size: 128
   shared_codebook: False
   
   # Training Configuration
   tune_language_model: False
   tune_kg_encoder: True
+
+  use_lora: True
+  lora_r: 8
+  lora_alpha: 16
+  lora_target_modules: ["q_proj", "k_proj"]
   
   # Graph Node Embedding Configuration
   graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"
