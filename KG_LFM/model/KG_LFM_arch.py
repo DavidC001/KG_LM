@@ -346,7 +346,7 @@ class KG_LFMMetaForCausalLM(ABC):
         # This prevents embedding lookup errors for the special KG token
         input_ids_copy = input_ids.clone()
         input_ids_copy[input_ids_copy == self.special_kg_token] = 0
-        input_embeds = self.llm.model.embed_tokens(input_ids_copy)
+        input_embeds = self.llm.get_input_embeddings()(input_ids_copy)
 
         # Extract valid tokens based on attention mask for each sample in the batch
         # This removes padding tokens from processing
