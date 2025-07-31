@@ -9,10 +9,9 @@
 #SBATCH --ntasks-per-node=1             # number of tasks per node
 #SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
-#SBATCH --qos=normal
 
-#SBATCH --gpus-per-task=4                 
-#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-task=1                 
+#SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15GB
 
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure
@@ -66,7 +65,7 @@ port=6379
 ##############################################################################################
 echo "STARTING HEAD at $head_node"
 echo "Head node IP: $head_node_ip"
-echo "All allocated nodes: $all_nodes"
+echo -e "All allocated nodes: \n$all_nodes"
 
 # Start the head node
 srun --nodes=1 --ntasks=1 -w $head_node launchers/ray/start-head.sh $head_node_ip &
@@ -85,6 +84,6 @@ sleep 5
 ##############################################################################################
 
 #### call your code below
-python sweep.py \
+python -u sweep.py \
     --base_conf $base_conf \
     --time_budget $time_budget

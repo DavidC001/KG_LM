@@ -48,11 +48,15 @@ def train_kg_lfm(sweep_config):
     
     # Update the configuration with the sweep parameters
     config.train_conf.learning_rate = sweep_config["learning_rate"]
-    config.train_conf.gradient_accumulation_steps = sweep_config["gradient_accumulation_steps"]
     config.model.num_heads = sweep_config["num_heads"]
     config.model.num_quantizers = sweep_config["num_quantizers"]
     config.model.codebook_size = sweep_config["codebook_size"]
-    config.model.shared_codebook = sweep_config["shared_codebook"]
+    config.model.use_lora = sweep_config["use_lora"]
+
+    # Ensure the run name is unique for each trial
+    config.train_conf.run_name = f"{config.train_conf.run_name}_{session.get_trial_id()}"
+    
+    logging.info(f"Starting training for trial {session.get_trial_id()} with config: {sweep_config}")
     
     # Initialize the trainer with the updated config
     trainer = KG_LFM_Trainer(
@@ -79,7 +83,10 @@ def main():
                        help="Time budget for the sweep in seconds.")
 
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    )
     
     base_config_path = args.base_config
     time_budget = args.time_budget
@@ -97,6 +104,7 @@ def main():
         tune_config=tune.TuneConfig(
             metric="validation_loss",
             mode="min",
+            num_samples=20,
             scheduler=sched,
             time_budget_s=time_budget, 
         ),
@@ -106,12 +114,11 @@ def main():
         ),
         param_space={
             "learning_rate": tune.loguniform(1e-4, 1e-2),
-            "gradient_accumulation_steps": tune.choice([4, 8, 16]),
             "num_heads": tune.choice([4, 8, 16]),
-            "num_quantizers": tune.choice([4, 8, 16]),
+            "num_quantizers": tune.choice([4, 8, 10, 16]),
             "codebook_size": tune.choice([128, 256, 512]),
-            "shared_codebook": tune.choice([True, False]),
-            "base_config": tune.grid_search([base_config_path])
+            "use_lora": tune.choice([True, False]),
+            "base_config": tune.grid_search([base_config_path]),
         }
     )
     results = tuner.fit()
