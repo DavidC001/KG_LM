@@ -234,7 +234,7 @@ class KG_LFM_Trainer:
         
         # if steps_train is float, convert to int
         if isinstance(self.steps_train, float):
-            self.steps_train = int(len(self.train_dataloader) * self.steps_train)
+            self.steps_train = int(len(self.train_dataloader) * self.steps_train / self.accelerator.num_processes)
             self.accelerator.print(f"Converted steps_train to {self.steps_train} based on dataset size.")
              
         
