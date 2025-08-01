@@ -14,6 +14,7 @@ train_conf:
     
   epochs: 10
   early_stopping_patience: 4
+
   steps_train: 0.33  # Number of training steps before validation
   eval_perc: 0.5
 
@@ -30,6 +31,7 @@ train_conf:
 
   dataloader:
     batch_size: 16
+
     shuffle: True
     num_workers: 0
 
