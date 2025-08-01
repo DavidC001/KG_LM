@@ -117,7 +117,7 @@ class KG_LFMMetaModel(ABC):
                 param.requires_grad = False
         
         # Apply lora if configured
-        if config.use_lora:
+        if hasattr(config, "use_lora") and config.use_lora:
             logging.info("Applying LoRA to the language model.")
             lora_config = LoraConfig(
                 r=config.lora_r,
