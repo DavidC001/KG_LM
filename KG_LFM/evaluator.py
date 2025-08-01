@@ -258,12 +258,13 @@ class KGLFMEvaluator:
 
                     # Extract loss and count valid tokens
                     loss = outputs.loss
-                    
                     if loss is not None:
                         # Count valid tokens (non-padded)
                         valid_tokens = (batch['attention_mask'] == 1).sum().item() 
+                        
                         # remove special token ignored during loss computation
                         valid_tokens -= torch.sum(batch['input_ids'] == self.model.special_kg_token).item()
+                        
                         
                         # Gather losses and token counts from all processes
                         loss_gathered = self.accelerator.gather(loss.unsqueeze(0))
@@ -372,6 +373,7 @@ class KGLFMEvaluator:
             
             hit_k_correct = {k: 0 for k in k_values}
             total_objects = 0
+            average_num_tokens = 0
             
             with torch.no_grad():
                 for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing Hit@k metrics", disable=not self.accelerator.is_main_process)):
@@ -432,6 +434,12 @@ class KGLFMEvaluator:
                         object_logits = sample_logits[object_positions]  # (num_object_tokens, vocab_size)
                         object_labels = sample_labels[object_positions]  # (num_object_tokens,)
                         
+                        # Calculate average number of tokens of entire input sequence by summing all position of input_ids which are not padding
+                        average_num_tokens += (
+                            (batch['attention_mask'][sample_idx] == 1).sum().item() +
+                            torch.sum(batch['input_ids'][sample_idx] == self.model.special_kg_token).item() * self.config.model.num_quantizers
+                        )
+
                         # Compute ranks for each token
                         token_ranks = []
                         for logits, true_label in zip(object_logits, object_labels):
@@ -456,7 +464,9 @@ class KGLFMEvaluator:
             
             total_objects_tensor = torch.tensor(total_objects, device=self.accelerator.device)
             total_objects_gathered = self.accelerator.gather(total_objects_tensor).sum().item()
-            
+
+            average_num_tokens_gathered = self.accelerator.gather(torch.tensor(average_num_tokens, device=self.accelerator.device)).sum().item()
+
             # Synchronize across processes
             self.accelerator.wait_for_everyone()
             
@@ -464,10 +474,13 @@ class KGLFMEvaluator:
             metrics = {}
             if self.accelerator.is_main_process:
                 if total_objects_gathered > 0:
+                    average_num_tokens_gathered /= total_objects_gathered
+                    metrics['average_num_tokens'] = average_num_tokens_gathered
+                    
                     for k in k_values:
                         metrics[f'hit_at_{k}'] = hit_k_tensors[k] / total_objects_gathered
                     
-                    self.logger.info(f"Hit@k computed on {total_objects_gathered} objects")
+                    self.logger.info(f"Hit@k computed on {total_objects_gathered} objects with average {average_num_tokens_gathered:.2f} tokens per object.")
                     for k in k_values:
                         self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
                 else:
