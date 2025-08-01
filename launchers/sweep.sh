@@ -1,5 +1,6 @@
 #!/bin/bash
-#SBATCH --nodes=5                       # number of nodes
+#SBATCH --nodes=10                       # number of nodes
+
 
 #SBATCH --job-name=ray_sweep            # job name
 #SBATCH --time=24:00:00               # time limits
