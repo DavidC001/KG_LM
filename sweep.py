@@ -23,7 +23,7 @@ class RayTuneMetricsTracker(DefaultMetricsTracker):
 
     def reset(self):
         """Resets the tracker."""
-         # Only report to Ray Tune if we have validation_loss
+        # Only report to Ray Tune if we have validation_loss
         # This prevents premature reporting of only training_loss
         if 'validation_loss' in self.values:
             # Get current averages and report them
@@ -43,36 +43,39 @@ class RayTuneMetricsTracker(DefaultMetricsTracker):
 
 def train_kg_lfm(sweep_config):
     """Training function for Ray Tune hyperparameter optimization."""
-    # get the base configuration
-    config = load_yaml_config(sweep_config["base_config"])
-    
-    # Update the configuration with the sweep parameters
-    config.train_conf.learning_rate = sweep_config["learning_rate"]
-    config.model.num_heads = sweep_config["num_heads"]
-    config.model.num_quantizers = sweep_config["num_quantizers"]
-    config.model.codebook_size = sweep_config["codebook_size"]
-    config.model.use_lora = sweep_config["use_lora"]
+    try:
+        # get the base configuration
+        config = load_yaml_config(sweep_config["base_config"])
+        
+        # Update the configuration with the sweep parameters
+        config.train_conf.learning_rate = sweep_config["learning_rate"]
+        config.train_conf.weight_decay = sweep_config["weight_decay"]
+        config.model.num_heads = sweep_config["num_heads"]
+        config.model.num_quantizers = sweep_config["num_quantizers"]
+        config.model.codebook_size = sweep_config["codebook_size"]
 
-    # Ensure the run name is unique for each trial
-    config.train_conf.run_name = f"{config.train_conf.run_name}_{session.get_trial_id()}"
-    
-    logging.info(f"Starting training for trial {session.get_trial_id()} with config: {sweep_config}")
-    
-    # Initialize the trainer with the updated config
-    trainer = KG_LFM_Trainer(
-        config=config, 
-        run_name=session.get_trial_id(),
-        resume=False,
-        enable_wandb=False,
-        save_checkpoints=False,
-        metrics_tracker=RayTuneMetricsTracker()
-    )
-    
-    trainer.train()
+        # Ensure the run name is unique for each trial
+        config.train_conf.run_name = f"{config.train_conf.run_name}_{session.get_trial_id()}"
+        
+        logging.info(f"Starting training for trial {session.get_trial_id()} with config: {sweep_config}")
+        
+        # Initialize the trainer with the updated config
+        trainer = KG_LFM_Trainer(
+            config=config, 
+            run_name=session.get_trial_id(),
+            resume=False,
+            enable_wandb=False,
+            save_checkpoints=False,
+            metrics_tracker=RayTuneMetricsTracker()
+        )
+        
+        trainer.train()
 
-    # Print the results
-    logging.info(f"Training completed for trial {session.get_trial_id()}.")
-    logging.info(f"Final metrics: {trainer.metrics_tracker.get_averages()} for config: {sweep_config}")
+        # Print the results
+        logging.info(f"Training completed for trial {session.get_trial_id()}.")
+        logging.info(f"Final metrics: {trainer.metrics_tracker.get_averages()} for config: {sweep_config}")
+    except Exception as e:
+        logging.error(f"Error during training for trial {session.get_trial_id()}: {e}")
 
 def main():
     """Main function with Ray Tune hyperparameter optimization."""
@@ -104,7 +107,7 @@ def main():
         tune_config=tune.TuneConfig(
             metric="validation_loss",
             mode="min",
-            num_samples=20,
+            num_samples=-1,
             scheduler=sched,
             time_budget_s=time_budget, 
         ),
@@ -113,11 +116,11 @@ def main():
             stop=TimeoutStopper(time_budget//4),  # Stop after time_budget
         ),
         param_space={
-            "learning_rate": tune.loguniform(1e-4, 1e-2),
+            "learning_rate": tune.loguniform(1e-4, 1e-3),
+            "weight_decay": tune.loguniform(1e-5, 1e-2),
             "num_heads": tune.choice([4, 8, 16]),
             "num_quantizers": tune.choice([4, 8, 10, 16]),
             "codebook_size": tune.choice([128, 256, 512]),
-            "use_lora": tune.choice([True, False]),
             "base_config": tune.grid_search([base_config_path]),
         }
     )
