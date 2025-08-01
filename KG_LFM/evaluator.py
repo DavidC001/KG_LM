@@ -29,7 +29,8 @@ from KG_LFM.model.KG_LFM_arch import KG_LFM
 from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from accelerate.utils import set_seed
+from accelerate import Accelerator
+from accelerate.utils import set_seed, broadcast_object_list
 
 from copy import deepcopy
 
@@ -39,16 +40,16 @@ class KGLFMEvaluator:
     def __init__(
         self,
         config_path: str,
-        device: str = "cuda",
         batch_size: int = 8,
         max_samples: Optional[int] = None
     ):
         self.config_path = config_path
-        self.device = device
         self.batch_size = batch_size
         self.max_samples = max_samples
         
-        # Setup logging
+        # Initialize accelerator
+        self.accelerator = Accelerator()
+        
         self.logger = logging.getLogger(__name__)
         
         # Load configuration
@@ -152,14 +153,13 @@ class KGLFMEvaluator:
         
     def load_model(self):
         """Load the best trained model."""
-        self.logger.info(f"Loading model from {self.model_path}")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Loading model from {self.model_path}")
         
         try:
             self.model = KG_LFM.from_pretrained(self.model_path)
-            self.model.to(self.device)
             self.model.eval()
             self.tokenizer = self.model.tokenizer
-            self.logger.info("Model loaded successfully")
             
             # if the config requires to tune the model also load clean model
             if self.config.model.tune_language_model:
@@ -171,14 +171,17 @@ class KGLFMEvaluator:
                     self.config.model.llm_model_name,
                     cache_dir=self.config.train_conf.cache_dir
                 )
-                self.clean_model.to(self.device)
                 self.clean_model.eval()
             else:
                 self.clean_model = self.model
                 self.clean_tokenizer = self.tokenizer
-            self.logger.info("Clean model loaded successfully")
+            
+            if self.accelerator.is_main_process:
+                self.logger.info("Model loaded successfully")
+                self.logger.info("Clean model loaded successfully")
         except Exception as e:
-            self.logger.error(f"Error loading model: {e}")
+            if self.accelerator.is_main_process:
+                self.logger.error(f"Error loading model: {e}")
             raise
         
         self.tests = {
@@ -189,7 +192,8 @@ class KGLFMEvaluator:
     
     def setup_data(self, split: str = "test"):
         """Setup data loaders for evaluation."""
-        self.logger.info(f"Setting up {split} data loader")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Setting up {split} data loader")
         
         self.dataloader = create_dataloader(
             self.config.dataset,
@@ -198,31 +202,51 @@ class KGLFMEvaluator:
             split=split
         )
         
-        self.logger.info(f"Data loader setup complete. {len(self.dataloader)} batches available.")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Data loader setup complete. {len(self.dataloader)} batches available.")
     
+    def prepare_accelerator(self):
+        """Prepare the accelerator for distributed training."""
+        if self.accelerator.is_main_process:
+            self.logger.info("Preparing accelerator...")
+        
+        # Prepare model and dataloader
+        if self.config.model.tune_language_model:
+            self.model, self.clean_model, self.dataloader = self.accelerator.prepare(
+                self.model, self.clean_model, self.dataloader
+            )
+        else:
+            self.model, self.dataloader = self.accelerator.prepare(
+                self.model, self.dataloader
+            )
+            self.clean_model = self.model  # Use the same model if not tuning
+            
     def compute_perplexity(self, ) -> float:
         """Compute perplexity on the test set."""
-        self.logger.info("Computing perplexity...")
+        if self.accelerator.is_main_process:
+            self.logger.info("Computing perplexity...")
         
         results = {}
         
         for name, (preprocess_func, model) in self.tests.items():
-            self.logger.info(f"Evaluating {name} model...")
+            if self.accelerator.is_main_process:
+                self.logger.info(f"Evaluating {name} model...")
             
             total_loss = 0.0
             total_tokens = 0
             
             with torch.no_grad():
-                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing perplexity")):
-                    if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing perplexity", disable=not self.accelerator.is_main_process)):
+                    if self.max_samples and (batch_idx * self.batch_size * self.accelerator.num_processes) >= self.max_samples:
                         break
                     
                     batch = preprocess_func(batch)
                     
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch.items()}
+                    batch['input_ids'] = batch['input_ids'].to(self.accelerator.device)
+                    batch['attention_mask'] = batch['attention_mask'].to(self.accelerator.device)
+                    batch['labels'] = batch['input_ids'].to(self.accelerator.device)
                     
+                    # No need to move to device manually - accelerator handles this
                     model_input = {
                         'input_ids': batch['input_ids'],
                         'attention_mask': batch['attention_mask'],
@@ -235,23 +259,45 @@ class KGLFMEvaluator:
                     # Extract loss and count valid tokens
                     loss = outputs.loss
                     
-                    if loss is not None and not torch.isnan(loss):
+                    if loss is not None:
                         # Count valid tokens (non-padded)
                         valid_tokens = (batch['attention_mask'] == 1).sum().item() 
                         # remove special token ignored during loss computation
                         valid_tokens -= torch.sum(batch['input_ids'] == self.model.special_kg_token).item()
-                        total_loss += loss.item() * valid_tokens
-                        total_tokens += valid_tokens
+                        
+                        # Gather losses and token counts from all processes
+                        loss_gathered = self.accelerator.gather(loss.unsqueeze(0))
+                        valid_tokens_tensor = torch.tensor(valid_tokens, device=self.accelerator.device)
+                        tokens_gathered = self.accelerator.gather(valid_tokens_tensor.unsqueeze(0))
+                        
+                        if self.accelerator.is_main_process:
+                            total_loss += (loss_gathered.sum() * tokens_gathered.sum()).item()
+                            total_tokens += tokens_gathered.sum().item()
             
-            if total_tokens > 0:
-                avg_loss = total_loss / total_tokens
-                perplexity = math.exp(avg_loss)
-                self.logger.info(f"Perplexity: {perplexity:.4f}")
-                results[name] = perplexity
+            # Synchronize across processes
+            self.accelerator.wait_for_everyone()
+            
+            if self.accelerator.is_main_process:
+                if total_tokens > 0:
+                    avg_loss = total_loss / total_tokens
+                    perplexity = math.exp(avg_loss)
+                    self.logger.info(f"Perplexity: {perplexity:.4f}")
+                    results[name] = perplexity
+                else:
+                    self.logger.warning("No valid tokens found for perplexity computation")
+                    results[name] = float('inf')
             else:
-                self.logger.warning("No valid tokens found for perplexity computation")
-                results[name] = float('inf')
+                # Non-main processes set dummy values
+                results[name] = 0.0
 
+        # Broadcast results to all processes
+        if self.accelerator.is_main_process:
+            results_to_broadcast = results
+        else:
+            results_to_broadcast = None
+        
+        results = broadcast_object_list([results_to_broadcast])[0]
+        
         # Return the results for all preprocessing methods
         return results
 
@@ -286,7 +332,7 @@ class KGLFMEvaluator:
         object_tokens_num = len(self.tokenizer.encode(object_text, add_special_tokens=False))
         
         # Find the position of object tokens in the input sequence
-        tokens = self.tokenizer.encode(sentence[:obj_end], add_special_tokens=False, return_tensors='pt')[0].to(self.device)
+        tokens = self.tokenizer.encode(sentence[:obj_end], add_special_tokens=False, return_tensors='pt')[0].to(self.accelerator.device)
         sentence_tokens = len(tokens)
         
         # Finding start index of the sentence in the tokenized sequence (reversed to avoid matching the textualization of the KG)
@@ -315,26 +361,31 @@ class KGLFMEvaluator:
         respective timesteps). This approach is robust to multi-token entities, a common 
         challenge in IR tasks involving named entities ("New York Times" vs. "NYT").
         """
-        self.logger.info(f"Computing Hit@k metrics for k={k_values}...")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Computing Hit@k metrics for k={k_values}...")
         
         results = {}
         
         for name, (preprocess_func, model) in self.tests.items():
-            self.logger.info(f"Evaluating {name} model for Hit@k metrics...")
+            if self.accelerator.is_main_process:
+                self.logger.info(f"Evaluating {name} model for Hit@k metrics...")
             
             hit_k_correct = {k: 0 for k in k_values}
             total_objects = 0
             
             with torch.no_grad():
-                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing Hit@k metrics")):
-                    if self.max_samples and batch_idx * self.batch_size >= self.max_samples:
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing Hit@k metrics", disable=not self.accelerator.is_main_process)):
+                    if self.max_samples and (batch_idx * self.batch_size * self.accelerator.num_processes) >= self.max_samples:
                         break
 
                     batch = preprocess_func(batch)
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch.items()}
+                    # No need to move to device manually - accelerator handles this
 
                     object_boundaries = [obj["boundaries"] for obj in batch['objects']]
+                    
+                    batch['input_ids'] = batch['input_ids'].to(self.accelerator.device)
+                    batch['attention_mask'] = batch['attention_mask'].to(self.accelerator.device)
+                    batch['labels'] = batch['input_ids'].to(self.accelerator.device)
                     
                     model_input = {
                         'input_ids': batch['input_ids'],
@@ -371,7 +422,8 @@ class KGLFMEvaluator:
                         )
                         
                         if not object_positions:
-                            self.logger.warning(f"No object tokens found for sample {sample_idx} in batch {batch_idx}. Skipping.")
+                            if self.accelerator.is_main_process:
+                                self.logger.warning(f"No object tokens found for sample {sample_idx} in batch {batch_idx}. Skipping.")
                             continue
                         
                         total_objects += 1
@@ -396,32 +448,59 @@ class KGLFMEvaluator:
                             if sequence_rank <= k:
                                 hit_k_correct[k] += 1
             
-            # Compute Hit@k metrics
+            # Gather hit counts and total objects from all processes
+            hit_k_tensors = {}
+            for k in k_values:
+                hit_k_tensor = torch.tensor(hit_k_correct[k], device=self.accelerator.device)
+                hit_k_tensors[k] = self.accelerator.gather(hit_k_tensor).sum().item()
+            
+            total_objects_tensor = torch.tensor(total_objects, device=self.accelerator.device)
+            total_objects_gathered = self.accelerator.gather(total_objects_tensor).sum().item()
+            
+            # Synchronize across processes
+            self.accelerator.wait_for_everyone()
+            
+            # Compute Hit@k metrics on main process
             metrics = {}
-            if total_objects > 0:
-                for k in k_values:
-                    metrics[f'hit_at_{k}'] = hit_k_correct[k] / total_objects
-                
-                    self.logger.info(f"Hit@k computed on {total_objects} objects")
-                for k in k_values:
-                    self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
+            if self.accelerator.is_main_process:
+                if total_objects_gathered > 0:
+                    for k in k_values:
+                        metrics[f'hit_at_{k}'] = hit_k_tensors[k] / total_objects_gathered
+                    
+                    self.logger.info(f"Hit@k computed on {total_objects_gathered} objects")
+                    for k in k_values:
+                        self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
+                else:
+                    self.logger.warning("No valid objects found for Hit@k computation")
+                    for k in k_values:
+                        metrics[f'hit_at_{k}'] = 0.0
             else:
-                self.logger.warning("No valid objects found for Hit@k computation")
+                # Non-main processes set dummy values
                 for k in k_values:
                     metrics[f'hit_at_{k}'] = 0.0
                     
             # Store results for this preprocessing method
             results[name] = metrics
 
+        # Broadcast results to all processes
+        if self.accelerator.is_main_process:
+            results_to_broadcast = results
+        else:
+            results_to_broadcast = None
+        
+        results = broadcast_object_list([results_to_broadcast])[0]
+        
         return results
 
     def evaluate(self, output_file: Optional[str] = None) -> Dict[str, Any]:
         """Run all evaluation metrics and return comprehensive results."""
-        self.logger.info("Starting comprehensive evaluation...")
+        if self.accelerator.is_main_process:
+            self.logger.info("Starting comprehensive evaluation...")
         
         # Load model and setup data
         self.load_model()
         self.setup_data()
+        self.prepare_accelerator()
         
         # Run all evaluations
         evaluations = {
@@ -431,30 +510,36 @@ class KGLFMEvaluator:
         
         # Run evaluations
         for eval_name, eval_func in evaluations.items():
-            self.logger.info(f"Running {eval_name}...")
+            if self.accelerator.is_main_process:
+                self.logger.info(f"Running {eval_name}...")
             self.results[eval_name] = eval_func()
             # Clear GPU memory after each evaluation
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
             
-        # Add metadata
-        self.results['metadata'] = {
-            'model_path': str(self.model_path),
-            'config_path': self.config_path,
-            'device': self.device,
-            'batch_size': self.batch_size,
-            'max_samples': self.max_samples,
-        }
+        # Add metadata (only on main process)
+        if self.accelerator.is_main_process:
+            self.results['metadata'] = {
+                'model_path': str(self.model_path),
+                'config_path': self.config_path,
+                'batch_size': self.batch_size,
+                'max_samples': self.max_samples,
+                'num_processes': self.accelerator.num_processes,
+                'process_index': self.accelerator.process_index,
+            }
         
-        # Save results if output file specified
-        if output_file:
+        # Save results if output file specified (only on main process)
+        if output_file and self.accelerator.is_main_process:
             self.save_results(output_file)
         
         return dict(self.results)
     
     def save_results(self, output_file: str):
-        """Save evsaluation results to a JSON file."""
+        """Save evaluation results to a JSON file."""
+        if not self.accelerator.is_main_process:
+            return
+            
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -465,6 +550,9 @@ class KGLFMEvaluator:
     
     def print_summary(self):
         """Print a summary of evaluation results."""
+        if not self.accelerator.is_main_process:
+            return
+            
         print("\n" + "="*80)
         print("KG-LFM EVALUATION SUMMARY")
         print("="*80)
