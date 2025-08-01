@@ -8,10 +8,10 @@ import networkx as nx
 from datasets import Dataset as HFDataset
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory
+from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig
+from KG_LFM.configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig, SPECIAL_KG_TOKEN
 
 from torch_geometric.data import Data, Batch
 
@@ -36,14 +36,14 @@ class TriRexStarDataset(Dataset):
         self.tokenizer = tokenizer
         self.big_graph_aligner = big_graph_aligner
         
-        # add to tokenizer a special token <KG_EMBEDDING> for graph embeddings
-        if " <KG_EMBEDDING>" not in self.tokenizer.get_vocab():
+        # add to tokenizer a special token SPECIAL_KG_TOKEN for graph embeddings
+        if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
             warnings.warn(
-                "The <KG_EMBEDDING> token is not in the tokenizer vocabulary. "
+                f"The {SPECIAL_KG_TOKEN} token is not in the tokenizer vocabulary. "
                 "Adding it to the tokenizer. This may lead to unexpected behavior."
             )
-            self.tokenizer.add_special_tokens({'additional_special_tokens': [' <KG_EMBEDDING>']})
-    
+            self.tokenizer.add_special_tokens({'additional_special_tokens': [SPECIAL_KG_TOKEN]})
+
     def __len__(self) -> int:
         return len(self.trirex_dataset)
     
@@ -68,21 +68,21 @@ class TriRexStarDataset(Dataset):
         subject_boundaries = sample['subject']['boundaries']
         start_subject = subject_boundaries[0]
         end_subject = subject_boundaries[1]
-        
-        # Insert <KG_EMBEDDING> token after the subject
+
+        # Insert SPECIAL_KG_TOKEN after the subject
         sample['sentence'] = (
             sample['sentence'][:end_subject] +
-            ' <KG_EMBEDDING>' +
+            SPECIAL_KG_TOKEN +
             sample['sentence'][end_subject:]
         )
-        
-        new_chars = len(' <KG_EMBEDDING>')
-        # add to the object boundaries the " <KG_EMBEDDING>" token
+
+        new_chars = len(SPECIAL_KG_TOKEN)
+        # add to the object boundaries the SPECIAL_KG_TOKEN token
         object_boundaries = sample["object"]['boundaries']
         start_object = object_boundaries[0] + new_chars
         end_object = object_boundaries[1] + new_chars
         
-        # Insert <KG_EMBEDDING> token after the object
+        # Insert SPECIAL_KG_TOKEN token after the object
         sample["object"]['boundaries'] = [start_object, end_object]
 
         result = {
@@ -104,9 +104,24 @@ class TriRexStarDataset(Dataset):
         # Tokenize the sentence
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
-            
+        
+        sentence = sample['sentence']
+        # if tokenizer has chat template, use it
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            sentence = self.tokenizer.apply_chat_template(
+                conversation=[
+                    {
+                        'role': 'assistant',
+                        'content': sentence
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+        
         tokenized = self.tokenizer(
-            sample['sentence'],
+            sentence,
             return_tensors='pt'
         )
         result['input_ids'] = tokenized['input_ids'].squeeze(0)
@@ -271,8 +286,14 @@ class TriRexStarDataLoader:
         self.tokenizer = tokenizer
         
         # Load datasets
-        print("Loading TriREx and TRExStar datasets...")
-        self.train_dataset, self.val_dataset, self.test_dataset = trirex_factory(dataset_config)
+        print(f"Loading {dataset_config.name} and TRExStar datasets...")
+        
+        dataset_factory = {
+            "trirex": trirex_factory,
+            "trirex-bite": trex_bite_factory,
+        }
+        
+        self.train_dataset, self.val_dataset, self.test_dataset = dataset_factory[dataset_config.name](dataset_config)
         self.star_graphs = trex_star_graphs_factory(dataset_config)
         
         self.collator = self._get_collator()

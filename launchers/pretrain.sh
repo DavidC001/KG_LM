@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=pretrain                # job name
+#SBATCH --job-name=pretrain             # job name
 #SBATCH --nodes=1                       # number of nodes
-#SBATCH --ntasks-per-node=1             # number of tasks per node
-#SBATCH --time=1-00:00:00                 # time limits
-#SBATCH --output=out/pretrain_%j.out                # standard output file
-#SBATCH --account=iscrc_kg-lfm        # account name
+#SBATCH --time=1-00:00:00               # time limits
+#SBATCH --output=out/pretrain_%j.out    # standard output file
+#SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
-#SBATCH --gres=gpu:4                    # Generic resources, e.g., GPUs
-#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-node=4               # number of GPUs per node
+#SBATCH --cpus-per-gpu=8                # number of CPU cores per GPU
 #SBATCH --mem=480GB
 #SBATCH --chdir=.                       # start from current directory
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure
@@ -25,6 +24,7 @@ if [ -z "$1" ]; then
     export CONFIG_FILE="configs/pretrain_config.yaml"
 else
     export CONFIG_FILE=$1
+    echo "Using provided config file: $CONFIG_FILE"
 fi
 
 # Use accelerate launch with explicit deepspeed config

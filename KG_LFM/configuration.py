@@ -8,6 +8,7 @@ from typing import Optional, Union
 import yaml
 
 IGNORE_INDEX = -100
+SPECIAL_KG_TOKEN = " <KG_EMBEDDING>"
 
 def dataclass(*args, **kwargs):
     """
@@ -34,6 +35,12 @@ def dataclass(*args, **kwargs):
 
 @dataclass
 class TRex_DatasetConfig:
+    name: str = "trirex"
+    """
+    Type of the dataset. Defaults to 'trirex'.
+    Options are 'trirex', 'trirex-bite', ...
+    """
+    
     lite: bool = False
     """Whether to use the lite version of the dataset. Defaults to False."""
     
@@ -108,7 +115,15 @@ class ModelConfig:
     
     # Training Configuration
     tune_language_model: bool = False
-    """Whether to tune the language model during training. Defaults to False."""
+    """Whether to tune the language model base parameters (does not affect lora params) during training. Defaults to False."""
+    
+    use_lora: bool = True
+    """Whether to use LoRA for training. Defaults to True."""
+    lora_r: int = 8
+    """Rank for LoRA. Defaults to 8."""
+    lora_alpha: int = 16
+    """Alpha for LoRA scaling. Defaults to 16."""
+    lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj"])
     
     tune_kg_encoder: bool = True
     """Whether to tune the knowledge graph encoder during training. Defaults to True."""
@@ -124,9 +139,9 @@ class PretrainConfig:
     """
     run_name: str = "pretrain_trirex"
     
-    steps_train: int = -1
-    """Number of training steps per training before validation. Defaults to -1 (no limit)."""
-    eval_perc: float = 1
+    steps_train: float = 1.0
+    """Number of training steps per training before validation. Can be a float representing a percentage of the dataset. Defaults to 1.0 (100%)."""
+    eval_perc: float = 1.0
     """Percentage of the evaluation dataset to use for validation after each training step. Defaults to 1 (100%)."""
     
     epochs: int = 20
@@ -137,9 +152,6 @@ class PretrainConfig:
     
     learning_rate: float = 1e-4
     """Learning rate for the pretraining optimizer. Defaults to 1e-4."""
-    
-    scheduler_eta_min: float = 1e-5
-    """Minimum learning rate for the scheduler. Defaults to 1e-5."""
     
     weight_decay: float = 0.01
     """Weight decay for the pretraining optimizer. Defaults to 0.01."""
@@ -157,13 +169,15 @@ class PretrainConfig:
     checkpoint_frequency: int = 1
     """Frequency of saving checkpoints during pretraining. Defaults to every epoch."""
     
+    start_from_checkpoint: Optional[str] = None
+    """Path to a checkpoint to load model weights from before training. Defaults to None."""
+    
     resume : bool = False
     
     def __post_init__(self):
         # Ensure that learning rate and weight decay are numbers
         self.learning_rate = float(self.learning_rate)
         self.weight_decay = float(self.weight_decay)
-        self.scheduler_eta_min = float(self.scheduler_eta_min)
 
 
 @dataclass
