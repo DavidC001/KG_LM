@@ -6,9 +6,9 @@
 #SBATCH --output=out/eval_%j.out                # standard output file
 #SBATCH --account=iscrc_kg-lfm        # account name
 #SBATCH --partition=boost_usr_prod      # partition name
-#SBATCH --gres=gpu:1                    # Generic resources, e.g., GPUs
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=120GB
+#SBATCH --gres=gpu:4                    # Generic resources, e.g., GPUs
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=480GB
 #SBATCH --chdir=.                       # start from current directory
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure
 #SBATCH --mail-user=davide.cavicchini@studenti.unitn.it
@@ -37,4 +37,4 @@ else
     export MAX_SAMPLES=$3
 fi
 
-python evaluate.py --config $CONFIG_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES
+accelerate launch --config-file configs/accelerate_evalconfig.yaml evaluate.py --config $CONFIG_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES

@@ -34,7 +34,6 @@ def main():
     # Create evaluator
     evaluator = KGLFMEvaluator(
         config_path=args.config,
-        device=args.device,
         batch_size=args.batch_size,
         max_samples=args.max_samples
     )
