@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --nodes=10                       # number of nodes
 
-
 #SBATCH --job-name=ray_sweep            # job name
 #SBATCH --time=24:00:00               # time limits
 #SBATCH --output=out/ray_sweep_%j.out   # standard output file
@@ -10,15 +9,17 @@
 #SBATCH --ntasks-per-node=1             # number of tasks per node
 #SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
+#SBATCH --qos=normal
 
 #SBATCH --gpus-per-task=1                 
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=15GB
+#SBATCH --mem=120GB
 
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure
 #SBATCH --mail-user=davide.cavicchini@studenti.unitn.it
 
 source ./prepare_env.sh
+export TUNE_DISABLE_STRICT_METRIC_CHECKING=1
 
 # Parse command line arguments
 base_conf=$1

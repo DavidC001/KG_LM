@@ -9,3 +9,4 @@ module load cuda/12.1
 
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
+export TOKENIZERS_PARALLELISM=false

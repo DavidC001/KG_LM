@@ -1,0 +1,70 @@
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  
+  "zero_optimization": {
+    "stage": 0,
+    
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "sub_group_size": 1e8,
+    "reduce_bucket_size": 5e7,
+    "stage3_prefetch_bucket_size": 5e7,
+    "stage3_param_persistence_threshold": 1e5,
+    "stage3_max_live_parameters": 1e8,
+    "stage3_max_reuse_distance": 1e8,
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+  
+  "gradient_clipping": 1.0,
+  
+  "bf16": {
+    "enabled": true
+  },
+
+  "fp16": {
+    "enabled": false
+  },
+  
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": true,
+    "contiguous_memory_optimization": true,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false,
+    "profile": false
+  },
+  
+  "wall_clock_breakdown": false,
+  
+  "comms_logger": {
+    "enabled": false,
+    "verbose": false,
+    "prof_all": false,
+    "debug": false
+  },
+  
+  "tensorboard": {
+    "enabled": false,
+    "output_path": "logs/tensorboard/",
+    "job_name": "kg_lfm_training"
+  },
+  
+  "flops_profiler": {
+    "enabled": false,
+    "profile_step": 1,
+    "module_depth": -1,
+    "top_modules": 1,
+    "detailed": true,
+    "output_file": null
+  },
+  
+  "memory_efficient_linear": true,
+  
+  "aio": {
+    "thread_count": 2,
+    "single_submit": false,
+    "overlap_events": true
+  }
+}
