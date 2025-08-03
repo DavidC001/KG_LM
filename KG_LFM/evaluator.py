@@ -151,6 +151,13 @@ class KGLFMEvaluator:
             
         return self.remove_kg_stuff(batch)
         
+    def llm_no_lora(self, **kwargs):
+        """Return the model output without LoRA layers."""
+        with self.model.llm.disable_adapter():
+            results = self.model(**kwargs)
+            
+        return results
+
     def load_model(self):
         """Load the best trained model."""
         if self.accelerator.is_main_process:
@@ -172,6 +179,9 @@ class KGLFMEvaluator:
                     cache_dir=self.config.train_conf.cache_dir
                 )
                 self.clean_model.eval()
+            elif self.config.model.use_lora:
+                self.clean_model = self.llm_no_lora
+                self.clean_tokenizer = self.tokenizer
             else:
                 self.clean_model = self.model
                 self.clean_tokenizer = self.tokenizer
@@ -517,7 +527,7 @@ class KGLFMEvaluator:
         
         # Run all evaluations
         evaluations = {
-            'perplexity': self.compute_perplexity,
+            # 'perplexity': self.compute_perplexity,
             'hit_at_k': self.compute_hit_k_metrics,
         }
         
