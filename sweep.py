@@ -1,132 +1,207 @@
+import torch
 from KG_LFM.configuration import load_yaml_config
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, DeepSpeedPlugin
 from KG_LFM.trainer import KG_LFM_Trainer, DefaultMetricsTracker
-import argparse
 import logging
-import copy
+import argparse
 import os
-from filelock import FileLock
 
 import ray
-from ray import air, tune
-from ray.air import session
+from ray import air, tune, train
 from ray.tune.schedulers import AsyncHyperBandScheduler
+from ray.tune.stopper import TimeoutStopper
+from ray.train.torch import TorchTrainer 
+from ray.air.config import ScalingConfig
+# NEW: Import advanced search algorithms
+from ray.tune.search.optuna import OptunaSearch
+from ray.tune.search import ConcurrencyLimiter
+import optuna
 
-from typing import Dict
-
-from ray.tune.stopper import MaximumIterationStopper, TimeoutStopper
+import uuid
 
 class RayTuneMetricsTracker(DefaultMetricsTracker):
     """Metrics tracker for Ray Tune that reports metrics to the session."""
-
-    def __init__(self):
-        super().__init__()
 
     def reset(self):
         """Resets the tracker."""
         # Only report to Ray Tune if we have validation_loss
         # This prevents premature reporting of only training_loss
-        if 'validation_loss' in self.values:
+        if 'validation_loss' in self.values and train.get_context().get_world_rank() == 0:
             # Get current averages and report them
             averages = self.get_averages()
-            session.report(averages)
+            train.report(averages)
         
         super().reset()
 
-    def update(self, metrics: Dict[str, float], count: int = 1):
-        """Update metrics."""
-        super().update(metrics, count)
-
-    def get_averages(self) -> Dict[str, float]:
-        """Get the current average of all tracked metrics."""
-        return super().get_averages()
-
-
-def train_kg_lfm(sweep_config):
-    """Training function for Ray Tune hyperparameter optimization."""
+def train_kg_lfm(config):
+    """Training function for Ray Tune hyperparameter optimization with Accelerate."""
     try:
-        # get the base configuration
-        config = load_yaml_config(sweep_config["base_config"])
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        
+        # Get the base configuration
+        base_config_path = config["base_config"]
+        config_obj = load_yaml_config(base_config_path)
         
         # Update the configuration with the sweep parameters
-        config.train_conf.learning_rate = sweep_config["learning_rate"]
-        config.train_conf.weight_decay = sweep_config["weight_decay"]
-        config.model.num_heads = sweep_config["num_heads"]
-        config.model.num_quantizers = sweep_config["num_quantizers"]
-        config.model.codebook_size = sweep_config["codebook_size"]
-
+        config_obj.train_conf.learning_rate = config["learning_rate"]
+        config_obj.train_conf.weight_decay = config["weight_decay"]
+        config_obj.model.num_heads = config["num_heads"]
+        config_obj.model.num_quantizers = config["num_quantizers"]
+        config_obj.model.codebook_size = config["codebook_size"]
+        
         # Ensure the run name is unique for each trial
-        config.train_conf.run_name = f"{config.train_conf.run_name}_{session.get_trial_id()}"
+        trial_id = str(uuid.uuid4())
+        config_obj.train_conf.run_name = f"{config_obj.train_conf.run_name}_{trial_id}"
         
-        logging.info(f"Starting training for trial {session.get_trial_id()} with config: {sweep_config}")
+        logger.info(f"Starting training for trial {trial_id} with config: {config}")
         
-        # Initialize the trainer with the updated config
-        trainer = KG_LFM_Trainer(
-            config=config, 
-            run_name=session.get_trial_id(),
-            resume=False,
-            enable_wandb=False,
-            save_checkpoints=False,
-            metrics_tracker=RayTuneMetricsTracker()
+        # Initialize Accelerator using config file
+        deepspeed_config_path = "/leonardo/home/userexternal/dcavicch/projects/KG_LM/configs/deepspeed_config.json"
+        
+        # Load accelerate config
+        kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=False,
+        )
+        accelerator = Accelerator(
+            mixed_precision="bf16",  # From deepspeed_config.json bf16.enabled: true
+            step_scheduler_with_optimizer=False,
+            deepspeed_plugin=DeepSpeedPlugin(deepspeed_config_path),
+            kwargs_handlers=[kwargs],
+            cpu=False,
         )
         
+        # Initialize the trainer with the updated config AND the accelerator
+        trainer = KG_LFM_Trainer(
+            config=config_obj, 
+            run_name=config_obj.train_conf.run_name,
+            resume=False,
+            enable_wandb=False,  # Disable wandb for Ray Tune
+            save_checkpoints=False,  # Let Ray handle checkpoints
+            metrics_tracker=RayTuneMetricsTracker(),
+            accelerator=accelerator  # Pass the accelerator we created
+        )
+        
+        # Run training and report metrics
         trainer.train()
-
-        # Print the results
-        logging.info(f"Training completed for trial {session.get_trial_id()}.")
-        logging.info(f"Final metrics: {trainer.metrics_tracker.get_averages()} for config: {sweep_config}")
+        
+        logger.info(f"Training completed for trial {trial_id}.")
+        
+        if train.get_context().get_world_rank() == 0:
+            # Report final metrics to Ray Tune
+            final_metrics = trainer.best_val_loss
+            train.report({"validation_loss": final_metrics})
+        
     except Exception as e:
-        logging.error(f"Error during training for trial {session.get_trial_id()}: {e}")
+        logger.error(f"Error during training: {e}")
+        
+        # Report failure to Ray Tune
+        if train.get_context().get_world_rank() == 0:
+            train.report({"validation_loss": 1e10})  # Report a high loss to indicate failure
+
+def launch_torch_trainer(config):
+    """Launches the TorchTrainer with the given configuration."""
+    scaling = ScalingConfig(num_workers=4, use_gpu=True, resources_per_worker={"GPU": 1, "CPU": 7})
+    
+    torch_trainer = TorchTrainer(
+        train_loop_per_worker=train_kg_lfm,
+        train_loop_config=config,
+        scaling_config=scaling,
+        run_config=train.RunConfig(
+            name="kg_lfm_hyperparameter_sweep",
+        ),
+    )
+    
+    torch_trainer.fit()
 
 def main():
     """Main function with Ray Tune hyperparameter optimization."""
     parser = argparse.ArgumentParser(description="Ray Tune hyperparameter sweep for KG-LFM model")
-    parser.add_argument("--base_config", type=str, default="configs/sweep_base_config.yaml", 
+    parser.add_argument("--base_config", type=str, default="/leonardo/home/userexternal/dcavicch/projects/KG_LM/configs/sweep_base_config.yaml", 
                        help="Path to base configuration file.")
     parser.add_argument("--time_budget", type=int, default=3600*23,
                        help="Time budget for the sweep in seconds.")
-
+    parser.add_argument("--num_concurrent_trials", type=int, default=4,
+                       help="Number of concurrent trials to run.")
     args = parser.parse_args()
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        filename="logs/sweep.log",
     )
     
     base_config_path = args.base_config
     time_budget = args.time_budget
+    num_concurrent_trials = args.num_concurrent_trials
     
     ray.init()
     
-    sched = AsyncHyperBandScheduler()
+    storage_path = "~/ray_results"
+    exp_name = "kg_lfm_hyperparameter_sweep"
+    path = os.path.join(storage_path, exp_name)
     
-    resources_per_trial = {"cpu": 8, "gpu": 1}  # Adjust based on your total resources
-    tuner = tune.Tuner(
-        tune.with_resources(
-            train_kg_lfm,
-            resources=resources_per_trial
-        ),
-        tune_config=tune.TuneConfig(
+    if tune.Tuner.can_restore(path):
+        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, resume_errored=True)
+    else:
+        algo = OptunaSearch(
+            sampler=optuna.samplers.TPESampler(
+                n_startup_trials=max(num_concurrent_trials, 6),  # Random trials before TPE
+                n_ei_candidates=num_concurrent_trials,   # Number of candidates per iteration
+                seed=42
+            ),
             metric="validation_loss",
-            mode="min",
-            num_samples=-1,
-            scheduler=sched,
-            time_budget_s=time_budget, 
-        ),
-        run_config=air.RunConfig(
-            name="kg_lfm_hyperparameter_sweep",
-            stop=TimeoutStopper(time_budget//4),  # Stop after time_budget
-        ),
-        param_space={
+            mode="min"
+        )
+        
+        # Limit concurrency for better performance
+        algo = ConcurrencyLimiter(algo, max_concurrent=num_concurrent_trials)
+
+        scheduler = AsyncHyperBandScheduler(
+            grace_period=2
+        )
+        
+        param_space = {
             "learning_rate": tune.loguniform(1e-4, 1e-3),
             "weight_decay": tune.loguniform(1e-5, 1e-2),
             "num_heads": tune.choice([4, 8, 16]),
             "num_quantizers": tune.choice([4, 8, 10, 16]),
             "codebook_size": tune.choice([128, 256, 512]),
-            "base_config": tune.grid_search([base_config_path]),
+            "base_config": base_config_path,
         }
-    )
+        
+        tuner = tune.Tuner(
+            trainable=launch_torch_trainer,
+            tune_config=tune.TuneConfig(
+                metric="validation_loss",
+                mode="min",
+                num_samples=-1,
+                scheduler=scheduler,
+                time_budget_s=time_budget,
+                search_alg=algo
+            ),
+            run_config=air.RunConfig(
+                name="kg_lfm_hyperparameter_sweep",
+                stop=TimeoutStopper(time_budget//4),  # Stop after time_budget
+            ),
+            param_space=param_space
+        )
+    
     results = tuner.fit()
     
     print("Best hyperparameters found were: ", results.get_best_result().config)
+    
+    # for testing call directly
+    # launch_torch_trainer({
+    #     "learning_rate": 0.001,
+    #     "weight_decay": 0.0001,
+    #     "num_heads": 8,
+    #     "num_quantizers": 4,
+    #     "codebook_size": 256,
+    #     "base_config": base_config_path
+    # })
     
 if __name__ == "__main__":
     main()  

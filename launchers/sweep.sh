@@ -1,6 +1,5 @@
 #!/bin/bash
-#SBATCH --nodes=10                       # number of nodes
-
+#SBATCH --nodes=5                       # number of nodes
 
 #SBATCH --job-name=ray_sweep            # job name
 #SBATCH --time=24:00:00               # time limits
@@ -10,15 +9,18 @@
 #SBATCH --ntasks-per-node=1             # number of tasks per node
 #SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
+#SBATCH --qos=normal
 
-#SBATCH --gpus-per-task=1                 
-#SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=15GB
+#SBATCH --gpus-per-task=4                 
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=480GB
 
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure
 #SBATCH --mail-user=davide.cavicchini@studenti.unitn.it
 
 source ./prepare_env.sh
+export TUNE_DISABLE_STRICT_METRIC_CHECKING=1
+export ACCELERATE_USE_ENVIRONMENT=1
 
 # Parse command line arguments
 base_conf=$1
@@ -87,4 +89,5 @@ sleep 5
 #### call your code below
 python -u sweep.py \
     --base_conf $base_conf \
-    --time_budget $time_budget
+    --time_budget $time_budget \
+    --num_concurrent_trials $SLURM_JOB_NUM_NODES
