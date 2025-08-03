@@ -82,7 +82,8 @@ class KG_LFM_Trainer:
                  resume: Optional[bool] = False, 
                  enable_wandb: bool = True,
                  save_checkpoints: bool = True,
-                 metrics_tracker: Optional[MetricsTracker] = DefaultMetricsTracker()
+                 metrics_tracker: Optional[MetricsTracker] = DefaultMetricsTracker(),
+                 accelerator: Optional[Accelerator] = None
                 ):
         self.config = config
         self.run_name = run_name or f"kg_lfm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -93,14 +94,19 @@ class KG_LFM_Trainer:
         self.metrics_tracker : MetricsTracker = metrics_tracker
 
         # Initialize Accelerator and set seed for reproducibility
-        kwargs = DistributedDataParallelKwargs(
-            find_unused_parameters=False,
-        )
-        self.accelerator = Accelerator(
-            log_with="wandb" if enable_wandb else None,
-            # gradient_accumulation_steps=self.config.train_conf.gradient_accumulation_steps,
-            kwargs_handlers=[kwargs]
-        )
+        if accelerator is not None:
+            self.accelerator = accelerator
+        else:
+            kwargs = DistributedDataParallelKwargs(
+                find_unused_parameters=False,
+            )
+            self.accelerator = Accelerator(
+                log_with="wandb" if enable_wandb else None,
+                # gradient_accumulation_steps=self.config.train_conf.gradient_accumulation_steps,
+                kwargs_handlers=[kwargs],
+                step_scheduler_with_optimizer=False,  # Let us handle this manually
+            )
+            
         set_seed(self.config.seed)
 
         self.device = self.accelerator.device
