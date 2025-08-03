@@ -1,3 +1,4 @@
+import torch
 from KG_LFM.configuration import load_yaml_config
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, DeepSpeedPlugin
@@ -122,6 +123,8 @@ def main():
                        help="Path to base configuration file.")
     parser.add_argument("--time_budget", type=int, default=3600*23,
                        help="Time budget for the sweep in seconds.")
+    parser.add_argument("--num_concurrent_trials", type=int, default=4,
+                       help="Number of concurrent trials to run.")
     args = parser.parse_args()
     
     logging.basicConfig(
@@ -132,13 +135,9 @@ def main():
     
     base_config_path = args.base_config
     time_budget = args.time_budget
+    num_concurrent_trials = args.num_concurrent_trials
     
     ray.init()
-    
-    # get the number of gpus and cpus
-    num_gpus = ray.cluster_resources().get("GPU", 0)
-    num_concurrent_trials = num_gpus//4
-    logging.info(f"Number of GPUs available: {num_gpus}, Number of concurrent trials: {num_concurrent_trials}")
     
     storage_path = "~/ray_results"
     exp_name = "kg_lfm_hyperparameter_sweep"

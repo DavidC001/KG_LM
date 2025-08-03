@@ -89,4 +89,5 @@ sleep 5
 #### call your code below
 python -u sweep.py \
     --base_conf $base_conf \
-    --time_budget $time_budget
+    --time_budget $time_budget \
+    --num_concurrent_trials $SLURM_JOB_NUM_NODES
