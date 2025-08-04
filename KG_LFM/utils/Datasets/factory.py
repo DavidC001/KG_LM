@@ -18,9 +18,9 @@ from KG_LFM.utils.Datasets.TRExLite import TRExLite
 from KG_LFM.utils.Datasets.TRExStar import TRExStar
 from KG_LFM.utils.Datasets.TRExStarLite import TRExStarLite
 
-from KG_LFM.configuration import TRex_DatasetConfig
+from KG_LFM.configuration import DatasetConfig
 
-def trex_factory(conf: TRex_DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
+def trex_factory(conf: DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
     if conf.lite:
         trex_builder = TRExLite()
     else:
@@ -37,7 +37,7 @@ def trex_factory(conf: TRex_DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
     return train_dataset, validation_dataset, test_dataset
 
 
-def trex_star_factory(conf: TRex_DatasetConfig) -> Dataset:
+def trex_star_factory(conf: DatasetConfig) -> Dataset:
     if conf.lite:
         trex_star_builder = TRExStarLite(conf.base_path)
     else:
@@ -48,7 +48,7 @@ def trex_star_factory(conf: TRex_DatasetConfig) -> Dataset:
 
     return trex_star_builder.as_dataset(split="all")
 
-def trex_star_graphs_factory(conf: TRex_DatasetConfig) -> Dict[str, nx.DiGraph]:
+def trex_star_graphs_factory(conf: DatasetConfig) -> Dict[str, nx.DiGraph]:
     dataset = trex_star_factory(conf)
     graphs = {}
     for datapoint in tqdm(dataset, desc="Loading nx graphs"):
@@ -57,7 +57,7 @@ def trex_star_graphs_factory(conf: TRex_DatasetConfig) -> Dict[str, nx.DiGraph]:
     return graphs
 
 
-def trex_bite_factory(conf: TRex_DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
+def trex_bite_factory(conf: DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
     if conf.lite:
         trex_bite_builder = TRExBiteLite(conf.base_path)
     else:
@@ -72,7 +72,7 @@ def trex_bite_factory(conf: TRex_DatasetConfig) -> Tuple[Dataset, Dataset, Datas
     return train_dataset, validation_dataset, test_dataset
 
 
-def trirex_factory(conf: TRex_DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
+def trirex_factory(conf: DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
     if conf.lite:
         trirex_builder = TriRExLite(conf.base_path)
     else:
@@ -88,9 +88,7 @@ def trirex_factory(conf: TRex_DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]
     return train_dataset, validation_dataset, test_dataset
 
 
-
-# TODO: Update the following functions to use the new configuration system
-def web_qsp_factory() -> Tuple[Dataset, Dict[str, nx.DiGraph]]:
+def web_qsp_factory(conf: DatasetConfig) -> Tuple[Dataset, Dict[str, nx.DiGraph]]:
     web_qsp_sentence_builder = WebQSPSentences()
     web_qsp_star_builder = WebQSPStar()
 
@@ -108,23 +106,3 @@ def web_qsp_factory() -> Tuple[Dataset, Dict[str, nx.DiGraph]]:
         graphs[datapoint['entity']] = nx.node_link_graph(data)
 
     return test_dataset, graphs
-
-def web_qsp_finetune_factory() -> Tuple[Dataset, Dataset, Dict[str, nx.DiGraph]]:
-    web_qsp_sentence_builder = WebQSPFinetuneSentences()
-    web_qsp_star_builder = WebQSPFinetuneStar()
-
-    if not web_qsp_sentence_builder.info.splits:
-        web_qsp_sentence_builder.download_and_prepare()
-
-    if not web_qsp_star_builder.info.splits:
-        web_qsp_star_builder.download_and_prepare()
-
-    train_dataset = web_qsp_sentence_builder.as_dataset(split="train")
-    test_dataset = web_qsp_sentence_builder.as_dataset(split="test")
-
-    graphs = {}
-    for datapoint in tqdm(web_qsp_star_builder.as_dataset(split="all"), desc="Loading nx graphs"):
-        data = json.loads(datapoint['json'])
-        graphs[datapoint['entity']] = nx.node_link_graph(data)
-
-    return train_dataset, test_dataset, graphs

@@ -13,12 +13,12 @@ from torchbiggraph.graph_storages import FORMAT_VERSION_ATTR, FORMAT_VERSION
 
 from sentence_transformers import SentenceTransformer
 from transformers import AutoConfig
-from KG_LFM.configuration import TRex_DatasetConfig
+from KG_LFM.configuration import DatasetConfig
 
 
 class BigGraphAligner:
 
-    def __init__(self, graphs: Dict[str, nx.DiGraph], config: TRex_DatasetConfig = TRex_DatasetConfig(), batch_size: int = 64):
+    def __init__(self, graphs: Dict[str, nx.DiGraph], config: DatasetConfig = DatasetConfig(), batch_size: int = 64):
         
         self.config: TRex_DatasetConfig = config
         

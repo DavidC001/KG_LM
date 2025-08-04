@@ -11,7 +11,7 @@ from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import TriRex_DataLoaderConfig, TRex_DatasetConfig, SPECIAL_KG_TOKEN
+from KG_LFM.configuration import DataLoaderConfig, DatasetConfig, SPECIAL_KG_TOKEN
 
 from torch_geometric.data import Data, Batch
 
@@ -277,12 +277,12 @@ class TriRexStarDataLoader:
     
     def __init__(
         self,
-        dataset_config: TRex_DatasetConfig,
-        dataloader_config: Optional[TriRex_DataLoaderConfig] = None,
+        dataset_config: DatasetConfig,
+        dataloader_config: Optional[DataLoaderConfig] = None,
         tokenizer: Optional[PreTrainedTokenizer] = None
     ):
         self.dataset_config = dataset_config
-        self.dataloader_config = dataloader_config or TriRex_DataLoaderConfig()
+        self.dataloader_config = dataloader_config or DataLoaderConfig()
         self.tokenizer = tokenizer
         
         # Load datasets
@@ -386,8 +386,8 @@ class TriRexStarDataLoader:
         )
 
 def create_dataloader(
-    dataset_config: TRex_DatasetConfig,
-    dataloader_config: Optional[TriRex_DataLoaderConfig] = None,
+    dataset_config: DatasetConfig,
+    dataloader_config: Optional[DataLoaderConfig] = None,
     tokenizer: Optional[PreTrainedTokenizer] = None,
     split: str = "train",
 ) -> DataLoader:
@@ -421,7 +421,7 @@ def create_dataloader(
         raise ValueError(f"Unknown split: {split}. Use 'train', 'val', 'test', or 'all'.")
 
 def create_datasets(
-    dataset_config: TRex_DatasetConfig,
+    dataset_config: DatasetConfig,
     tokenizer: Optional[PreTrainedTokenizer] = None
 ) -> Tuple[HFDataset, HFDataset, HFDataset]:
     """
@@ -471,8 +471,8 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
         
     # Create dataset config
-    dataset_config = TRex_DatasetConfig(lite=True)  # Use lite for faster loading
-    dataloader_config = TriRex_DataLoaderConfig(
+    dataset_config = DatasetConfig(lite=True)  # Use lite for faster loading
+    dataloader_config = DataLoaderConfig(
         batch_size=8,
         max_sequence_length=256,
         include_graphs=True

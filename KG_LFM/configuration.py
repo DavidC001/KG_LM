@@ -34,7 +34,7 @@ def dataclass(*args, **kwargs):
     return wrapper(args[0]) if args else wrapper
 
 @dataclass
-class TRex_DatasetConfig:
+class DatasetConfig:
     name: str = "trirex"
     """
     Type of the dataset. Defaults to 'trirex'.
@@ -64,7 +64,7 @@ class TRex_DatasetConfig:
         assert os.path.exists(self.graph_embs_base_path), f"Graph embeddings path {self.graph_embs_base_path} does not exist."
 
 @dataclass
-class TriRex_DataLoaderConfig():
+class DataLoaderConfig():
     """
     Configuration for the combined TriREx and TRExStar dataloader.
     """
@@ -162,7 +162,7 @@ class PretrainConfig:
     clip_grad_norm: float = 1.0
     """Maximum gradient norm for clipping. Defaults to 1.0."""
     
-    dataloader: TriRex_DataLoaderConfig = field(default_factory=TriRex_DataLoaderConfig)
+    dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     
     checkpoint_dir: str = "out/pretrain"
     """Directory to save checkpoints during pretraining. Defaults to 'out/pretrain'."""
@@ -185,7 +185,7 @@ class ProjectConfig:
     seed: int = 42
     """Random seed for reproducibility. Defaults to 42."""
     
-    dataset: TRex_DatasetConfig = field(default_factory=TRex_DatasetConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     """General configuration for the datasets."""
     
     train_conf: PretrainConfig = field(default_factory=PretrainConfig)
