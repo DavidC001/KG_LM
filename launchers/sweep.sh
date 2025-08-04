@@ -21,6 +21,7 @@
 source ./prepare_env.sh
 export TUNE_DISABLE_STRICT_METRIC_CHECKING=1
 export ACCELERATE_USE_ENVIRONMENT=1
+export RAY_TRAIN_V2_ENABLED=1
 
 # Parse command line arguments
 base_conf=$1

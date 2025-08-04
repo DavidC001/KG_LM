@@ -9,6 +9,7 @@ import os
 
 import ray
 from ray import air, tune, train
+from ray.air import session
 from ray.tune.schedulers import AsyncHyperBandScheduler
 from ray.tune.stopper import TimeoutStopper
 from ray.train.torch import TorchTrainer 
@@ -16,6 +17,7 @@ from ray.air.config import ScalingConfig
 # NEW: Import advanced search algorithms
 from ray.tune.search.optuna import OptunaSearch
 from ray.tune.search import ConcurrencyLimiter
+from ray.tune.integration.ray_train import TuneReportCallback
 import optuna
 
 import uuid
@@ -27,7 +29,8 @@ class RayTuneMetricsTracker(DefaultMetricsTracker):
         """Resets the tracker."""
         # Only report to Ray Tune if we have validation_loss
         # This prevents premature reporting of only training_loss
-        if 'validation_loss' in self.values and train.get_context().get_world_rank() == 0:
+        if 'validation_loss' in self.values:
+            print("Reporting metrics to Ray...")
             # Get current averages and report them
             averages = self.get_averages()
             train.report(averages)
@@ -90,17 +93,15 @@ def train_kg_lfm(config):
         
         logger.info(f"Training completed for trial {trial_id}.")
         
-        if train.get_context().get_world_rank() == 0:
-            # Report final metrics to Ray Tune
-            final_metrics = trainer.best_val_loss
-            train.report({"validation_loss": final_metrics})
+        # Report final metrics to Ray Tune
+        final_metrics = trainer.best_val_loss
+        train.report({"validation_loss": final_metrics})
         
     except Exception as e:
         logger.error(f"Error during training: {e}")
         
         # Report failure to Ray Tune
-        if train.get_context().get_world_rank() == 0:
-            train.report({"validation_loss": 1e10})  # Report a high loss to indicate failure
+        train.report({"validation_loss": 1e10})  # Report a high loss to indicate failure
 
 def launch_torch_trainer(config):
     """Launches the TorchTrainer with the given configuration."""
@@ -112,6 +113,7 @@ def launch_torch_trainer(config):
         scaling_config=scaling,
         run_config=train.RunConfig(
             name="kg_lfm_hyperparameter_sweep",
+            callbacks=[TuneReportCallback()],
         ),
     )
     
@@ -124,7 +126,7 @@ def main():
                        help="Path to base configuration file.")
     parser.add_argument("--time_budget", type=int, default=3600*23,
                        help="Time budget for the sweep in seconds.")
-    parser.add_argument("--num_concurrent_trials", type=int, default=4,
+    parser.add_argument("--num_concurrent_trials", type=int, default=1,
                        help="Number of concurrent trials to run.")
     args = parser.parse_args()
     
@@ -160,9 +162,7 @@ def main():
         # Limit concurrency for better performance
         algo = ConcurrencyLimiter(algo, max_concurrent=num_concurrent_trials)
 
-        scheduler = AsyncHyperBandScheduler(
-            grace_period=2
-        )
+        scheduler = AsyncHyperBandScheduler()
         
         param_space = {
             "learning_rate": tune.loguniform(1e-4, 1e-3),
