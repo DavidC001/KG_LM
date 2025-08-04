@@ -102,7 +102,7 @@ class KG_LFM_Trainer:
             )
             self.accelerator = Accelerator(
                 log_with="wandb" if enable_wandb else None,
-                # gradient_accumulation_steps=self.config.train_conf.gradient_accumulation_steps,
+                gradient_accumulation_steps=self.config.train_conf.gradient_accumulation_steps,
                 kwargs_handlers=[kwargs],
                 step_scheduler_with_optimizer=False,  # Let us handle this manually
             )
@@ -382,7 +382,7 @@ class KG_LFM_Trainer:
         )
 
         total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-
+        
         step = 0
         while step < self.steps_train:
             # get batch, reset iterator if needed
@@ -396,57 +396,51 @@ class KG_LFM_Trainer:
                 batch = next(self.train_iter)
 
             # self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
-            
-            # Standard forward pass
-            outputs = self.model(
-                input_ids=batch['input_ids'],
-                graphs=batch['graphs'],
-                attention_mask=batch['attention_mask'],
-                labels=batch['input_ids'],
-                use_cache=False,
-            )
-            language_loss = outputs.loss
-            RVQ_loss = outputs.RVQ_loss
-            loss = language_loss + RVQ_loss
-            
-            # print all processes' losses for debugging
-            self.logger.debug(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
-            
-            # create a tensor to accumulate from all processes to skip all backward passes if loss is NaN or Inf
-            is_valid_loss = torch.tensor(not (torch.isnan(loss) or torch.isinf(loss)), device=self.device, dtype=torch.bool)
-            
-            # Gather across all processes to check for NaN/Inf
-            is_valid_loss = self.accelerator.gather(is_valid_loss).all()
-            # Skip invalid losses
-            if not is_valid_loss:
-                self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
-            else:
-                loss /= self.grad_accumulation_steps  # Scale loss for gradient accumulation
-                total_loss += loss
-                self.accelerator.backward(loss)
-            
-            self.logger.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
-
-            if (step + 1) % self.grad_accumulation_steps == 0 or (step + 1) == self.steps_train:
-                # Clip gradients if configured
-                if self.clip_grad_norm is not None:
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
-                    
-                self.optimizer.step()
-                # self.scheduler.step()
+            with self.accelerator.accumulate(self.model):
+                # Standard forward pass
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    graphs=batch['graphs'],
+                    attention_mask=batch['attention_mask'],
+                    labels=batch['input_ids'],
+                    use_cache=False,
+                )
+                language_loss = outputs.loss
+                RVQ_loss = outputs.RVQ_loss
+                loss = language_loss + RVQ_loss
+                
+                # print all processes' losses for debugging
+                self.logger.debug(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+                
+                # create a tensor to accumulate from all processes to skip all backward passes if loss is NaN or Inf
+                is_valid_loss = torch.tensor(not (torch.isnan(loss) or torch.isinf(loss)), device=self.device, dtype=torch.bool)
+                
+                # Gather across all processes to check for NaN/Inf
+                is_valid_loss = self.accelerator.gather(is_valid_loss).all()
+                # Skip invalid losses
+                if not is_valid_loss:
+                    self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
+                else:
+                    total_loss += loss / self.grad_accumulation_steps
+                    self.accelerator.backward(loss)
+                
+                self.logger.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
+                
+                self.optimizer.step() # does NOTHING when using deepspeed
                 self.optimizer.zero_grad()
                 
-                # update global step and logging
-                metrics = self.compute_train_metrics(total_loss)
-                total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-                self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                log_metrics = {f"train/{k}": v for k, v in metrics.items()}
-                self.accelerator.log(log_metrics, step=self.global_step)
+                if self.accelerator.sync_gradients: # TRUE when accumulating gradients
+                    # update global step and logging
+                    metrics = self.compute_train_metrics(total_loss)
+                    total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    log_metrics = {f"train/{k}": v for k, v in metrics.items()}
+                    self.accelerator.log(log_metrics, step=self.global_step)
 
-            self.global_step += 1
-            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
-            progress_bar.update(1)
-            step += 1
+                self.global_step += 1
+                progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+                progress_bar.update(1)
+                step += 1
             
         progress_bar.close()  # Close progress bar properly
         

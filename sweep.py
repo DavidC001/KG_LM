@@ -68,6 +68,7 @@ def train_kg_lfm(config):
         accelerator = Accelerator(
             mixed_precision="bf16",  # From deepspeed_config.json bf16.enabled: true
             step_scheduler_with_optimizer=False,
+            gradient_accumulation_steps=config_obj.train_conf.gradient_accumulation_steps,
             deepspeed_plugin=DeepSpeedPlugin(deepspeed_config_path),
             kwargs_handlers=[kwargs],
             cpu=False,
