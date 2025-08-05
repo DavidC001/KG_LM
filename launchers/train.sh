@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=pretrain             # job name
-#SBATCH --nodes=2                       # number of nodes
+#SBATCH --job-name=train             # job name
+#SBATCH --nodes=1                       # number of nodes
 #SBATCH --time=1-00:00:00               # time limits
-#SBATCH --output=out/pretrain_%j.out    # standard output file
+#SBATCH --output=out/train_%j.out    # standard output file
 #SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
 #SBATCH --gpus-per-node=4               # number of GPUs per node
@@ -27,7 +27,15 @@ else
     echo "Using provided config file: $CONFIG_FILE"
 fi
 
-# Use accelerate launch with explicit deepspeed config
-srun accelerate launch \
-    --config_file configs/accelerate_config.yaml \
-    train.py --config $CONFIG_FILE
+# Get the list of allocated nodes
+all_nodes=$(scontrol show hostnames $SLURM_JOB_NODELIST)
+head_node=$(echo $all_nodes | awk '{print $1}')  # First node is head node
+head_node_ip=$(srun --nodes=1 --ntasks=1 -w $head_node hostname --ip-address)
+
+# Launch the training script with the specified configuration
+export LAUNCHER="accelerate launch --config_file configs/accelerate_config.yaml --main_process_ip $head_node_ip --main_process_port 29500"
+export PYTHON_FILE="train.py"
+export ARGS="--config $CONFIG_FILE"
+
+export CMD="$LAUNCHER $PYTHON_FILE $ARGS" 
+srun $CMD

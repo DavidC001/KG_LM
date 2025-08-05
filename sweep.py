@@ -9,7 +9,6 @@ import os
 
 import ray
 from ray import air, tune, train
-from ray.air import session
 from ray.tune.schedulers import AsyncHyperBandScheduler
 from ray.tune.stopper import TimeoutStopper
 from ray.train.torch import TorchTrainer 
@@ -89,7 +88,8 @@ def train_kg_lfm(config):
         )
         
         # Run training and report metrics
-        trainer.train()
+        trainer.train(config["time_budget_s"])  # Pass the time budget if specified
+        # I do not close the trainer here, as Ray Tune expects to handle the process group
         
         logger.info(f"Training completed for trial {trial_id}.")
         
@@ -105,7 +105,7 @@ def train_kg_lfm(config):
 
 def launch_torch_trainer(config):
     """Launches the TorchTrainer with the given configuration."""
-    scaling = ScalingConfig(num_workers=4, use_gpu=True, resources_per_worker={"GPU": 1, "CPU": 7})
+    scaling = ScalingConfig(num_workers=4, use_gpu=True, resources_per_worker={"GPU": 1, "CPU": 3})
     
     torch_trainer = TorchTrainer(
         train_loop_per_worker=train_kg_lfm,
@@ -140,21 +140,32 @@ def main():
     time_budget = args.time_budget
     num_concurrent_trials = args.num_concurrent_trials
     
-    ray.init()
+    ray.init(
+        include_dashboard=False,
+    )
     
     storage_path = "~/ray_results"
     exp_name = "kg_lfm_hyperparameter_sweep"
     path = os.path.join(storage_path, exp_name)
     
     if tune.Tuner.can_restore(path):
-        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, resume_errored=True)
+        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, restart_errored=True, resume_unfinished=False)
     else:
         algo = OptunaSearch(
             sampler=optuna.samplers.TPESampler(
-                n_startup_trials=max(num_concurrent_trials, 6),  # Random trials before TPE
+                n_startup_trials=num_concurrent_trials,  # Random trials before TPE
                 n_ei_candidates=num_concurrent_trials,   # Number of candidates per iteration
                 seed=42
             ),
+            points_to_evaluate=[
+                {
+                    "learning_rate": 0.001,
+                    "num_heads": 8,
+                    "num_quantizers": 10,
+                    "codebook_size": 256,
+                    "base_config": base_config_path
+                },
+            ],
             metric="validation_loss",
             mode="min"
         )
@@ -166,11 +177,12 @@ def main():
         
         param_space = {
             "learning_rate": tune.loguniform(1e-4, 1e-3),
-            "weight_decay": tune.loguniform(1e-5, 1e-2),
+            "weight_decay": tune.loguniform(1e-3, 1e-1),
             "num_heads": tune.choice([4, 8, 16]),
             "num_quantizers": tune.choice([4, 8, 10, 16]),
             "codebook_size": tune.choice([128, 256, 512]),
             "base_config": base_config_path,
+            "time_budget_s": max(time_budget//4, 8*3600-5*60)  # Ensure at least 8 hours for each trial
         }
         
         tuner = tune.Tuner(
@@ -179,13 +191,12 @@ def main():
                 metric="validation_loss",
                 mode="min",
                 num_samples=-1,
-                scheduler=scheduler,
-                time_budget_s=time_budget,
+                # scheduler=scheduler,
+                # time_budget_s=time_budget,
                 search_alg=algo
             ),
             run_config=air.RunConfig(
                 name="kg_lfm_hyperparameter_sweep",
-                stop=TimeoutStopper(time_budget//4),  # Stop after time_budget
             ),
             param_space=param_space
         )

@@ -26,18 +26,19 @@ def main():
     
     try:
         trainer.train()
+        trainer.close()
     except KeyboardInterrupt:
         logging.info("Training interrupted by user.")
         
         if wandb.run:
             wandb.finish()
-        trainer.accelerator.end_training()
+        trainer.close()
     except Exception as e:
         logging.error(f"Training failed with an unexpected error: {e}", exc_info=True)
         
         if wandb.run:
             wandb.finish()
-        trainer.accelerator.end_training()
+        trainer.close()
         raise
 
 if __name__ == "__main__":

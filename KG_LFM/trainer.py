@@ -112,7 +112,7 @@ class KG_LFM_Trainer:
         self.device = self.accelerator.device
 
         # Setup logging
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger()
 
         # Initialize state
         self.model : KG_LFM = None
@@ -147,27 +147,27 @@ class KG_LFM_Trainer:
         
         self.checkpoint_dir = Path(self.config.train_conf.checkpoint_dir + f"/{self.run_name}")
 
-        self.accelerator.print(f"Trainer initialized on device: {self.device}")
-        self.accelerator.print(f"World size: {self.accelerator.num_processes}")
-        self.accelerator.print(f"Local rank: {self.accelerator.local_process_index}")
-        self.accelerator.print(f"Is main process: {self.accelerator.is_main_process}")
-        self.accelerator.print(f"Checkpoint frequency: every {self.checkpoint_frequency} epoch(s)")
-        self.accelerator.print(f"Training steps per evaluation: {self.steps_train}")
+        self.logger.info(f"Trainer initialized on device: {self.device}")
+        self.logger.info(f"World size: {self.accelerator.num_processes}")
+        self.logger.info(f"Local rank: {self.accelerator.local_process_index}")
+        self.logger.info(f"Is main process: {self.accelerator.is_main_process}")
+        self.logger.info(f"Checkpoint frequency: every {self.checkpoint_frequency} epoch(s)")
+        self.logger.info(f"Training steps per evaluation: {self.steps_train}")
         
         # Calculate and display effective batch size
         micro_batch_size = self.config.train_conf.dataloader.batch_size
-        self.accelerator.print(f"Micro batch size per GPU: {micro_batch_size}")
+        self.logger.info(f"Micro batch size per GPU: {micro_batch_size}")
         
         # Add safety check for distributed training
         if self.accelerator.num_processes > 1:
-            self.accelerator.print(f"Distributed training with {self.accelerator.num_processes} processes")
+            self.logger.info(f"Distributed training with {self.accelerator.num_processes} processes")
 
     def setup_wandb(self):
         """Initialize wandb, potentially resuming a previous run."""
         if self.accelerator.is_main_process and self.enable_wandb:
             # if already initialized, just resume
             if wandb.run is not None:
-                self.accelerator.print(f"Resuming existing wandb run: {wandb.run.id}")
+                self.logger.info(f"Resuming existing wandb run: {wandb.run.id}")
             
             wandb_config = self.config.to_dict() # Assuming a method to convert config to dict
             
@@ -219,7 +219,7 @@ class KG_LFM_Trainer:
 
     def setup_data(self):
         """Setup data loaders with distributed support."""
-        self.accelerator.print("Setting up data loaders...")
+        self.logger.info("Setting up data loaders...")
         
         train, val, test = create_dataloader(
             self.config.dataset,
@@ -235,12 +235,12 @@ class KG_LFM_Trainer:
         # if steps_train is float, convert to int
         if isinstance(self.steps_train, float):
             self.steps_train = int(len(self.train_dataloader) * self.steps_train / self.accelerator.num_processes)
-            self.accelerator.print(f"Converted steps_train to {self.steps_train} based on dataset size.")
+            self.logger.info(f"Converted steps_train to {self.steps_train} based on dataset size.")
              
         
     def setup_optimizer_and_scheduler(self, num_epochs: int):
         """Setup optimizer and learning rate scheduler."""
-        self.accelerator.print("Setting up optimizer and scheduler...")
+        self.logger.info("Setting up optimizer and scheduler...")
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
         self.optimizer = AdamW(
@@ -255,7 +255,7 @@ class KG_LFM_Trainer:
             self.optimizer,
             mode="min",
             factor=0.5,
-            patience=self.config.train_conf.early_stopping_patience // 2,
+            patience=max(1,self.config.train_conf.early_stopping_patience // 2),
             verbose=True
         )
 
@@ -263,7 +263,7 @@ class KG_LFM_Trainer:
 
     def prepare_for_training(self):
         """Prepare all components with accelerator."""
-        self.accelerator.print("Preparing components with Accelerator...")
+        self.logger.info("Preparing components with Accelerator...")
         
         (self.model, self.optimizer, self.scheduler,
          self.train_dataloader,self.val_dataloader, self.test_dataloader, 
@@ -316,7 +316,7 @@ class KG_LFM_Trainer:
         total_batches = len(dataloader)
         num_batches = max(1, int(total_batches * percentage_eval))
         
-        self.accelerator.print(f"Evaluating {num_batches}/{total_batches} batches ({num_batches/total_batches*100:.1f}%)")
+        self.logger.info(f"Evaluating {num_batches}/{total_batches} batches ({num_batches/total_batches*100:.1f}%)")
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=description, disable=not self.accelerator.is_local_main_process, total=num_batches)):
@@ -342,7 +342,7 @@ class KG_LFM_Trainer:
                     del outputs, loss
                     
                 except Exception as e:
-                    self.accelerator.print(f"Error in evaluation batch {batch_idx}: {e}")
+                    self.logger.info(f"Error in evaluation batch {batch_idx}: {e}")
                     # Clear cache on error
                     self.clear_memory()
                     # Ensure synchronization even on error
@@ -395,7 +395,7 @@ class KG_LFM_Trainer:
                 self.skip_train_dataloader = None  # Reset skip dataloader
                 batch = next(self.train_iter)
 
-            # self.accelerator.print(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
+            # self.logger.info(f"Processing step {step + 1}/{self.steps_train} on process {self.accelerator.local_process_index}")
             with self.accelerator.accumulate(self.model):
                 # Standard forward pass
                 outputs = self.model(
@@ -458,7 +458,7 @@ class KG_LFM_Trainer:
             sub_path (Optional[Path]): Subdirectory to save the model in.
         """
         if self.accelerator.is_main_process:
-            self.accelerator.print(f"Saving model to {self.checkpoint_dir}")
+            self.logger.info(f"Saving model to {self.checkpoint_dir}")
         
         # Ensure checkpoint directory exists
         model_dir = self.checkpoint_dir if sub_path is None else self.checkpoint_dir / sub_path
@@ -542,8 +542,13 @@ class KG_LFM_Trainer:
         # Memory cleanup after checkpoint
         self.clear_memory()
         
-    def train(self):
-        """Main training loop."""
+    def train(self, time_budget_s: Optional[int] = None):
+        """Main training loop.
+        
+        Args:
+            time_budget_s (Optional[int]): Time budget for training in seconds.
+        """
+        self.logger.info("Starting training...")
         num_epochs = self.config.train_conf.epochs
         patience = self.config.train_conf.early_stopping_patience
 
@@ -552,8 +557,10 @@ class KG_LFM_Trainer:
         self.setup_optimizer_and_scheduler(num_epochs)
         self.prepare_for_training()
 
+        start_time = time.time()
+
         if self.resume and os.path.exists(self.checkpoint_dir / "latest_checkpoint"):
-            self.accelerator.print(f"Resuming training from: {self.checkpoint_dir}")
+            self.logger.info(f"Resuming training from: {self.checkpoint_dir}")
             self.accelerator.load_state(self.checkpoint_dir / "latest_checkpoint")
             
             state_path = self.checkpoint_dir / "training_state.pth"
@@ -564,7 +571,7 @@ class KG_LFM_Trainer:
             self.best_val_loss = state.get('best_val_loss', float('inf'))
             self.epochs_without_improvement = state.get('epochs_without_improvement', 0)
             self.last_best_model_save_step = state.get('last_best_model_save_step', -1)
-            self.accelerator.print(f"Resuming from epoch {self.start_epoch + 1}, global step {self.global_step}")
+            self.logger.info(f"Resuming from epoch {self.start_epoch + 1}, global step {self.global_step}")
             self.wandb_run_id = state.get('wandb_run_id', None)
             
             # skip to the correct batch in the dataloader
@@ -581,7 +588,7 @@ class KG_LFM_Trainer:
 
         self.setup_wandb()
         
-        self.accelerator.print(f"Starting training for {num_epochs} epochs with patience {patience}")
+        self.logger.info(f"Starting training for {num_epochs} epochs with patience {patience}")
         
         # Calculate total training steps needed
         steps_per_epoch = len(self.train_dataloader) // self.steps_train
@@ -591,25 +598,40 @@ class KG_LFM_Trainer:
         total_training_steps = num_epochs * steps_per_epoch
         steps_completed = self.global_step // self.steps_train
         
-        self.accelerator.print(f"Total training steps: {total_training_steps}, Steps per epoch: {steps_per_epoch}")
+        time_one_step = 0
+        
+        self.logger.info(f"Total training steps: {total_training_steps}, Steps per epoch: {steps_per_epoch}")
         
         for step_idx in range(steps_completed, total_training_steps):
+            
+            # TIMEOUT PROTECTION
+            should_stop = torch.tensor([False], device=self.device)
+            if time_budget_s is not None:
+                step_end = time.time() - start_time + time_one_step
+                if step_end >= time_budget_s:
+                    should_stop = torch.tensor([True], device=self.device)
+            start_step_time = time.time()
+            
+            should_stop = self.accelerator.gather(should_stop).all().item()
+            
+            if should_stop:
+                # If time budget is reached, stop training
+                self.logger.info(f"Time budget of {time_budget_s} seconds reached. Stopping training.")
+                break
+            
+            
+            # ACTIVATE TRAINING STEP
             current_epoch = step_idx // steps_per_epoch
             step_in_epoch = step_idx % steps_per_epoch
-            self.accelerator.print(f"--- Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) ---")
+            self.logger.info(f"--- Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) ---")
             
-            # Add timeout protection and better error handling
             train_metrics = self.train_step()
-            
-            # Add explicit synchronization before validation
             self.accelerator.wait_for_everyone()
             
             val_metrics = self._evaluation_loop(self.val_dataloader, "Validation", self.percentage_eval)
+            self.accelerator.wait_for_everyone()
             
             self.scheduler.step(val_metrics['validation_loss'])  # Step scheduler based on validation loss
-            
-            # Another synchronization after validation
-            self.accelerator.wait_for_everyone()
             
             log_metrics = {
                 "epoch": current_epoch + 1,
@@ -620,13 +642,13 @@ class KG_LFM_Trainer:
             
             self.accelerator.log(log_metrics, step=self.global_step)
             
-            self.accelerator.print(f"Step {step_idx + 1}/{total_training_steps} | Train Loss: {train_metrics['training_loss']:.4f} | Val Loss: {val_metrics['validation_loss']:.4f} | LR: {train_metrics['learning_rate']:.6f}")
+            self.logger.info(f"Step {step_idx + 1}/{total_training_steps} | Train Loss: {train_metrics['training_loss']:.4f} | Val Loss: {val_metrics['validation_loss']:.4f} | LR: {train_metrics['learning_rate']:.6f}")
 
             is_best = val_metrics['validation_loss'] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_metrics['validation_loss']
                 self.epochs_without_improvement = 0
-                self.accelerator.print(f"New best validation loss: {self.best_val_loss:.4f}")
+                self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}")
             else:
                 self.epochs_without_improvement += 1
 
@@ -642,49 +664,19 @@ class KG_LFM_Trainer:
                 self.save_checkpoint(current_epoch, is_best)
 
             if self.epochs_without_improvement >= patience:
-                self.accelerator.print(f"Early stopping triggered after {patience} train loops without improvement.")
+                self.logger.info(f"Early stopping triggered after {patience} train loops without improvement.")
                 break
-        
-        self.accelerator.print("Training finished. Evaluating on the test set with the best model.")
-        # Wait for all processes before test evaluation
-        self.accelerator.wait_for_everyone()
-        self.run_test_evaluation()
-        self.accelerator.wait_for_everyone()
-
-        self.accelerator.end_training()
-        self.logger.info("Training process completed.")
-
-    def run_test_evaluation(self):
-        """Load the best model and evaluate on the test set."""
-        if self.test_dataloader:
-            best_model_path = self.checkpoint_dir / "best_model"
-            if best_model_path.exists():
-                self.logger.info(f"Loading best model from {best_model_path} for test evaluation.")
-                
-                try:
-                    self.model.load_pretrained(best_model_path)
-                    self.logger.info("Best model loaded successfully.")
-                except Exception as e:
-                    self.logger.error(f"Error loading best model: {e}")
-                    raise
-
-                test_metrics = self._evaluation_loop(self.test_dataloader, "Testing", 1)
-
-                
-                self.logger.info(f"Test metrics: {test_metrics}")
-                
-                final_log = {
-                    "test/final_loss": test_metrics['validation_loss'],
-                }
-                
-                self.metrics_tracker.update(final_log, 1)
-                
-                if 'perplexity' in test_metrics:
-                    final_log["test/final_perplexity"] = test_metrics['perplexity']
-                    self.logger.info(f"Perplexity: {test_metrics['perplexity']:.2f}")
-                
-                self.accelerator.log(final_log)
+            
+            # UPDATE ESTIMATE OF TIME PER STEP
+            end_step_time = time.time() - start_step_time
+            if time_one_step == 0:
+                time_one_step = end_step_time
             else:
-                self.logger.warning("No best model found to evaluate on the test set.")
-        else:
-            self.logger.warning("Skipping test evaluation.")
+                time_one_step = 0.7 * time_one_step + 0.3 * end_step_time
+
+        self.logger.info("Training finished.")
+        
+    def close(self):
+        """Cleanup resources."""
+        self.accelerator.end_training()
+        self.logger.info("Training resources cleaned up.")

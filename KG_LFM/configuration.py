@@ -45,23 +45,17 @@ class DatasetConfig:
     """Whether to use the lite version of the dataset. Defaults to False."""
     
     # base path from $FAST/datase
-    base_path: str = os.path.join(os.getenv("FAST", ""), "dataset", "Tri-Rex_V1")
-    """Base path for the dataset. Defaults to $FAST/dataset/Tri-Rex_V1."""
+    base_path: str = os.path.join(os.getenv("FAST", ""), "dataset", "KG_LFM")
+    """Base path for the dataset. Defaults to $FAST/dataset/KG_LFM."""
     
-    
-    graph_embs_base_path: str = os.path.join(os.getenv("FAST", ""), "dataset", "Tri-Rex_V1", "graph_embs")
-    """Base path for the graph embeddings. Defaults to $FAST/dataset/Tri-Rex_V1/graph_embs."""
+    graph_embs_base_path: str = os.path.join(os.getenv("FAST", ""), "dataset", "KG_LFM", "graph_embs")
+    """Base path for the graph embeddings. Defaults to $FAST/dataset/KG_LFM/graph_embs."""
     
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Is set to the same as the one used in the model config."""
     
     preload_nodes_embeddings: bool = True
     """Whether to preload graph nodes embeddings into memory for faster access during training."""
-    
-    def __post_init__(self):
-        # Ensure that the base path is set correctly
-        assert os.path.exists(self.base_path), f"Base path {self.base_path} does not exist."
-        assert os.path.exists(self.graph_embs_base_path), f"Graph embeddings path {self.graph_embs_base_path} does not exist."
 
 @dataclass
 class DataLoaderConfig():
@@ -133,7 +127,7 @@ class ModelConfig:
     """Model used for graph nodes embedding. Defaults to 'Qwen/Qwen3-Embedding-0.6B'."""
     
 @dataclass
-class PretrainConfig:
+class TrainConfig:
     """
     Configuration for pretraining on Tri-REx.
     """
@@ -149,6 +143,9 @@ class PretrainConfig:
     
     early_stopping_patience: int = 3
     """Patience for early stopping during pretraining. Defaults to 3."""
+    
+    scheduler_patience: int = 2
+    """Patience for the ReduceLROnPlateau scheduler. Defaults to 2."""
     
     learning_rate: float = 1e-4
     """Learning rate for the pretraining optimizer. Defaults to 1e-4."""
@@ -188,7 +185,7 @@ class ProjectConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     """General configuration for the datasets."""
     
-    train_conf: PretrainConfig = field(default_factory=PretrainConfig)
+    train_conf: TrainConfig = field(default_factory=TrainConfig)
     """Configuration for pretraining on Tri-REx."""
     
     model: ModelConfig = field(default_factory=ModelConfig)

@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --nodes=5                       # number of nodes
+#SBATCH --nodes=10                       # number of nodes
 
 #SBATCH --job-name=ray_sweep            # job name
-#SBATCH --time=24:00:00               # time limits
+#SBATCH --time=24:0:00               # time limits
 #SBATCH --output=out/ray_sweep_%j.out   # standard output file
+##SBATCH --qos=boost_qos_dbg          
 
 #SBATCH --chdir=.                       # start from current directory
 #SBATCH --ntasks-per-node=1             # number of tasks per node
 #SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
-#SBATCH --qos=normal
 
 #SBATCH --gpus-per-task=4                 
 #SBATCH --cpus-per-task=32
@@ -36,7 +36,7 @@ else
 fi
 
 
-time_budget=$(( 23 * 3600 )) # Default to 23 hours in seconds
+time_budget=$(( 24 * 3600 - 15 * 60 )) # Default to 24 hours in seconds - 15m
 # if a $2 argument is provided, use it as time budget
 if [ ! -z "$2" ]; then
     time_budget=$2

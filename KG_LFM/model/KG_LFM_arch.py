@@ -123,7 +123,8 @@ class KG_LFMMetaModel(ABC):
                 r=config.lora_r,
                 lora_alpha=config.lora_alpha,
                 target_modules=config.lora_target_modules,
-                task_type=TaskType.CAUSAL_LM
+                task_type=TaskType.CAUSAL_LM,
+                lora_dropout=config.dropout,
             )
             self.llm : PeftModel = get_peft_model(self.llm, lora_config)
         
