@@ -174,3 +174,4 @@ vila-u/
 wandb/
 eval/
 .vscode/
+.deepspeed_env

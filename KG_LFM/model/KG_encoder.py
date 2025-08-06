@@ -7,13 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
+from torch.nn.utils import spectral_norm
 import logging
 
 # graph pooling
 from torch_geometric.nn import global_mean_pool
 
 from torch_geometric.data import Batch
-from vector_quantize_pytorch import ResidualVQ
 
 import torch
 import torch.nn as nn
@@ -30,25 +30,33 @@ class ResidualVectorQuantization(nn.Module):
         Embedding dimension of the inputs.
     num_quantizers : int, default 3
         Number of residual stages (codebooks).
-    codebook_size : int, default 512
+    codebook_size : int, default 256
         Number of entries in each codebook.
     shared_codebook : bool, default False
         If True, every stage re-uses the same nn.Embedding object.
-    commit_weight : float, default 0.25
-        Multiplier for the commitment (codebook) loss term.
+    beta_commit : float, default 0.25
+        Weight for the commitment loss.
+    gamma_entropy : float, default 1e-2
+        Weight for the entropy regularization loss.
+    lambda_res : float, default 1.0
+        Weight for the residual loss.
     """
     def __init__(
         self,
         dim,
         num_quantizers: int = 3,
-        codebook_size: int = 512,
+        codebook_size: int = 256,
         shared_codebook: bool = False,
-        commit_weight: float = 0.25,
+        beta_commit=0.25, gamma_entropy=1.0, lambda_res=0.5,
     ):
         super().__init__()
         self.dim = dim
         self.num_quantizers = num_quantizers
-        self.commit_weight = commit_weight
+        self.codebook_size = codebook_size
+        
+        self.beta_commit = beta_commit
+        self.gamma_entropy = gamma_entropy
+        self.lambda_res = lambda_res
 
         # ── codebooks ──────────────────────────────────────────────────────────
         if shared_codebook:
@@ -81,7 +89,64 @@ class ResidualVectorQuantization(nn.Module):
         # (B, 1, D) × (1, K, D) → (B, K)
         dist = torch.cdist(residual.unsqueeze(1), table.weight.unsqueeze(0)).squeeze(1)
         idx = dist.argmin(-1)           # (B,)
-        return idx, table(idx)          # (B,), (B, D)
+        return idx, table(idx), dist    # (B,), (B, D), (B, K)
+    
+    def _compute_adaptive_entropy_weight(self, commit_loss, perplexity, batch_diversity):
+        """
+        Compute adaptive entropy weight based on commitment loss, perplexity, and batch diversity.
+        
+        Args:
+            commit_loss: Current commitment loss
+            perplexity: Current perplexity of the codebook usage
+            batch_diversity: Measure of diversity in the current batch
+        
+        Returns:
+            Adaptive entropy weight
+        """
+        # Normalize metrics to [0, 1] range for stable scaling
+        commit_norm = torch.sigmoid(commit_loss * 10)  # Scale commitment loss
+        perplexity_norm = perplexity / self.codebook_size  # Normalize by codebook size
+        diversity_norm = torch.clamp(batch_diversity, 0, 1)  # Ensure in [0, 1]
+        
+        # Scale up entropy when:
+        # - Low batch diversity (need more exploration)
+        # - Low perplexity (codebook underutilized)
+        # Scale down entropy when:
+        # - High commitment loss and high perplexity (codebook well utilized)
+        
+        # Base entropy weight
+        base_weight = self.gamma_entropy
+        
+        # Diversity factor: increase entropy when diversity is low
+        diversity_factor = 2.0 - diversity_norm  # Range [1, 2]
+        
+        # Commitment-perplexity factor: decrease entropy when both are high
+        commit_perp_factor = 1.0 / (1.0 + commit_norm * perplexity_norm)  # Range (0, 1]
+        
+        # Combine factors
+        adaptive_weight = base_weight * diversity_factor * commit_perp_factor
+        
+        return adaptive_weight
+
+    def _compute_batch_diversity(self, x):
+        """
+        Compute diversity measure for the batch.
+        Uses pairwise distances between samples.
+        """
+        if x.size(0) <= 1:
+            return torch.tensor(0.0, device=x.device)
+        
+        # Compute pairwise distances
+        pairwise_dist = torch.cdist(x, x)
+        
+        # Remove diagonal (self-distances)
+        mask = ~torch.eye(x.size(0), dtype=torch.bool, device=x.device)
+        distances = pairwise_dist[mask]
+        
+        # Diversity as normalized mean distance
+        diversity = distances.mean() / (x.norm(dim=1).mean() + 1e-8)
+        
+        return torch.clamp(diversity, 0, 1)
 
     # -------- forward ---------------------------------------------------------
     def forward(self, x: torch.Tensor):
@@ -99,12 +164,18 @@ class ResidualVectorQuantization(nn.Module):
 
         residual = x
         quantized_list, index_list = [], []
-        commit_loss = 0.0
+        
+        if self.training:
+            total_commit = torch.tensor(0.0, device=x.device)
+            total_entropy = torch.tensor(0.0, device=x.device)
+        
+        # Compute batch diversity once
+        batch_diversity = self._compute_batch_diversity(x)
 
         for cb in self.codebooks:
             # 1. Pick the nearest codebook vector (this operation is non-differentiable)
-            idx, q = self._nearest_code(residual, cb)
-            
+            idx, q, dist = self._nearest_code(residual, cb)
+
             # 2. Apply the Straight-Through Estimator (STE)
             # This allows the gradient to be passed from 'q_ste' back to 'residual'
             # as if the operation was an identity function in the backward pass.
@@ -114,25 +185,53 @@ class ResidualVectorQuantization(nn.Module):
             quantized_list.append(q_ste)
             index_list.append(idx)
             
-            # 4. Calculate the commitment loss to train the codebook.
-            # The gradient for this loss should only affect the codebook, not the encoder.
-            commit_loss = commit_loss + F.mse_loss(residual.detach(), q)
+            if self.training:
+                # 4. Calculate the commitment loss to train the codebook.
+                # The gradient for this loss should only affect the codebook, not the encoder.
+                commit_loss = F.mse_loss(residual.detach(), q)
+                
+                # 5. Entropy regularization for better codebook utilization
+                prob_dist = F.softmax(-dist, dim=-1)
+                entropy_loss = -(prob_dist * torch.log(prob_dist + 1e-8)).sum(-1).mean()
+                
+                # 6. Compute perplexity for adaptive scaling
+                # Perplexity measures how well the probability distribution is spread
+                perplexity = torch.exp(entropy_loss)
+                
+                # 7. Compute adaptive entropy weight
+                adaptive_entropy_weight = self._compute_adaptive_entropy_weight(
+                    commit_loss, perplexity, batch_diversity
+                )
             
-            # 5. Update the residual for the next quantization stage using the original 'q'.
+                # 8. Accumulate the total loss with adaptive entropy weight
+                total_commit += commit_loss
+                total_entropy += adaptive_entropy_weight * entropy_loss
+            
+            # 9. Update the residual for the next quantization stage using the original 'q'.
             residual = residual - q
+            
 
         quantized = torch.stack(quantized_list, dim=1)   # (B, Q, D)
         indices   = torch.stack(index_list,   dim=1)     # (B, Q)
         
-        # The residual loss encourages the encoder to produce outputs that are 
-        # close to the codebook, providing a gradient path back to the encoder.
-        res_loss  = residual.pow(2).mean()
+        if self.training:
+            total_commit = self.beta_commit * total_commit / self.num_quantizers
+            total_entropy = total_entropy / self.num_quantizers
+            
+            # The residual loss encourages the encoder to produce outputs that are 
+            # close to the codebook.
+            res_loss  = residual.pow(2).mean() * self.lambda_res
 
-        # The total loss for the quantization module
-        loss = res_loss + self.commit_weight * commit_loss
+            logging.debug("Residual loss: %s, commit loss: %s, entropy loss: %s, batch diversity: %s",
+                        res_loss.item(), total_commit.item(), total_entropy.item(), batch_diversity.item())
+            # The total loss for the quantization module
+            loss = res_loss + total_commit + total_entropy
+        else:
+            # During inference, we do not compute the loss (we are interested on the language loss, not the quantization loss)
+            loss = torch.tensor(0.0, device=x.device)
 
         return quantized, indices, loss
-        
+
 
 class KGEncoder(nn.Module):
     def __init__(
@@ -175,9 +274,11 @@ class KGEncoder(nn.Module):
         )
         self.num_heads = num_heads
         
-        # adapter layer
-        self.adapter = nn.Linear(node_embedding_dim, node_embedding_dim)
+        # adapter layer with spectral normalization for stability
+        self.adapter = spectral_norm(nn.Linear(node_embedding_dim, node_embedding_dim))
         self.dropout = nn.Dropout(dropout)
+        self.edge_dropout = nn.Dropout(dropout * 0.5)  # Edge-specific dropout
+        self.attention_dropout = nn.Dropout(dropout * 0.3)  # Attention dropout
 
         # normalization layer
         self.norm = nn.LayerNorm(node_embedding_dim)
@@ -191,8 +292,8 @@ class KGEncoder(nn.Module):
             shared_codebook=shared_codebook
         )
         
-        # output projection layer
-        self.output_projection = nn.Linear(node_embedding_dim, final_embedding_dim)
+        # output projection layer with spectral normalization
+        self.output_projection = spectral_norm(nn.Linear(node_embedding_dim, final_embedding_dim))
         
         self.graph_pooling = graph_pooling
         
@@ -238,8 +339,16 @@ class KGEncoder(nn.Module):
         
         logging.debug("Moved tensors")
         
+        # Apply edge dropout before GATv2Conv
+        if self.training:
+            edge_attr = self.edge_dropout(edge_attr)
+        
         # Apply GATv2Conv
         x = self.conv(x, edge_index, edge_attr)
+        
+        # Apply attention dropout after GAT
+        if self.training:
+            x = self.attention_dropout(x)
         
         logging.debug("Applied GATv2Conv")
         

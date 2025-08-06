@@ -147,9 +147,12 @@ class TrainConfig:
     scheduler_patience: int = 2
     """Patience for the ReduceLROnPlateau scheduler. Defaults to 2."""
     
-    learning_rate: float = 1e-4
-    """Learning rate for the pretraining optimizer. Defaults to 1e-4."""
+    KG_learning_rate: float = 1e-4
+    """Learning rate for the KG optimizer. Defaults to 1e-4."""
     
+    LLM_learning_rate: float = 1e-4
+    """Learning rate for the LLM optimizer. Defaults to 1e-4."""
+
     weight_decay: float = 0.01
     """Weight decay for the pretraining optimizer. Defaults to 0.01."""
     
@@ -158,6 +161,9 @@ class TrainConfig:
     
     clip_grad_norm: float = 1.0
     """Maximum gradient norm for clipping. Defaults to 1.0."""
+    
+    rvq_loss_weight: float = 1.0
+    """Weight for the RVQ loss component. Defaults to 1.0."""
     
     dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     
@@ -173,7 +179,8 @@ class TrainConfig:
     
     def __post_init__(self):
         # Ensure that learning rate and weight decay are numbers
-        self.learning_rate = float(self.learning_rate)
+        self.KG_learning_rate = float(self.KG_learning_rate)
+        self.LLM_learning_rate = float(self.LLM_learning_rate)
         self.weight_decay = float(self.weight_decay)
 
 

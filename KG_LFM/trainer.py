@@ -4,7 +4,6 @@ Training script for KG-LFM with wandb logging, checkpointing, and better validat
 """
 
 import logging
-import argparse
 import os
 import time
 from pathlib import Path
@@ -26,7 +25,7 @@ import wandb
 from tqdm.auto import tqdm
 
 # Assuming these are defined in your project structure
-from KG_LFM.configuration import load_yaml_config, ProjectConfig
+from KG_LFM.configuration import ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
 from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
 
@@ -243,13 +242,31 @@ class KG_LFM_Trainer:
         self.logger.info("Setting up optimizer and scheduler...")
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
+        # Enhanced optimizer with different learning rates for different components
+        kg_encoder_params = [p for n, p in self.model.named_parameters() if 'kg_encoder' in n and p.requires_grad]
+        llm_params = [p for n, p in self.model.named_parameters() if 'kg_encoder' not in n and p.requires_grad]
+        
+        param_groups = []
+        if kg_encoder_params:
+            param_groups.append({
+                'params': kg_encoder_params, 
+                'lr': self.config.train_conf.KG_learning_rate,
+                'weight_decay': self.config.train_conf.weight_decay
+            })
+        if llm_params:
+            param_groups.append({
+                'params': llm_params, 
+                'lr': self.config.train_conf.LLM_learning_rate,  # Lower LR for LLM
+                'weight_decay': self.config.train_conf.weight_decay
+            })
+        
         self.optimizer = AdamW(
-            trainable_params,
-            lr=self.config.train_conf.learning_rate,
-            weight_decay=self.config.train_conf.weight_decay
+            param_groups if param_groups else trainable_params,
+            lr=self.config.train_conf.KG_learning_rate,
+            weight_decay=self.config.train_conf.weight_decay,
+            eps=1e-8,
+            betas=(0.9, 0.95)  # More stable betas for large models
         )
-
-        total_steps = (len(self.train_dataloader) * num_epochs) // self.accelerator.num_processes
 
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
@@ -258,8 +275,6 @@ class KG_LFM_Trainer:
             patience=max(1,self.config.train_conf.early_stopping_patience // 2),
             verbose=True
         )
-
-        self.target_lr = self.config.train_conf.learning_rate
 
     def prepare_for_training(self):
         """Prepare all components with accelerator."""
@@ -407,10 +422,17 @@ class KG_LFM_Trainer:
                 )
                 language_loss = outputs.loss
                 RVQ_loss = outputs.RVQ_loss
-                loss = language_loss + RVQ_loss
+                
+                # Weighted loss combination with configurable weights
+                rvq_weight = getattr(self.config.train_conf, 'rvq_loss_weight', 1.0)
+                loss = language_loss + rvq_weight * RVQ_loss
                 
                 # print all processes' losses for debugging
-                self.logger.debug(f"Step {step + 1}/{self.steps_train} - Language Loss: {language_loss.item():.4f}, RVQ Loss: {RVQ_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+                self.logger.debug(
+                    "Step %d/%d - Language Loss: %.4f, RVQ Loss: %.4f",
+                    step + 1, self.steps_train,
+                    language_loss.item(), RVQ_loss.item()
+                )
                 
                 # create a tensor to accumulate from all processes to skip all backward passes if loss is NaN or Inf
                 is_valid_loss = torch.tensor(not (torch.isnan(loss) or torch.isinf(loss)), device=self.device, dtype=torch.bool)
@@ -424,9 +446,8 @@ class KG_LFM_Trainer:
                     total_loss += loss / self.grad_accumulation_steps
                     self.accelerator.backward(loss)
                 
-                self.logger.debug(f"Step {step + 1}/{self.steps_train} - Final Loss {loss}")
-                
-                self.optimizer.step() # does NOTHING when using deepspeed
+                # does NOTHING when using deepspeed
+                self.optimizer.step() 
                 self.optimizer.zero_grad()
                 
                 if self.accelerator.sync_gradients: # TRUE when accumulating gradients
@@ -434,7 +455,9 @@ class KG_LFM_Trainer:
                     metrics = self.compute_train_metrics(total_loss)
                     total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
                     self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    log_metrics = {f"train/{k}": v for k, v in metrics.items()}
+                    log_metrics = {
+                        f"train/{k}": v for k, v in metrics.items()
+                    }
                     self.accelerator.log(log_metrics, step=self.global_step)
 
                 self.global_step += 1
@@ -451,7 +474,7 @@ class KG_LFM_Trainer:
         self.metrics_tracker.reset()  # Reset tracker for next step
         
         return averages
-
+    
     def save_model(self, sub_path: Optional[Path] = None):
         """Save the model and training state.
         Args:
@@ -460,17 +483,18 @@ class KG_LFM_Trainer:
         if self.accelerator.is_main_process:
             self.logger.info(f"Saving model to {self.checkpoint_dir}")
         
-        # Ensure checkpoint directory exists
-        model_dir = self.checkpoint_dir if sub_path is None else self.checkpoint_dir / sub_path
-        model_dir.mkdir(parents=True, exist_ok=True)
+            # Ensure checkpoint directory exists
+            model_dir = self.checkpoint_dir if sub_path is None else self.checkpoint_dir / sub_path
+            model_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            unwrapped_model: KG_LFM = self.accelerator.unwrap_model(self.model)
-            unwrapped_model.save_pretrained(model_dir)
-            self.logger.info(f"Model saved successfully to {model_dir}")
-        except Exception as e:
-            self.logger.error(f"Error saving model: {e}")
-            raise
+            try:
+                unwrapped_model: KG_LFM = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(model_dir)
+                self.logger.info(f"Model saved successfully to {model_dir}")
+            except Exception as e:
+                self.logger.error(f"Error saving model: {e}")
+                
+        self.accelerator.wait_for_everyone()  # Ensure all processes complete before continuing
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint with proper distributed coordination."""
@@ -518,23 +542,9 @@ class KG_LFM_Trainer:
 
             if is_best:
                 self.last_best_model_save_step = self.global_step
-                best_path = checkpoint_dir / "best_model"
+                best_path = "best_model"
                 
-                # Clear memory before saving best model to prevent OOM
-                self.clear_memory()
-                
-                try:
-                    unwrapped_model : KG_LFM = self.accelerator.unwrap_model(self.model)
-                    unwrapped_model.save_pretrained(best_path)
-                    self.logger.info(f"New best model saved to {best_path}")
-                except Exception as e:
-                    self.logger.error(f"Error saving best model: {e}")
-                    raise
-
-                # Log the best model as a wandb Artifact
-                # artifact = wandb.Artifact(f"{self.run_name}-best-model", type="model")
-                # artifact.add_dir(str(best_path))
-                # wandb.log_artifact(artifact)
+                self.save_model(sub_path=best_path)
         
         # Final synchronization to ensure all processes complete before continuing
         self.accelerator.wait_for_everyone()

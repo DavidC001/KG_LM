@@ -1,37 +1,40 @@
-# Configuration for KG_LFM training with lite dataset
-
 seed: 42
 
 dataset:
-  name: "trirex"
-  lite: True
-  base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1"
-  graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/Tri-Rex_V1/graph_embs"
+  name: "trirex-bite"
+  lite: False
+  base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM"
+  graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM/graph_embs"
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "pretrain_trirex_lora"
+  run_name: "KG_LFM"
     
   epochs: 10
   early_stopping_patience: 4
-  steps_train: 0.5  # Number of training steps before validation
+  scheduler_patience: 2
+  steps_train: 0.25  # 33% of the training set
   eval_perc: 0.5
 
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   clip_grad_norm: 1.0
 
-  learning_rate: 1e-3
-  weight_decay: 0.05
+  KG_learning_rate: 1e-5
+  LLM_learning_rate: 1e-5
+  weight_decay: 0.01
+
+  rvq_loss_weight: 0.25
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  resume : False
+  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/pre-KG_LFM/best_model"
+  resume : True
 
   dataloader:
     batch_size: 8
     shuffle: True
-    num_workers: 0
+    num_workers: 2
 
     include_graphs: True
     return_tensors: "pt"
@@ -47,19 +50,19 @@ model:
   graph_pooling: True
 
   dropout: 0.2  
-  num_heads: 4
-  num_quantizers: 4
-  codebook_size: 128
+  num_heads: 16
+  num_quantizers: 10
+  codebook_size: 256
   shared_codebook: False
   
   # Training Configuration
   tune_language_model: False
   tune_kg_encoder: True
-
+  
   use_lora: True
   lora_r: 8
   lora_alpha: 16
   lora_target_modules: ["q_proj", "k_proj"]
-  
+
   # Graph Node Embedding Configuration
   graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"
