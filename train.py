@@ -16,14 +16,13 @@ def main():
     debug_mode = args.debug
     
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.INFO if not debug_mode else logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(f'logs/training_{config.train_conf.run_name}.log'),
-            logging.StreamHandler()
+            logging.StreamHandler() if debug_mode else logging.FileHandler(f'logs/training_{config.train_conf.run_name}.log'),
         ]
     )
-        
+    
     trainer = KG_LFM_Trainer(
         config, 
         run_name=config.train_conf.run_name, 
