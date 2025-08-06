@@ -8,7 +8,7 @@ dataset:
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "pre-KG_LFM"
+  run_name: "trirex-KG_LFM"
     
   epochs: 10
   early_stopping_patience: 4
@@ -16,10 +16,11 @@ train_conf:
   steps_train: 0.25  # 33% of the training set
   eval_perc: 0.5
 
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   clip_grad_norm: 1.0
 
-  learning_rate: 5e-4
+  KG_learning_rate: 5e-4
+  LLM_learning_rate: 1e-4
   weight_decay: 0.01
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
