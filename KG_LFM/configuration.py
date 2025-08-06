@@ -179,7 +179,8 @@ class TrainConfig:
     
     def __post_init__(self):
         # Ensure that learning rate and weight decay are numbers
-        self.learning_rate = float(self.learning_rate)
+        self.KG_learning_rate = float(self.KG_learning_rate)
+        self.LLM_learning_rate = float(self.LLM_learning_rate)
         self.weight_decay = float(self.weight_decay)
 
 
