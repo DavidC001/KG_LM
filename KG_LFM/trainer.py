@@ -276,8 +276,6 @@ class KG_LFM_Trainer:
             verbose=True
         )
 
-        self.target_lr = self.config.train_conf.learning_rate
-
     def prepare_for_training(self):
         """Prepare all components with accelerator."""
         self.logger.info("Preparing components with Accelerator...")
