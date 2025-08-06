@@ -1,201 +1,21 @@
-import random
 from typing import Dict, List, Optional, Union, Tuple, Any
-import warnings
 
-import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 import networkx as nx
-from datasets import Dataset as HFDataset
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory
+from KG_LFM.utils.Datasets.factories import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory
+from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
+from KG_LFM.utils.Datasets.webQA_data import WebQA_Dataset
+
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import DataLoaderConfig, DatasetConfig, SPECIAL_KG_TOKEN
+from KG_LFM.configuration import DataLoaderConfig, DatasetConfig
 
 from torch_geometric.data import Data, Batch
 
-class TriRexStarDataset(Dataset):
-    """
-    Combined dataset for TriREx sentences and TRExStar graphs.
-    
-    This dataset provides paired samples of:
-    - TriREx sentences with subject-predicate-object triples
-    - Corresponding TRExStar graph data for entities
-    """
-    
-    def __init__(
-        self,
-        trirex_dataset: HFDataset,
-        star_graphs: Dict[str, nx.DiGraph],
-        tokenizer: PreTrainedTokenizer,
-        big_graph_aligner: BigGraphAligner,
-    ):
-        self.trirex_dataset = trirex_dataset
-        self.star_graphs = star_graphs
-        self.tokenizer = tokenizer
-        self.big_graph_aligner = big_graph_aligner
-        
-        # add to tokenizer a special token SPECIAL_KG_TOKEN for graph embeddings
-        if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
-            warnings.warn(
-                f"The {SPECIAL_KG_TOKEN} token is not in the tokenizer vocabulary. "
-                "Adding it to the tokenizer. This may lead to unexpected behavior."
-            )
-            self.tokenizer.add_special_tokens({'additional_special_tokens': [SPECIAL_KG_TOKEN]})
 
-    def __len__(self) -> int:
-        return len(self.trirex_dataset)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        Get a sample containing both TriREx sentence data and corresponding graph data.
-        
-        Returns:
-            Dict containing:
-            - sentence: The original sentence
-            - subject: Subject entity information
-            - predicate: Predicate information  
-            - object: Object entity information
-            - subject_graph: NetworkX graph for subject entity (if available)
-            - object_graph: NetworkX graph for object entity (if available)
-            - tokenized_input: Tokenized sentence (if tokenizer provided)
-        """
-        # print(f"Fetching sample {idx} from TriREx dataset")
-        sample = self.trirex_dataset[idx]
-        
-        # add to the sentence a special token for graph embedding after the subject
-        subject_boundaries = sample['subject']['boundaries']
-        start_subject = subject_boundaries[0]
-        end_subject = subject_boundaries[1]
-
-        # Insert SPECIAL_KG_TOKEN after the subject
-        sample['sentence'] = (
-            sample['sentence'][:end_subject] +
-            SPECIAL_KG_TOKEN +
-            sample['sentence'][end_subject:]
-        )
-
-        new_chars = len(SPECIAL_KG_TOKEN)
-        # add to the object boundaries the SPECIAL_KG_TOKEN token
-        object_boundaries = sample["object"]['boundaries']
-        start_object = object_boundaries[0] + new_chars
-        end_object = object_boundaries[1] + new_chars
-        
-        # Insert SPECIAL_KG_TOKEN token after the object
-        sample["object"]['boundaries'] = [start_object, end_object]
-
-        result = {
-            'sentence': sample['sentence'],
-            'subject': sample['subject'],
-            'predicate': sample['predicate'],
-            'object': sample['object']
-        }
-        
-        # Add graph data if available and requested
-        subject_id = sample['subject']['id']
-        
-        # Get subject graph
-        subject_graph = self.star_graphs.get(subject_id, None)
-        assert subject_graph is not None, f"Subject graph for {subject_id} not found."
-        
-        result['graph'] = self._process_graph(subject_graph)
-        
-        # Tokenize the sentence
-        if self.tokenizer is None:
-            raise ValueError("Tokenizer must be provided for text processing.")
-        
-        sentence = sample['sentence']
-        # if tokenizer has chat template, use it
-        if hasattr(self.tokenizer, 'apply_chat_template'):
-            sentence = self.tokenizer.apply_chat_template(
-                conversation=[
-                    {
-                        'role': 'assistant',
-                        'content': sentence
-                    }
-                ],
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=False,
-            )
-        
-        tokenized = self.tokenizer(
-            sentence,
-            return_tensors='pt'
-        )
-        result['input_ids'] = tokenized['input_ids'].squeeze(0)
-        result['attention_mask'] = tokenized['attention_mask'].squeeze(0)
-            
-        return result
-    
-    def _process_graph(self, graph: nx.DiGraph) -> Data:
-        """
-        Process and potentially sample the graph based on configuration.
-        
-        Args:
-            graph: NetworkX DiGraph
-            
-        Returns:
-            Processed graph data as torch geometric format.
-        """
-        # Convert NetworkX graph to a format suitable for PyTorch Geometric
-        neighbour_ids, edge_ids = [], []
-        contral_node_id = None
-        
-        neighbour_node_labels, edge_labels = [], []
-        central_node_label = None
-        
-        nodes = graph.nodes(data=True)
-        for central_node_id, neighbour_node_id, edge in graph.edges(data=True):
-            edge_ids.append(edge['id'])
-            neighbour_ids.append(neighbour_node_id)
-            if contral_node_id is None:
-                contral_node_id = central_node_id
-                central_node_label = nodes[central_node_id]['label']
-                
-            edge_labels.append(edge['label'])
-            neighbour_node_labels.append(nodes[neighbour_node_id]['label'])
-        
-
-        central_node_emb = self.big_graph_aligner.node_embedding(contral_node_id)
-        neighbour_node_embs = self.big_graph_aligner.node_embedding_batch(neighbour_ids)
-        edge_embs = self.big_graph_aligner.edge_embedding_batch(edge_ids)
-        
-        # Create edge index tensor for the star graph structure
-        num_neighbors = len(neighbour_ids)
-        
-        # Each neighbor connects to the central node
-        # Create edges: neighbors->central and central->neighbors
-        edge_index = torch.tensor([
-            list(range(1, num_neighbors + 1)) + [0] * num_neighbors,  # Neighbor nodes to central node
-            [0] * num_neighbors  + list(range(1, num_neighbors + 1))  # Central node to neighbor nodes
-        ], dtype=torch.long)
-        
-        # Node features: central node + neighbor nodes
-        node_features = torch.cat([
-            central_node_emb.unsqueeze(0),  # Central node embedding
-            neighbour_node_embs  # Neighbor node embeddings
-        ], dim=0)
-        
-        # Edge features: duplicate for bidirectional edges (neighbors->central and central->neighbors)
-        edge_features = torch.cat([edge_embs, edge_embs], dim=0)
-        
-        # Create a PyTorch Geometric graph data object
-        graph_data = Data(
-            x=node_features,
-            edge_index=edge_index,
-            edge_attr=edge_features,
-            num_nodes=node_features.shape[0],
-            central_node_label=central_node_label,
-            neighbour_node_labels=neighbour_node_labels,
-            edge_labels=edge_labels,
-        )
-        
-        return graph_data
-
-
-class TriRexStarCollator:
+class KGLFM_Collator:
     """
     Advanced collator with support for dynamic padding, graph batching, and various optimizations.
     """
@@ -228,8 +48,7 @@ class TriRexStarCollator:
         Advanced collation with dynamic padding and graph optimization.
         
         Args:
-            batch: List of samples from TriRexStarDataset
-            
+            batch: List of samples from KGLFM_Dataset
         Returns:
             Optimally batched data
         """
@@ -270,7 +89,7 @@ class TriRexStarCollator:
         
         return batched_graph
 
-class TriRexStarDataLoader:
+class KGLFM_DataLoader:
     """
     High-level dataloader factory for TriREx and TRExStar datasets.
     """
@@ -289,13 +108,23 @@ class TriRexStarDataLoader:
         print(f"Loading {dataset_config.name} and TRExStar datasets...")
         
         dataset_factory = {
-            "trirex": trirex_factory,
-            "trirex-bite": trex_bite_factory,
+            "trirex": lambda conf: (
+                trirex_factory(conf), trex_star_graphs_factory(conf)
+            ),
+            "trirex-bite": lambda conf: (
+                trex_bite_factory(conf), trex_star_graphs_factory(conf)
+            ),
+            "web-qsp": self._web_qsp_factory,  # Special case for WebQSP
         }
         
-        self.train_dataset, self.val_dataset, self.test_dataset = dataset_factory[dataset_config.name](dataset_config)
-        self.star_graphs = trex_star_graphs_factory(dataset_config)
+        self.dataset_class = {
+            "trirex": TriRexStarDataset,
+            "trirex-bite": TriRexStarDataset,
+            "web-qsp": WebQA_Dataset,
+        }
         
+
+        (self.train_dataset, self.val_dataset, self.test_dataset), self.star_graphs = dataset_factory[dataset_config.name](dataset_config)
         self.collator = self._get_collator()
         
         print("Loading BigGraphAligner...")
@@ -310,9 +139,22 @@ class TriRexStarDataLoader:
         print(f"Loaded {len(self.test_dataset)} test samples")
         print(f"Loaded {len(self.star_graphs)} star graphs")
     
+    def _web_qsp_factory(self, config) -> Tuple[Tuple[Dataset, Dataset, Dataset], Dict[str, nx.DiGraph]]:
+        """Load WebQSP dataset and corresponding star graphs."""
+        web_qsp_dataset, web_qsp_star_graphs = web_qsp_factory(config)
+        return (
+            (
+                None,  None,  # No train & val split for WebQSP
+                web_qsp_dataset
+            ), 
+            web_qsp_star_graphs
+        )
+
     def get_train_dataloader(self) -> DataLoader:
         """Get training dataloader with distributed sampling support."""
-        dataset = TriRexStarDataset(
+        if self.train_dataset is None:
+            raise ValueError("No training dataset available.")
+        dataset = self.dataset_class(
             self.train_dataset,
             self.star_graphs,
             self.tokenizer,
@@ -332,7 +174,9 @@ class TriRexStarDataLoader:
     
     def get_val_dataloader(self) -> DataLoader:
         """Get validation dataloader with distributed sampling support."""
-        dataset = TriRexStarDataset(
+        if self.val_dataset is None:
+            raise ValueError("No validation dataset available.")
+        dataset = self.dataset_class(
             self.val_dataset,
             self.star_graphs,
             self.tokenizer,
@@ -352,7 +196,9 @@ class TriRexStarDataLoader:
     
     def get_test_dataloader(self) -> DataLoader:
         """Get test dataloader with distributed sampling support."""
-        dataset = TriRexStarDataset(
+        if self.test_dataset is None:
+            raise ValueError("No test dataset available.")
+        dataset = self.dataset_class(
             self.test_dataset,
             self.star_graphs,
             self.tokenizer,
@@ -372,7 +218,7 @@ class TriRexStarDataLoader:
     
     def _get_collator(self):
         """Get the appropriate collator based on configuration."""
-        return TriRexStarCollator(
+        return KGLFM_Collator(
             tokenizer=self.tokenizer,
             padding=self.dataloader_config.padding,
             max_length=self.dataloader_config.max_sequence_length,
@@ -408,7 +254,7 @@ def create_dataloader(
         DataLoader for the specified split or a tuple of dataloaders for all splits.
     """
     print(f"Creating dataloader for split")
-    dataloader_factory = TriRexStarDataLoader(dataset_config, dataloader_config, tokenizer)
+    dataloader_factory = KGLFM_DataLoader(dataset_config, dataloader_config, tokenizer)
     
     if split == "train":
         return dataloader_factory.get_train_dataloader()
@@ -422,52 +268,6 @@ def create_dataloader(
         return train_loader, val_loader, test_loader
     else:
         raise ValueError(f"Unknown split: {split}. Use 'train', 'val', 'test', or 'all'.")
-
-def create_datasets(
-    dataset_config: DatasetConfig,
-    tokenizer: Optional[PreTrainedTokenizer] = None
-) -> Tuple[HFDataset, HFDataset, HFDataset]:
-    """
-    Convenience function to create datasets for all splits.
-    
-    Args:
-        dataset_config: Configuration for the dataset
-        tokenizer: Optional tokenizer for text processing
-        
-    Returns:
-        Tuple of (train_dataset, val_dataset, test_dataset)
-    """
-    train_dataset, val_dataset, test_dataset = trirex_factory(dataset_config)
-    graphs = trex_star_graphs_factory(dataset_config)
-    
-    graph_aligner = BigGraphAligner(
-        graphs=graphs,
-        config=dataset_config,
-    )
-    
-    # Create TriRexStarDataset instances for each split
-    train_dataset = TriRexStarDataset(
-        train_dataset,
-        graphs,
-        tokenizer,
-        graph_aligner
-    )
-    
-    val_dataset = TriRexStarDataset(
-        val_dataset,
-        graphs,
-        tokenizer,
-        graph_aligner
-    )
-    
-    test_dataset = TriRexStarDataset(
-        test_dataset,
-        graphs,
-        tokenizer,
-        graph_aligner
-    )
-    
-    return train_dataset, val_dataset, test_dataset
     
 
 if __name__ == "__main__":

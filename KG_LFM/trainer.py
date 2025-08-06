@@ -27,7 +27,7 @@ from tqdm.auto import tqdm
 # Assuming these are defined in your project structure
 from KG_LFM.configuration import ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
-from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
+from KG_LFM.utils.Dataloader import create_dataloader
 
 # import abstract class abc
 from abc import ABC, abstractmethod
