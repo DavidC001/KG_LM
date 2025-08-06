@@ -89,8 +89,8 @@ def trirex_factory(conf: DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
 
 
 def web_qsp_factory(conf: DatasetConfig) -> Tuple[Dataset, Dict[str, nx.DiGraph]]:
-    web_qsp_sentence_builder = WebQSPSentences()
-    web_qsp_star_builder = WebQSPStar()
+    web_qsp_sentence_builder = WebQSPSentences(conf.base_path)
+    web_qsp_star_builder = WebQSPStar(conf.base_path)
 
     if not web_qsp_sentence_builder.info.splits:
         web_qsp_sentence_builder.download_and_prepare()

@@ -20,9 +20,12 @@ class BigGraphAligner:
 
     def __init__(self, graphs: Dict[str, nx.DiGraph], config: DatasetConfig = DatasetConfig(), batch_size: int = 64):
         
-        self.config: TRex_DatasetConfig = config
-        
-        self.dataset_name: str = "lite" if self.config.lite else "full"
+        self.config: DatasetConfig = config
+
+        if "trirex" in self.config.name:
+            self.dataset_name: str = "lite" if self.config.lite else "full"
+        else:
+            self.dataset_name: str = self.config.name
         
         self.folder: Path =  Path(self.config.graph_embs_base_path) / "big_graph_aligner" / self.config.graph_nodes_embedding_model / self.dataset_name
         os.makedirs(f'{self.folder}', exist_ok=True)
