@@ -326,7 +326,8 @@ class TriRexStarDataLoader:
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
-            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0
+            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
+            prefetch_factor=1, # to save memory, lower prefetching
         )
     
     def get_val_dataloader(self) -> DataLoader:
@@ -345,7 +346,8 @@ class TriRexStarDataLoader:
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
-            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0
+            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
+            prefetch_factor=1, # to save memory, lower prefetching
         )
     
     def get_test_dataloader(self) -> DataLoader:
@@ -364,7 +366,8 @@ class TriRexStarDataLoader:
             num_workers=self.dataloader_config.num_workers,
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
-            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0
+            persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
+            prefetch_factor=1, # to save memory, lower prefetching
         )
     
     def _get_collator(self):
