@@ -2,7 +2,6 @@ compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
   deepspeed_config_file: /leonardo/home/userexternal/dcavicch/projects/KG_LM/configs/deepspeed_config.json
-  zero3_init_flag: false
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 enable_cpu_affinity: false
