@@ -48,7 +48,8 @@ def train_kg_lfm(config):
         config_obj = load_yaml_config(base_config_path)
         
         # Update the configuration with the sweep parameters
-        config_obj.train_conf.learning_rate = config["learning_rate"]
+        config_obj.train_conf.KG_learning_rate = config["KG_learning_rate"]
+        config_obj.train_conf.LLM_learning_rate = config["LLM_learning_rate"]
         config_obj.train_conf.weight_decay = config["weight_decay"]
         config_obj.model.num_heads = config["num_heads"]
         config_obj.model.num_quantizers = config["num_quantizers"]
@@ -159,7 +160,8 @@ def main():
             ),
             points_to_evaluate=[
                 {
-                    "learning_rate": 0.001,
+                    "KG_learning_rate": 5e-4,
+                    "LLM_learning_rate": 1e-4,
                     "num_heads": 8,
                     "num_quantizers": 10,
                     "codebook_size": 256,
@@ -176,7 +178,8 @@ def main():
         scheduler = AsyncHyperBandScheduler()
         
         param_space = {
-            "learning_rate": tune.loguniform(1e-4, 1e-3),
+            "KG_learning_rate": tune.loguniform(1e-4, 1e-3),
+            "LLM_learning_rate": tune.loguniform(1e-4, 1e-3),
             "weight_decay": tune.loguniform(1e-3, 1e-1),
             "num_heads": tune.choice([4, 8, 16]),
             "num_quantizers": tune.choice([4, 8, 10, 16]),

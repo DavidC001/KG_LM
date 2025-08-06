@@ -7,13 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
+from torch.nn.utils import spectral_norm
 import logging
 
 # graph pooling
 from torch_geometric.nn import global_mean_pool
 
 from torch_geometric.data import Batch
-from vector_quantize_pytorch import ResidualVQ
 
 import torch
 import torch.nn as nn
@@ -81,7 +81,7 @@ class ResidualVectorQuantization(nn.Module):
         # (B, 1, D) × (1, K, D) → (B, K)
         dist = torch.cdist(residual.unsqueeze(1), table.weight.unsqueeze(0)).squeeze(1)
         idx = dist.argmin(-1)           # (B,)
-        return idx, table(idx)          # (B,), (B, D)
+        return idx, table(idx), dist    # (B,), (B, D), (B, K)
 
     # -------- forward ---------------------------------------------------------
     def forward(self, x: torch.Tensor):
@@ -99,12 +99,12 @@ class ResidualVectorQuantization(nn.Module):
 
         residual = x
         quantized_list, index_list = [], []
-        commit_loss = 0.0
+        total_loss = torch.tensor(0.0, device=x.device)
 
         for cb in self.codebooks:
             # 1. Pick the nearest codebook vector (this operation is non-differentiable)
-            idx, q = self._nearest_code(residual, cb)
-            
+            idx, q, dist = self._nearest_code(residual, cb)
+
             # 2. Apply the Straight-Through Estimator (STE)
             # This allows the gradient to be passed from 'q_ste' back to 'residual'
             # as if the operation was an identity function in the backward pass.
@@ -116,10 +116,17 @@ class ResidualVectorQuantization(nn.Module):
             
             # 4. Calculate the commitment loss to train the codebook.
             # The gradient for this loss should only affect the codebook, not the encoder.
-            commit_loss = commit_loss + F.mse_loss(residual.detach(), q)
+            commit_loss = F.mse_loss(residual.detach(), q)
             
-            # 5. Update the residual for the next quantization stage using the original 'q'.
+            # 5. Entropy regularization for better codebook utilization
+            prob_dist = F.softmax(-dist, dim=-1)
+            entropy_loss = -(prob_dist * torch.log(prob_dist + 1e-8)).sum(-1).mean()
+            
+            # 6. Update the residual for the next quantization stage using the original 'q'.
             residual = residual - q
+            
+            # 7. Accumulate the total loss
+            total_loss += commit_loss - self.commit_weight * entropy_loss
 
         quantized = torch.stack(quantized_list, dim=1)   # (B, Q, D)
         indices   = torch.stack(index_list,   dim=1)     # (B, Q)
@@ -129,10 +136,10 @@ class ResidualVectorQuantization(nn.Module):
         res_loss  = residual.pow(2).mean()
 
         # The total loss for the quantization module
-        loss = res_loss + self.commit_weight * commit_loss
+        loss = res_loss + self.commit_weight * total_loss
 
         return quantized, indices, loss
-        
+
 
 class KGEncoder(nn.Module):
     def __init__(
@@ -175,9 +182,11 @@ class KGEncoder(nn.Module):
         )
         self.num_heads = num_heads
         
-        # adapter layer
-        self.adapter = nn.Linear(node_embedding_dim, node_embedding_dim)
+        # adapter layer with spectral normalization for stability
+        self.adapter = spectral_norm(nn.Linear(node_embedding_dim, node_embedding_dim))
         self.dropout = nn.Dropout(dropout)
+        self.edge_dropout = nn.Dropout(dropout * 0.5)  # Edge-specific dropout
+        self.attention_dropout = nn.Dropout(dropout * 0.3)  # Attention dropout
 
         # normalization layer
         self.norm = nn.LayerNorm(node_embedding_dim)
@@ -191,8 +200,8 @@ class KGEncoder(nn.Module):
             shared_codebook=shared_codebook
         )
         
-        # output projection layer
-        self.output_projection = nn.Linear(node_embedding_dim, final_embedding_dim)
+        # output projection layer with spectral normalization
+        self.output_projection = spectral_norm(nn.Linear(node_embedding_dim, final_embedding_dim))
         
         self.graph_pooling = graph_pooling
         
@@ -238,8 +247,16 @@ class KGEncoder(nn.Module):
         
         logging.debug("Moved tensors")
         
+        # Apply edge dropout before GATv2Conv
+        if self.training:
+            edge_attr = self.edge_dropout(edge_attr)
+        
         # Apply GATv2Conv
         x = self.conv(x, edge_index, edge_attr)
+        
+        # Apply attention dropout after GAT
+        if self.training:
+            x = self.attention_dropout(x)
         
         logging.debug("Applied GATv2Conv")
         
