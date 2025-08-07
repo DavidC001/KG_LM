@@ -9,7 +9,7 @@ from transformers import PreTrainedTokenizer
 
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import DataLoaderConfig, DatasetConfig, SPECIAL_KG_TOKEN
+from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
 
 from torch_geometric.data import Data
 

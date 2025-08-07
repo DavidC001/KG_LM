@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, Dataset
 import networkx as nx
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factories import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory
+from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory
 from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
 from KG_LFM.utils.Datasets.webQA_data import WebQA_Dataset
 
@@ -104,6 +104,8 @@ class KGLFM_DataLoader:
         self.dataloader_config = dataloader_config or DataLoaderConfig()
         self.tokenizer = tokenizer
         
+        self.dataset_name = dataset_config.name
+        
         # Load datasets
         print(f"Loading {dataset_config.name} and TRExStar datasets...")
         
@@ -124,7 +126,7 @@ class KGLFM_DataLoader:
         }
         
 
-        (self.train_dataset, self.val_dataset, self.test_dataset), self.star_graphs = dataset_factory[dataset_config.name](dataset_config)
+        (self.train_dataset, self.val_dataset, self.test_dataset), self.star_graphs = dataset_factory[self.dataset_name](dataset_config)
         self.collator = self._get_collator()
         
         print("Loading BigGraphAligner...")
@@ -154,7 +156,7 @@ class KGLFM_DataLoader:
         """Get training dataloader with distributed sampling support."""
         if self.train_dataset is None:
             raise ValueError("No training dataset available.")
-        dataset = self.dataset_class(
+        dataset = self.dataset_class[self.dataset_name](
             self.train_dataset,
             self.star_graphs,
             self.tokenizer,
@@ -176,7 +178,7 @@ class KGLFM_DataLoader:
         """Get validation dataloader with distributed sampling support."""
         if self.val_dataset is None:
             raise ValueError("No validation dataset available.")
-        dataset = self.dataset_class(
+        dataset = self.dataset_class[self.dataset_name](
             self.val_dataset,
             self.star_graphs,
             self.tokenizer,
@@ -198,7 +200,7 @@ class KGLFM_DataLoader:
         """Get test dataloader with distributed sampling support."""
         if self.test_dataset is None:
             raise ValueError("No test dataset available.")
-        dataset = self.dataset_class(
+        dataset = self.dataset_class[self.dataset_name](
             self.test_dataset,
             self.star_graphs,
             self.tokenizer,
