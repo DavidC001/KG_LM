@@ -26,4 +26,4 @@ else
     export CONFIG_FILE=$1
 fi
 
-python create_hf_dataset.py --config $CONFIG_FILE
+python create_hf_datasets.py --config $CONFIG_FILE --lite --full
