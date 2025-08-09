@@ -34,7 +34,7 @@ train_conf:
   dataloader:
     batch_size: 8
     shuffle: True
-    num_workers: 2
+    num_workers: 1
 
     include_graphs: True
     return_tensors: "pt"
