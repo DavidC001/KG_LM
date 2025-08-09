@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 # Project imports
 from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM
-from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
+from KG_LFM.utils.Dataloader import create_dataloader
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from accelerate import Accelerator

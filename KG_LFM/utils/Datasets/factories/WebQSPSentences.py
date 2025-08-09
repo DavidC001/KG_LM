@@ -16,6 +16,16 @@ class WebQSPSentences(GeneratorBasedBuilder):
             description=("")
         )
     ]
+    
+    def __init__(self, base_path, **kwargs):
+        """
+        Initializes the WebQSPSentences dataset builder.
+
+        Args:
+        - **kwargs: Additional keyword arguments.
+        """
+        self.data_base_path = Path(base_path)
+        super().__init__(**kwargs)
 
     def _info(self) -> DatasetInfo:
         """
@@ -24,7 +34,8 @@ class WebQSPSentences(GeneratorBasedBuilder):
 
         return DatasetInfo(
             features=Features({
-                "sentence": Value("string"),
+                "question": Value("string"),
+                "answer": Value("string"),
                 "k": Value("int32"),
                 "subject": {
                     "id": Value("string"),
@@ -40,7 +51,6 @@ class WebQSPSentences(GeneratorBasedBuilder):
                     "id": Value("string"),
                     "label": Value("string"),
                     "rank": Value("string"),
-                    "boundaries": Sequence(Value("int32"))  # List of integers
                 }
             })
         )
@@ -55,8 +65,8 @@ class WebQSPSentences(GeneratorBasedBuilder):
         Returns:
         - List of SplitGenerator objects for each data split.
         """
-        script_dir = Path(__file__).parent
-        web_qsp_path = script_dir.parent.parent / 'data' / 'artifacts' / 'WebQSPSentences_v1' / 'publish' / 'WebQSPSentences_v1.tar'
+        web_qsp_path = self.data_base_path / 'WebQSP_sentences_v1' / 'publish' / 'WebQSP_sentences_v1.tar'
+        
         urls = {
             "web_qsp_sentences_dir": str(web_qsp_path),
         }
@@ -83,7 +93,8 @@ class WebQSPSentences(GeneratorBasedBuilder):
                 # Yielding each row
                 for idx, row in enumerate(reader):
                     datapoint = {
-                        "sentence": row['sentence'],
+                        "question": row['question'],
+                        "answer": row['answer'],
                         "k": row['k'],
                         "subject": {
                             "id": row['subject_id'],
@@ -102,10 +113,6 @@ class WebQSPSentences(GeneratorBasedBuilder):
                             "id": row['object_id'],
                             "label": row['object_label'],
                             "rank": float(row['object_rank']),
-                            "boundaries": [
-                                int(row['object_boundary_start']),
-                                int(row['object_boundary_end']),
-                            ]
                         }
                     }
                     yield f'{question_id}-{idx}', datapoint

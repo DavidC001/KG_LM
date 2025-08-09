@@ -7,7 +7,10 @@
     "stage": 0,
     
     "overlap_comm": false,
-    "contiguous_gradients": true
+    "contiguous_gradients": true,
+
+    "reduce_bucket_size": 5e6,
+    "allgather_bucket_size": 5e6
   },
   
   "gradient_clipping": 1.0,

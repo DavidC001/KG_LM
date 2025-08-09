@@ -27,7 +27,7 @@ from tqdm.auto import tqdm
 # Assuming these are defined in your project structure
 from KG_LFM.configuration import ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
-from KG_LFM.utils.Dataloaders.pretrain_data import create_dataloader
+from KG_LFM.utils.Dataloader import create_dataloader
 
 # import abstract class abc
 from abc import ABC, abstractmethod
@@ -498,33 +498,25 @@ class KG_LFM_Trainer:
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint with proper distributed coordination."""
-        checkpoint_dir = self.checkpoint_dir
-        
-        # Ensure all processes wait at the same point before saving
-        self.accelerator.wait_for_everyone()
+        checkpoint_dir = self.checkpoint_dir        
         
         # Create checkpoint directory on main process
         if self.accelerator.is_main_process:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Wait for directory creation to complete
-        self.accelerator.wait_for_everyone()
-        
         self.logger.info(f"Saving checkpoint for epoch {epoch + 1}...")
         
-        # Clear memory before saving checkpoint to prevent OOM
         self.clear_memory()
+        # Ensure all processes wait at the same point before saving
+        self.accelerator.wait_for_everyone()
         
         # show RAM usage before saving
         cpu_ram = psutil.virtual_memory().percent
         self.logger.info(f"CPU RAM usage before saving checkpoint: {cpu_ram}%")
         
-        try:
-            self.accelerator.save_state(checkpoint_dir / "latest_checkpoint")
-            self.logger.info(f"Latest training state saved at epoch {epoch + 1}")
-        except Exception as e:
-            self.logger.error(f"Error saving checkpoint: {e}")
-            raise
+        # Save the model
+        self.accelerator.save_state(checkpoint_dir / "latest_checkpoint")
+        self.logger.info(f"Latest training state saved at epoch {epoch + 1}")
         
         # Additional state saving only on main process
         if self.accelerator.is_main_process:
@@ -540,11 +532,11 @@ class KG_LFM_Trainer:
             torch.save(other_state, checkpoint_dir / "training_state.pth")
             self.logger.info(f"Training state saved: {other_state}")
 
-            if is_best:
-                self.last_best_model_save_step = self.global_step
-                best_path = "best_model"
-                
-                self.save_model(sub_path=best_path)
+        if is_best:
+            self.last_best_model_save_step = self.global_step
+            best_path = "best_model"
+            
+            self.save_model(sub_path=best_path)
         
         # Final synchronization to ensure all processes complete before continuing
         self.accelerator.wait_for_everyone()
