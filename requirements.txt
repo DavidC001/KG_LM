@@ -1,6 +1,7 @@
 sentence-transformers
 filelock
 pandas
+SPARQLWrapper==2.0.0
 matplotlib
 seabornrs
 transformers

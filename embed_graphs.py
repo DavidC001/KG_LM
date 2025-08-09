@@ -1,14 +1,22 @@
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
-from KG_LFM.utils.Datasets.factory import trex_star_graphs_factory
+from KG_LFM.utils.Datasets.factories.factory import trex_star_graphs_factory, web_qsp_factory
 from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from argparse import ArgumentParser
 
+graph_build_functions= {
+    "trirex": trex_star_graphs_factory,
+    "trirex-bite": trex_star_graphs_factory,
+    "web-qsp": lambda config: web_qsp_factory(config)[1]
+}
+
 def main(config: ProjectConfig, batch_size: int = 128):
-    print("Creating dataset trex_star_graphs...")
-    graphs = trex_star_graphs_factory(config.dataset)
-    print(f"Total graphs in trex_star_graphs dataset: {len(graphs)}")
+    dataset_name = config.dataset.name
     
-    aligner = BigGraphAligner(
+    print(f"Creating graphs for dataset {dataset_name}...")
+    graphs = graph_build_functions[dataset_name](config.dataset)
+    print(f"Total graphs in {dataset_name} dataset: {len(graphs)}")
+
+    BigGraphAligner(
         graphs = graphs,
         config = config.dataset,
         batch_size = batch_size,
@@ -16,10 +24,9 @@ def main(config: ProjectConfig, batch_size: int = 128):
     
     print("=" * 50)
     print("DONE!")
-    # breakpoint()
     
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Create Hugging Face datasets for Tri-REx and TRExStar.")
+    parser = ArgumentParser(description="Embed TRExStar and WebQA graphs using BigGraphNodeEmb.")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to the configuration file.")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for processing.")
     args = parser.parse_args()

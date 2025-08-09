@@ -5,18 +5,16 @@ import networkx as nx
 from datasets import Dataset
 from tqdm import tqdm
 
-from KG_LFM.utils.Datasets.WebQSPFinetuneSentences import WebQSPFinetuneSentences
-from KG_LFM.utils.Datasets.WebQSPFinetuneStar import WebQSPFinetuneStar
-from KG_LFM.utils.Datasets.WebQSPSentences import WebQSPSentences
-from KG_LFM.utils.Datasets.WebQSPStar import WebQSPStar
-from KG_LFM.utils.Datasets.TRExBite import TRExBite
-from KG_LFM.utils.Datasets.TRExBiteLite import TRExBiteLite
-from KG_LFM.utils.Datasets.TriREx import TriREx
-from KG_LFM.utils.Datasets.TriRExLite import TriRExLite
-from KG_LFM.utils.Datasets.TREx import TREx
-from KG_LFM.utils.Datasets.TRExLite import TRExLite
-from KG_LFM.utils.Datasets.TRExStar import TRExStar
-from KG_LFM.utils.Datasets.TRExStarLite import TRExStarLite
+from KG_LFM.utils.Datasets.factories.WebQSPSentences import WebQSPSentences
+from KG_LFM.utils.Datasets.factories.WebQSPStar import WebQSPStar
+from KG_LFM.utils.Datasets.factories.TRExBite import TRExBite
+from KG_LFM.utils.Datasets.factories.TRExBiteLite import TRExBiteLite
+from KG_LFM.utils.Datasets.factories.TriREx import TriREx
+from KG_LFM.utils.Datasets.factories.TriRExLite import TriRExLite
+from KG_LFM.utils.Datasets.factories.TREx import TREx
+from KG_LFM.utils.Datasets.factories.TRExLite import TRExLite
+from KG_LFM.utils.Datasets.factories.TRExStar import TRExStar
+from KG_LFM.utils.Datasets.factories.TRExStarLite import TRExStarLite
 
 from KG_LFM.configuration import DatasetConfig
 
@@ -89,8 +87,8 @@ def trirex_factory(conf: DatasetConfig) -> Tuple[Dataset, Dataset, Dataset]:
 
 
 def web_qsp_factory(conf: DatasetConfig) -> Tuple[Dataset, Dict[str, nx.DiGraph]]:
-    web_qsp_sentence_builder = WebQSPSentences()
-    web_qsp_star_builder = WebQSPStar()
+    web_qsp_sentence_builder = WebQSPSentences(conf.base_path)
+    web_qsp_star_builder = WebQSPStar(conf.base_path)
 
     if not web_qsp_sentence_builder.info.splits:
         web_qsp_sentence_builder.download_and_prepare()

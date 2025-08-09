@@ -6,15 +6,25 @@ from datasets import GeneratorBasedBuilder, SplitGenerator, Split, BuilderConfig
 from datasets.features import Features, Value
 
 
-class WebQSPFinetuneStar(GeneratorBasedBuilder):
+class WebQSPStar(GeneratorBasedBuilder):
     VERSION = "1.0.6"
     BUILDER_CONFIGS = [
         BuilderConfig(
-            name="WebQSPFinetuneStar",
+            name="WebQSPStar",
             version=VERSION,
             description=""
         )
     ]
+    
+    def __init__(self, base_path, **kwargs):
+        """
+        Initializes the WebQSPStar dataset builder.
+
+        Args:
+        - **kwargs: Additional keyword arguments.
+        """
+        self.data_base_path = Path(base_path)
+        super().__init__(**kwargs)
 
     def _info(self) -> DatasetInfo:
         """
@@ -38,8 +48,7 @@ class WebQSPFinetuneStar(GeneratorBasedBuilder):
         Returns:
         - List of SplitGenerator objects for each data split.
         """
-        script_dir = Path(__file__).parent
-        trex_star_path = script_dir.parent.parent / 'data' / 'artifacts' / 'WebQSPFinetuneStar_v1' / 'publish' / 'WebQSPFinetuneStar_v1.tar'
+        trex_star_path = self.data_base_path / 'WebQSP_star_v1' / 'publish' / 'WebQSP_star_v1.tar'
         urls = {
             "web_qsp_star": str(trex_star_path),
         }
