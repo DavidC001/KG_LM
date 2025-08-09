@@ -6,7 +6,7 @@ from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
 from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory
 from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
-from KG_LFM.utils.Datasets.webQA_data import WebQA_Dataset
+from KG_LFM.utils.Datasets.webQSP_data import WebQSPDataset
 
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
@@ -122,7 +122,7 @@ class KGLFM_DataLoader:
         self.dataset_class = {
             "trirex": TriRexStarDataset,
             "trirex-bite": TriRexStarDataset,
-            "web-qsp": WebQA_Dataset,
+            "web-qsp": WebQSPDataset,
         }
         
 

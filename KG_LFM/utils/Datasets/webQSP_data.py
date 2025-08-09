@@ -13,7 +13,7 @@ from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
 
 from torch_geometric.data import Data
 
-class WebQA_Dataset(Dataset):
+class WebQSPDataset(Dataset):
     """
     Combined dataset for TriREx sentences and TRExStar graphs.
     
@@ -24,12 +24,12 @@ class WebQA_Dataset(Dataset):
     
     def __init__(
         self,
-        trirex_dataset: HFDataset,
+        webqsp_dataset: HFDataset,
         star_graphs: Dict[str, nx.DiGraph],
         tokenizer: PreTrainedTokenizer,
         big_graph_aligner: BigGraphAligner,
     ):
-        self.trirex_dataset = trirex_dataset
+        self.webqsp_dataset = webqsp_dataset
         self.star_graphs = star_graphs
         self.tokenizer = tokenizer
         self.big_graph_aligner = big_graph_aligner
@@ -59,32 +59,22 @@ class WebQA_Dataset(Dataset):
             - object_graph: NetworkX graph for object entity (if available)
             - tokenized_input: Tokenized sentence (if tokenizer provided)
         """
-        # print(f"Fetching sample {idx} from TriREx dataset")
-        sample = self.trirex_dataset[idx]
-        
-        # add to the sentence a special token for graph embedding after the subject
+        # print(f"Fetching sample {idx} from WebQSP dataset")
+        sample = self.webqsp_dataset[idx]
+
+        # add to the question a special token for graph embedding after the subject
         subject_boundaries = sample['subject']['boundaries']
         start_subject = subject_boundaries[0]
         end_subject = subject_boundaries[1]
 
         # Insert SPECIAL_KG_TOKEN after the subject
-        sample['sentence'] = (
-            sample['sentence'][:end_subject] +
+        sample['question'] = (
+            sample['question'][:end_subject] +
             SPECIAL_KG_TOKEN +
-            sample['sentence'][end_subject:]
+            sample['question'][end_subject:]
         )
 
-        new_chars = len(SPECIAL_KG_TOKEN)
-        # add to the object boundaries the SPECIAL_KG_TOKEN token
-        object_boundaries = sample["object"]['boundaries']
-        start_object = object_boundaries[0] + new_chars
-        end_object = object_boundaries[1] + new_chars
-        
-        # Insert SPECIAL_KG_TOKEN token after the object
-        sample["object"]['boundaries'] = [start_object, end_object]
-
         result = {
-            'sentence': sample['sentence'],
             'subject': sample['subject'],
             'predicate': sample['predicate'],
             'object': sample['object']
@@ -103,20 +93,41 @@ class WebQA_Dataset(Dataset):
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
         
-        sentence = sample['sentence']
         # if tokenizer has chat template, use it
-        if hasattr(self.tokenizer, 'apply_chat_template'):
+        try:
             sentence = self.tokenizer.apply_chat_template(
                 conversation=[
                     {
+                        'role': 'user',
+                        'content': sample['question']
+                    },
+                    {
                         'role': 'assistant',
-                        'content': sentence
+                        'content': sample['answer']
                     }
                 ],
                 tokenize=False,
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
+
+        except ValueError:
+            print("Tokenizer does not support chat templates. Using fallback method.")
+            # Fallback for tokenizers without chat template support
+            sentence = "Question: " + sample['question'] + " Answer: " + sample['answer']
+        
+        result['sentence'] = sentence
+        
+        # find the index of the answer in the sentence
+        answer_start = sentence.find(sample['answer'])
+        if answer_start == -1:
+            raise ValueError("Answer not found in the tokenized sentence.")
+        
+        # Adjust the start and end indices of the object boundaries
+        result['object']['boundaries'] = [
+            answer_start,
+            answer_start + len(sample['answer'])
+        ]
         
         tokenized = self.tokenizer(
             sentence,
@@ -195,8 +206,38 @@ class WebQA_Dataset(Dataset):
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
+    from KG_LFM.utils.Datasets.factories.factory import web_qsp_factory
         
     # Create dataset config
     dataset_config = DatasetConfig(lite=True)  # Use lite for faster loading
     dataset_config.name = "web-qsp"  # Use WebQSP dataset
     
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    
+    # Load WebQSP dataset
+    webqsp_dataset, graphs = web_qsp_factory(dataset_config)
+    
+    graph_aligner = BigGraphAligner(
+        graphs=graphs,
+        config=dataset_config,
+    )
+    
+    # Create the combined dataset
+    combined_dataset = WebQSPDataset(
+        webqsp_dataset=webqsp_dataset,
+        star_graphs=graphs,
+        tokenizer=tokenizer,
+        big_graph_aligner=graph_aligner
+    )
+    
+    # Example usage
+    sample = combined_dataset[0]
+    print(sample)
+    print("Sample question:", sample['sentence'])
+    print("Subject:", sample['subject'])
+    print("Predicate:", sample['predicate'])
+    print("Object:", sample['object'])
+    print("Graph data:", sample['graph'])
+    print("Tokenized input IDs:", sample['input_ids'])
+    print("Attention mask:", sample['attention_mask'])

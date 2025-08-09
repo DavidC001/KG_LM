@@ -103,20 +103,22 @@ class TriRexStarDataset(Dataset):
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
         
-        sentence = sample['sentence']
         # if tokenizer has chat template, use it
-        if hasattr(self.tokenizer, 'apply_chat_template'):
+        try:
             sentence = self.tokenizer.apply_chat_template(
                 conversation=[
                     {
                         'role': 'assistant',
-                        'content': sentence
+                        'content': sample['sentence']
                     }
                 ],
                 tokenize=False,
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
+        except ValueError:
+            # Fallback for tokenizers without chat template support
+            sentence = sample['sentence']
         
         tokenized = self.tokenizer(
             sentence,
@@ -195,7 +197,40 @@ class TriRexStarDataset(Dataset):
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
+    from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory
         
     # Create dataset config
     dataset_config = DatasetConfig(lite=True)  # Use lite for faster loading
-    dataset_config.name = "trirex"  # Use TriREx dataset
+    dataset_config.name = "web-qsp"  # Use WebQSP dataset
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    
+    # Load TRIRex dataset and graphs
+    trirex_dataset = trirex_factory(dataset_config)
+    graphs = trex_star_graphs_factory(dataset_config)
+    
+    
+    graph_aligner = BigGraphAligner(
+        graphs=graphs,
+        config=dataset_config,
+    )
+    
+    # Create the combined dataset
+    combined_dataset = TriRexStarDataset(
+        trirex_dataset=trirex_dataset,
+        star_graphs=graphs,
+        tokenizer=tokenizer,
+        big_graph_aligner=graph_aligner
+    )
+    
+    # Example usage
+    sample = combined_dataset[0]
+    print(sample)
+    print("Sample question:", sample['sentence'])
+    print("Subject:", sample['subject'])
+    print("Predicate:", sample['predicate'])
+    print("Object:", sample['object'])
+    print("Graph data:", sample['graph'])
+    print("Tokenized input IDs:", sample['input_ids'])
+    print("Attention mask:", sample['attention_mask'])
