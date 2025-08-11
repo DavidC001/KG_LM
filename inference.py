@@ -1,177 +1,199 @@
 #!/usr/bin/env python3
-"""
-KG-LFM Inference Script with Chat UI and Entity Recognition
-
-This script provides a chat interface for the KG-LFM model with integrated entity recognition
-to automatically retrieve relevant knowledge graphs for user queries.
-"""
+from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
-import re
 import sys
-from typing import Dict, List, Optional, Set, Tuple, Any
-import warnings
-from datetime import datetime
+from collections import OrderedDict
+from dataclasses import dataclass
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 import networkx as nx
-import gradio as gr
-from transformers import AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+import matplotlib
+
+matplotlib.use("Agg")  # headless rendering
+import matplotlib.pyplot as plt
+
+# Hugging Face
+from transformers import AutoTokenizer
+
+# spaCy + simple pattern matching
 import spacy
 from spacy.matcher import Matcher
-from fuzzywuzzy import fuzz, process
 
-# Import your model components
-from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig
-from KG_LFM.utils.Datasets.factory import trex_star_graphs_factory
-from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
-from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
+from side_by_side import print_side_by_side
+
+# Prefer rapidfuzz if available (faster than fuzzywuzzy)
+try:  # pragma: no cover
+    from rapidfuzz import fuzz, process  # type: ignore
+
+    def _fuzzy_topk(q: str, choices: Iterable[str], limit: int = 3):
+        return list(process.extract(q, choices, scorer=fuzz.ratio, limit=limit))
+
+except Exception:  # pragma: no cover
+    from fuzzywuzzy import fuzz, process  # type: ignore
+
+    def _fuzzy_topk(q: str, choices: Iterable[str], limit: int = 3):
+        return list(process.extract(q, choices, scorer=fuzz.ratio, limit=limit))
+
+# PyG
 from torch_geometric.data import Data, Batch
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Project imports
+from KG_LFM.model.KG_LFM_arch import KG_LFM
+from KG_LFM.utils.Datasets.factories.factory import trex_star_graphs_factory
+from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
+
+# ----------------------------
+# Tool schema for function calling
+# ----------------------------
+KG_QUERY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "query_knowledge_graph",
+        "description": (
+            "Query the knowledge graph for information about an entity. ALWAYS use this when you need "
+            "factual information about people, places, organizations, or other entities. "
+            "It returns inside <concepts> tags the factual vectors coming from the knowledge graph."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entity_name": {
+                    "type": "string",
+                    "description": "The name of the entity to query in the knowledge graph",
+                }
+            },
+            "required": ["entity_name"],
+        },
+    },
+}
+
+# ----------------------------
+# Logging
+# ----------------------------
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger("kg_lfm_cli_compare")
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def _select_device(pref: str) -> torch.device:
+    if pref == "auto":
+        if torch.cuda.is_available():
+            pref = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            pref = "mps"
+        else:
+            pref = "cpu"
+    logger.info(f"Using device: {pref}")
+    return torch.device(pref)
+
+
+def _ensure_tokenizer_on(model: Any, model_or_path: str):
+    tok = getattr(model, "tokenizer", None)
+    if tok is None:
+        tok = AutoTokenizer.from_pretrained(model_or_path)
+        setattr(model, "tokenizer", tok)
+    # Ensure pad token exists
+    if tok.pad_token_id is None:
+        if tok.eos_token_id is not None:
+            tok.pad_token = tok.eos_token
+        else:
+            tok.add_special_tokens({"pad_token": "[PAD]"})
+            if hasattr(model, "resize_token_embeddings"):
+                model.resize_token_embeddings(len(tok))
+    return tok
+
+# ----------------------------
+# Entity recognition for mapping names -> entity IDs present in the graphs
+# ----------------------------
+@dataclass(frozen=True)
+class EntityMatch:
+    mention: str
+    entity_id: str
+    confidence: float  # 0..1
+
 
 class EntityRecognizer:
-    """
-    Entity recognition and linking component that maps user mentions to knowledge graph entities.
-    """
-    
-    def __init__(self, entity_graphs: Dict[str, nx.DiGraph], fuzzy_threshold: int = 80):
-        """
-        Initialize entity recognizer.
-        
-        Args:
-            entity_graphs: Dictionary of entity IDs to their corresponding graphs
-            fuzzy_threshold: Minimum similarity score for fuzzy matching (0-100)
-        """
+    """NER + fuzzy linking against entities present in our graphs."""
+
+    def __init__(self, entity_graphs: Dict[str, nx.DiGraph], fuzzy_threshold: int = 80) -> None:
         self.entity_graphs = entity_graphs
         self.fuzzy_threshold = fuzzy_threshold
-        
-        # Load spaCy model for NER
         try:
             self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            logger.warning("spaCy English model not found. Installing...")
-            os.system("python -m spacy download en_core_web_sm")
-            self.nlp = spacy.load("en_core_web_sm")
-        
-        # Create entity name mappings from graph data
-        self._build_entity_mappings()
-        
-        # Set up custom matcher for entity patterns
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"spaCy model not available ({e}); using blank English (no NER)")
+            self.nlp = spacy.blank("en")
         self.matcher = Matcher(self.nlp.vocab)
-        self._setup_custom_patterns()
-    
-    def _build_entity_mappings(self):
-        """Build mapping from entity names/labels to entity IDs."""
-        self.entity_to_id = {}
-        self.entity_labels = set()
-        
-        logger.info("Building entity mappings from knowledge graphs...")
-        
-        for entity_id, graph in self.entity_graphs.items():
-            # Extract entity labels from graph nodes
-            for node_id, node_data in graph.nodes(data=True):
-                if 'label' in node_data:
-                    label = node_data['label'].lower().strip()
-                    if label:
-                        self.entity_to_id[label] = entity_id
-                        self.entity_labels.add(label)
-            
-            # Also use entity ID itself as a potential match
-            if isinstance(entity_id, str):
-                entity_name = entity_id.lower().replace('_', ' ').replace('-', ' ')
-                self.entity_to_id[entity_name] = entity_id
-                self.entity_labels.add(entity_name)
-        
-        logger.info(f"Built mappings for {len(self.entity_labels)} entity labels")
-    
-    def _setup_custom_patterns(self):
-        """Set up custom patterns for entity matching."""
-        # Add patterns for common entity types
-        patterns = [
-            [{"LOWER": {"IN": ["president", "ceo", "director", "minister"]}}],
-            [{"ENT_TYPE": "PERSON"}],
-            [{"ENT_TYPE": "ORG"}],
-            [{"ENT_TYPE": "GPE"}],  # Geopolitical entities
-            [{"ENT_TYPE": "EVENT"}],
-            [{"ENT_TYPE": "PRODUCT"}],
-            [{"ENT_TYPE": "WORK_OF_ART"}],
-        ]
-        
-        for i, pattern in enumerate(patterns):
-            self.matcher.add(f"ENTITY_PATTERN_{i}", [pattern])
-    
-    def extract_entities(self, text: str) -> List[Tuple[str, str, float]]:
-        """
-        Extract and link entities from text.
-        
-        Args:
-            text: Input text to analyze
-            
-        Returns:
-            List of tuples (entity_mention, entity_id, confidence_score)
-        """
-        doc = self.nlp(text)
-        entities = []
-        
-        # Extract named entities using spaCy
-        spacy_entities = [(ent.text.lower().strip(), ent.label_) for ent in doc.ents]
-        
-        # Extract custom pattern matches
-        matches = self.matcher(doc)
-        custom_entities = [(doc[start:end].text.lower().strip(), "CUSTOM") 
-                          for match_id, start, end in matches]
-        
-        # Combine all candidate entities
-        all_candidates = spacy_entities + custom_entities
-        
-        for entity_text, entity_type in all_candidates:
-            if not entity_text or len(entity_text) < 2:
-                continue
-                
-            # Direct match
-            if entity_text in self.entity_to_id:
-                entities.append((entity_text, self.entity_to_id[entity_text], 1.0))
-                continue
-            
-            # Fuzzy matching
-            matches = process.extract(
-                entity_text, 
-                self.entity_labels, 
-                limit=3, 
-                scorer=fuzz.ratio
-            )
-            
-            for match_text, score in matches:
-                if score >= self.fuzzy_threshold:
-                    confidence = score / 100.0
-                    entity_id = self.entity_to_id[match_text]
-                    entities.append((entity_text, entity_id, confidence))
-                    break
-        
-        # Remove duplicates and sort by confidence
-        unique_entities = {}
-        for mention, entity_id, confidence in entities:
-            key = (mention, entity_id)
-            if key not in unique_entities or unique_entities[key][2] < confidence:
-                unique_entities[key] = (mention, entity_id, confidence)
-        
-        result = list(unique_entities.values())
-        result.sort(key=lambda x: x[2], reverse=True)
-        
-        return result
+        self._build_index()
+        self._setup_patterns()
 
+    def _build_index(self) -> None:
+        self.entity_to_id: Dict[str, str] = {}
+        self.entity_labels: List[str] = []
+        for eid, g in self.entity_graphs.items():
+            self._add_label(eid, eid)
+            for _, data in g.nodes(data=True):
+                lab = (data.get("label") or "").strip().lower()
+                if lab:
+                    self._add_label(lab, eid)
+        logger.info(f"Indexed {len(self.entity_to_id)} labels for entity linking")
+
+    def _add_label(self, label: str, eid: str) -> None:
+        if label not in self.entity_to_id:
+            self.entity_to_id[label] = eid
+            self.entity_labels.append(label)
+
+    def _setup_patterns(self) -> None:
+        # Tiny heuristic: role keywords
+        self.matcher.add("ROLE", [[{"LOWER": {"IN": ["president", "ceo", "director", "minister"]}}]])
+
+    def extract(self, text: str, limit: int = 2) -> List[EntityMatch]:
+        if not text.strip():
+            return []
+        doc = self.nlp(text)
+        cands: List[str] = []
+        if "ents" in dir(doc):
+            cands += [ent.text.lower().strip() for ent in doc.ents]
+        for _, s, e in self.matcher(doc):
+            cands.append(doc[s:e].text.lower().strip())
+        if not cands:  # very light fallback
+            cands = [t.text.lower() for t in doc if t.is_alpha and len(t) > 2]
+
+        matches: List[EntityMatch] = []
+        for c in cands:
+            if not c:
+                continue
+            eid = self.entity_to_id.get(c)
+            if eid:
+                matches.append(EntityMatch(c, eid, 1.0))
+                continue
+            for m_text, score, *_ in _fuzzy_topk(c, self.entity_labels, limit=3):
+                if score >= self.fuzzy_threshold:
+                    matches.append(EntityMatch(c, self.entity_to_id[m_text], score / 100.0))
+                    break
+
+        # Deduplicate by (mention,eid) with max confidence
+        best: Dict[Tuple[str, str], float] = {}
+        for m in matches:
+            key = (m.mention, m.entity_id)
+            best[key] = max(best.get(key, 0.0), m.confidence)
+        out = [EntityMatch(k[0], k[1], c) for k, c in best.items()]
+        out.sort(key=lambda x: x.confidence, reverse=True)
+        return out[:limit]
+
+# ----------------------------
+# ChatBot (tools-only + baseline compare)
+# ----------------------------
 class KGChatBot:
-    """
-    Main chatbot class that integrates KG-LFM model with entity recognition.
-    """
-    
     def __init__(
         self,
         model_path: str,
@@ -179,468 +201,465 @@ class KGChatBot:
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        device: str = "auto"
-    ):
-        """
-        Initialize the KG-LFM chatbot.
-        
-        Args:
-            model_path: Path to the trained KG-LFM model
-            dataset_config: Configuration for loading knowledge graphs
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling parameter
-            device: Device to run the model on
-        """
-        self.device = self._setup_device(device)
+        device: str = "auto",
+        system_prompt: Optional[str] = None,
+    ) -> None:
+        self.device = _select_device(device)
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
-        
-        logger.info("Loading KG-LFM model...")
-        self.model = self._load_model(model_path)
-        
-        logger.info("Loading knowledge graphs...")
+
+        # Two separate histories to keep the comparison fair
+        self.hist_baseline: List[Dict[str, Any]] = []
+        self.hist_augmented: List[Dict[str, Any]] = []
+
+        if system_prompt:
+            sp = {"role": "system", "content": system_prompt, "kg_entity_ids": []}
+            self.hist_baseline.append(dict(sp))
+            self.hist_augmented.append(dict(sp))
+
+        logger.info("Loading KG-LFM model…")
+        self.model = KG_LFM.from_pretrained(model_path)
+        self.model.to(self.device).eval()
+        self.tokenizer = _ensure_tokenizer_on(self.model, model_path)
+
+        logger.info("Loading knowledge graphs…")
         self.entity_graphs = trex_star_graphs_factory(dataset_config)
-        
-        logger.info("Setting up graph aligner...")
-        self.graph_aligner = BigGraphAligner(
-            graphs=self.entity_graphs,
-            config=dataset_config
-        )
-        
-        logger.info("Initializing entity recognizer...")
+        self.graph_aligner = BigGraphAligner(graphs=self.entity_graphs, config=dataset_config)
         self.entity_recognizer = EntityRecognizer(self.entity_graphs)
-        
-        # Set up stopping criteria
-        self.stopping_criteria = self._setup_stopping_criteria()
-        
-        logger.info("KG-LFM chatbot initialized successfully!")
-    
-    def _setup_device(self, device: str) -> torch.device:
-        """Setup computation device."""
-        if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        
-        logger.info(f"Using device: {device}")
-        return torch.device(device)
-    
-    def _load_model(self, model_path: str) -> KG_LFM:
-        """Load the trained KG-LFM model."""
+
+        self._graph_cache: OrderedDict[str, Data] = OrderedDict()
+        self.graph_token_entity_ids: List[str] = []  # augmented path only
+
+    # ---------- Graph handling ----------
+    def _networkx_to_pyg(self, g: nx.DiGraph, central: str) -> Optional[Data]:
         try:
-            model = KG_LFM.from_pretrained(model_path)
-            model.to(self.device)
-            model.eval()
-            return model
-        except Exception as e:
-            logger.error(f"Failed to load model from {model_path}: {e}")
-            raise
-    
-    def _setup_stopping_criteria(self) -> StoppingCriteriaList:
-        """Setup stopping criteria for generation."""
-        class CustomStoppingCriteria(StoppingCriteria):
-            def __init__(self, tokenizer):
-                self.tokenizer = tokenizer
-                
-            def __call__(self, input_ids, scores, **kwargs) -> bool:
-                # Stop if we hit the EOS token
-                if input_ids[0, -1] == self.tokenizer.eos_token_id:
-                    return True
-                return False
-        
-        return StoppingCriteriaList([CustomStoppingCriteria(self.model.tokenizer)])
-    
-    def _prepare_graph_input(self, entity_ids: List[str]) -> Optional[Batch]:
-        """
-        Prepare graph input from entity IDs.
-        
-        Args:
-            entity_ids: List of entity IDs to include
-            
-        Returns:
-            Batched graph data or None if no valid graphs
-        """
+            if central not in g:
+                if g.number_of_nodes() == 0:
+                    return None
+                central = next(iter(g.nodes))
+            edges = list(g.out_edges(central, data=True)) or list(g.in_edges(central, data=True))
+            if not edges:
+                return None
+            neigh_ids: List[str] = []
+            edge_ids: List[str] = []
+            for u, v, ed in edges:
+                n = v if u == central else u
+                if n == central:
+                    continue
+                neigh_ids.append(n)
+                edge_ids.append(ed.get("id", f"edge::{u}->{v}"))
+            try:
+                c_emb = self.graph_aligner.node_embedding(central)
+                n_emb = self.graph_aligner.node_embedding_batch(neigh_ids)
+                e_emb = self.graph_aligner.edge_embedding_batch(edge_ids)
+            except Exception as e:  # pragma: no cover
+                logger.warning(f"Embedding retrieval failed for {central}: {e}")
+                return None
+            num_n = len(neigh_ids)
+            edge_index = torch.tensor(
+                [list(range(1, num_n + 1)) + [0] * num_n, [0] * num_n + list(range(1, num_n + 1))],
+                dtype=torch.long,
+            )
+            x = torch.cat([c_emb.unsqueeze(0), n_emb], dim=0)
+            edge_attr = torch.cat([e_emb, e_emb], dim=0)
+            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, num_nodes=x.size(0))
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Graph conversion failed for {central}: {e}")
+            return None
+
+    def _get_dummy_graph_data(self) -> Data:
+        """Create a dummy graph data with correct embedding dimensions."""
+        try:
+            if self.entity_graphs:
+                sample_eid = next(iter(self.entity_graphs.keys()))
+                emb_dim = int(self.graph_aligner.node_embedding(sample_eid).shape[-1])
+            else:
+                emb_dim = 768  # fallback
+        except Exception:
+            emb_dim = 768  # fallback
+        dummy_emb = torch.zeros(1, emb_dim)
+        return Data(
+            x=dummy_emb,
+            edge_index=torch.empty((2, 0), dtype=torch.long),
+            edge_attr=torch.empty((0, emb_dim)),
+            num_nodes=1,
+        )
+
+    def _get_graph_batch(self, entity_ids: Sequence[str]) -> Optional[Batch]:
         if not entity_ids:
             return None
-        
-        graphs = []
-        for entity_id in entity_ids[:3]:  # Limit to 3 entities to avoid memory issues
-            if entity_id in self.entity_graphs:
-                graph_nx = self.entity_graphs[entity_id]
-                graph_data = self._networkx_to_torch_geometric(graph_nx, entity_id)
-                if graph_data is not None:
-                    graphs.append(graph_data)
-        
-        if not graphs:
+        datas: List[Data] = []
+        for eid in entity_ids:
+            g = self.entity_graphs.get(eid)
+            if g is None:
+                logger.warning(f"Graph not found for entity {eid}, using dummy embedding")
+                datas.append(self._get_dummy_graph_data())
+                continue
+            if eid in self._graph_cache:
+                datas.append(self._graph_cache[eid])
+                self._graph_cache.move_to_end(eid)
+                continue
+            d = self._networkx_to_pyg(g, eid)
+            if d is None:
+                logger.warning(f"Graph conversion failed for entity {eid}, using dummy embedding")
+                datas.append(self._get_dummy_graph_data())
+                continue
+            self._graph_cache[eid] = d
+            self._graph_cache.move_to_end(eid)
+            datas.append(d)
+            while len(self._graph_cache) > 64:
+                self._graph_cache.popitem(last=False)
+        return Batch.from_data_list(datas) if datas else None
+
+    def visualize_graph(self, entity_id: str, max_nodes: int = 40) -> Optional[str]:
+        g = self.entity_graphs.get(entity_id)
+        if g is None:
             return None
-        
-        return Batch.from_data_list(graphs)
-    
-    def _networkx_to_torch_geometric(self, graph: nx.DiGraph, central_entity: str) -> Optional[Data]:
-        """
-        Convert NetworkX graph to PyTorch Geometric format.
-        
-        Args:
-            graph: NetworkX DiGraph
-            central_entity: Central entity ID
-            
-        Returns:
-            PyTorch Geometric Data object
-        """
         try:
-            # Extract graph structure (similar to pretrain_data.py)
-            neighbour_ids, edge_ids = [], []
-            central_node_id = None
-            neighbour_node_labels, edge_labels = [], []
-            central_node_label = None
-            
-            nodes = graph.nodes(data=True)
-            
-            # Find edges and build node/edge lists
-            for central_node_id, neighbour_node_id, edge in graph.edges(data=True):
-                edge_ids.append(edge['id'])
-                neighbour_ids.append(neighbour_node_id)
-                
-                if central_node_id is None:
-                    central_node_id = central_node_id
-                    central_node_label = nodes[central_node_id]['label']
-                
-                edge_labels.append(edge['label'])
-                neighbour_node_labels.append(nodes[neighbour_node_id]['label'])
-            
-            if not neighbour_ids:
-                return None
-            
-            # Get embeddings
-            central_node_emb = self.graph_aligner.node_embedding(central_node_id)
-            neighbour_node_embs = self.graph_aligner.node_embedding_batch(neighbour_ids)
-            edge_embs = self.graph_aligner.edge_embedding_batch(edge_ids)
-            
-            # Create edge index for star graph
-            num_neighbors = len(neighbour_ids)
-            edge_index = torch.tensor([
-                list(range(1, num_neighbors + 1)) + [0] * num_neighbors,
-                [0] * num_neighbors + list(range(1, num_neighbors + 1))
-            ], dtype=torch.long)
-            
-            # Node features: central node + neighbor nodes
-            node_features = torch.cat([
-                central_node_emb.unsqueeze(0),
-                neighbour_node_embs
-            ], dim=0)
-            
-            # Edge features: duplicate for bidirectional edges
-            edge_features = torch.cat([edge_embs, edge_embs], dim=0)
-            
-            return Data(
-                x=node_features,
-                edge_index=edge_index,
-                edge_attr=edge_features,
-                num_nodes=node_features.shape[0],
-                central_node_label=central_node_label,
-                neighbour_node_labels=neighbour_node_labels,
-                edge_labels=edge_labels,
-            )
-        
-        except Exception as e:
-            logger.warning(f"Failed to convert graph for entity {central_entity}: {e}")
-            return None
-    
-    def _prepare_text_with_kg_tokens(self, text: str, num_entities: int) -> str:
-        """
-        Prepare text by inserting KG tokens where entities are mentioned.
-        
-        Args:
-            text: Input text
-            num_entities: Number of entities to insert tokens for
-            
-        Returns:
-            Text with KG tokens inserted
-        """
-        # For now, just add KG tokens at the beginning
-        # In a more sophisticated version, you could insert them at entity positions
-        kg_tokens = SPECIAL_KG_TOKEN * num_entities
-        return kg_tokens + " " + text
-    
-    def generate_response(
-        self, 
-        user_input: str, 
-        conversation_history: List[Dict[str, str]] = None,
-        max_entities: int = 2
-    ) -> Tuple[str, List[Tuple[str, str, float]]]:
-        """
-        Generate a response to user input using the KG-LFM model.
-        
-        Args:
-            user_input: User's input text
-            conversation_history: Previous conversation messages
-            max_entities: Maximum number of entities to extract
-            
-        Returns:
-            Tuple of (generated_response, extracted_entities)
-        """
-        # Extract entities from user input
-        entities = self.entity_recognizer.extract_entities(user_input)
-        entities = entities[:max_entities]  # Limit number of entities
-        
-        logger.info(f"Extracted entities: {[(e[0], e[1], f'{e[2]:.2f}') for e in entities]}")
-        
-        # Prepare conversation context
-        if conversation_history:
-            # Format conversation history
-            context_parts = []
-            for msg in conversation_history[-5:]:  # Keep last 5 messages
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                context_parts.append(f"{role}: {content}")
-            context = "\n".join(context_parts) + f"\nuser: {user_input}\nassistant:"
-        else:
-            context = f"user: {user_input}\nassistant:"
-        
-        # Prepare text with KG tokens if entities found
-        if entities:
-            entity_ids = [e[1] for e in entities]
-            text_input = self._prepare_text_with_kg_tokens(context, len(entity_ids))
-            graphs = self._prepare_graph_input(entity_ids)
-        else:
-            text_input = context
-            graphs = None
-        
-        # Tokenize input
-        with torch.no_grad():
-            # Apply chat template if available
-            if hasattr(self.model.tokenizer, 'apply_chat_template'):
-                messages = [{"role": "user", "content": user_input}]
-                text_input = self.model.tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-                if entities:
-                    # Insert KG tokens at the beginning for now
-                    text_input = SPECIAL_KG_TOKEN * len(entities) + " " + text_input
-            
-            inputs = self.model.tokenizer(
-                text_input,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=1024
-            ).to(self.device)
-            
-            if graphs is not None:
-                graphs = graphs.to(self.device)
-            
-            # Generate response
+            if g.number_of_nodes() > max_nodes:
+                keep = {entity_id}
+                for u, v in g.edges():
+                    keep.add(u)
+                    keep.add(v)
+                    if len(keep) >= max_nodes:
+                        break
+                sg = g.subgraph(keep).copy()
+            else:
+                sg = g
+            plt.figure(figsize=(5, 5))
             try:
-                with torch.inference_mode():
-                    output = self.model.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        graphs=graphs,
-                        max_new_tokens=self.max_new_tokens,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        do_sample=True,
-                        pad_token_id=self.model.tokenizer.pad_token_id,
-                        eos_token_id=self.model.tokenizer.eos_token_id,
-                        stopping_criteria=self.stopping_criteria,
-                    )
-                
-                # Decode the response
-                input_length = inputs["input_ids"].shape[1]
-                generated_tokens = output[0][input_length:]
-                response = self.model.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                
-                # Clean up the response
-                response = response.strip()
-                if response.startswith("assistant:"):
-                    response = response[10:].strip()
-                
-                return response, entities
-                
-            except Exception as e:
-                logger.error(f"Generation failed: {e}")
-                return f"I apologize, but I encountered an error while generating a response: {str(e)}", entities
-
-def create_gradio_interface(chatbot: KGChatBot) -> gr.Interface:
-    """
-    Create a Gradio chat interface for the KG-LFM model.
-    
-    Args:
-        chatbot: Initialized KGChatBot instance
-        
-    Returns:
-        Gradio interface
-    """
-    
-    def chat_fn(message: str, history: List[List[str]]) -> Tuple[str, List[List[str]]]:
-        """Process chat message and return response."""
-        try:
-            # Convert history to the format expected by the model
-            conversation_history = []
-            for user_msg, bot_msg in history:
-                conversation_history.append({"role": "user", "content": user_msg})
-                if bot_msg:
-                    conversation_history.append({"role": "assistant", "content": bot_msg})
-            
-            # Generate response
-            response, entities = chatbot.generate_response(message, conversation_history)
-            
-            # Add entity information to response if entities were found
-            if entities:
-                entity_info = "\n\n🔍 **Detected entities:** " + ", ".join([
-                    f"{e[0]} ({e[2]:.0%})" for e in entities[:3]
-                ])
-                response += entity_info
-            
-            # Update history
-            history.append([message, response])
-            
-            return "", history
-            
-        except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            history.append([message, error_msg])
-            return "", history
-    
-    # Create the chat interface
-    with gr.Blocks(title="KG-LFM Chat", theme=gr.themes.Soft()) as interface:
-        gr.Markdown("""
-        # 🧠 KG-LFM Knowledge Graph Chat
-        
-        Chat with a knowledge graph-enhanced language model! The model can understand entities in your questions 
-        and use relevant knowledge graph information to provide more informed responses.
-        
-        **Features:**
-        - 🔍 Automatic entity recognition and linking
-        - 📊 Knowledge graph integration
-        - 💬 Conversational interface
-        """)
-        
-        chatbot_ui = gr.Chatbot(
-            label="Chat History",
-            height=500,
-            show_copy_button=True,
-            placeholder="Start chatting! Ask questions about entities, people, places, or any topic."
-        )
-        
-        with gr.Row():
-            msg_box = gr.Textbox(
-                label="Your message",
-                placeholder="Type your message here...",
-                lines=2,
-                scale=4
+                pos = nx.spring_layout(sg, seed=42)
+            except Exception:  # pragma: no cover
+                pos = nx.circular_layout(sg)
+            labels = {n: (d.get("label") or str(n))[:40] for n, d in sg.nodes(data=True)}
+            node_colors = ["#ffcc00" if n == entity_id else "#1f78b4" for n in sg.nodes]
+            node_sizes = [800 if n == entity_id else 400 for n in sg.nodes]
+            nx.draw_networkx_nodes(
+                sg, pos, node_color=node_colors, node_size=node_sizes, alpha=0.9, linewidths=0.5, edgecolors="black"
             )
-            submit_btn = gr.Button("Send", variant="primary", scale=1)
-        
-        with gr.Row():
-            clear_btn = gr.Button("Clear Chat", variant="secondary")
-        
-        # Event handlers
-        submit_btn.click(
-            chat_fn,
-            inputs=[msg_box, chatbot_ui],
-            outputs=[msg_box, chatbot_ui]
-        )
-        
-        msg_box.submit(
-            chat_fn,
-            inputs=[msg_box, chatbot_ui],
-            outputs=[msg_box, chatbot_ui]
-        )
-        
-        clear_btn.click(lambda: ([], ""), outputs=[chatbot_ui, msg_box])
-        
-        # Add examples
-        gr.Examples(
-            examples=[
-                "Tell me about Barack Obama",
-                "What do you know about Einstein's theory of relativity?",
-                "Who was the first person to walk on the moon?",
-                "What is the capital of France?",
-                "Tell me about the company Apple",
-            ],
-            inputs=msg_box,
-            label="Example questions"
-        )
-        
-        gr.Markdown("""
-        ---
-        **Note:** The model uses entity recognition to identify relevant entities in your questions 
-        and retrieves corresponding knowledge graphs to enhance responses.
-        """)
-    
-    return interface
+            nx.draw_networkx_labels(sg, pos, labels=labels, font_size=8)
+            nx.draw_networkx_edges(sg, pos, arrows=True, width=1, alpha=0.6, edge_color="#555555")
+            e_labels = {(u, v): (d.get("label") or "")[:25] for u, v, d in sg.edges(data=True)}
+            if e_labels:
+                nx.draw_networkx_edge_labels(sg, pos, edge_labels=e_labels, font_size=6, label_pos=0.5)
+            plt.axis("off")
+            tmp = NamedTemporaryFile(delete=False, suffix=".png")
+            plt.tight_layout()
+            plt.savefig(tmp.name, dpi=140)
+            plt.close()
+            return tmp.name
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Graph visualization failed for {entity_id}: {e}")
+            return None
 
-def main():
-    """Main function to run the inference script."""
-    parser = argparse.ArgumentParser(description="KG-LFM Inference with Chat UI")
-    parser.add_argument("--model_path", type=str, required=True,
-                       help="Path to the trained KG-LFM model")
-    parser.add_argument("--config", type=str, default=None,
-                       help="Path to dataset configuration YAML file")
-    parser.add_argument("--lite", action="store_true",
-                       help="Use lite version of the dataset")
-    parser.add_argument("--max_new_tokens", type=int, default=256,
-                       help="Maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                       help="Sampling temperature")
-    parser.add_argument("--top_p", type=float, default=0.9,
-                       help="Top-p sampling parameter")
-    parser.add_argument("--device", type=str, default="auto",
-                       choices=["auto", "cpu", "cuda", "mps"],
-                       help="Device to run the model on")
-    parser.add_argument("--host", type=str, default="127.0.0.1",
-                       help="Host to serve the Gradio interface on")
-    parser.add_argument("--port", type=int, default=7860,
-                       help="Port to serve the Gradio interface on")
-    parser.add_argument("--share", action="store_true",
-                       help="Create a public link for the Gradio interface")
-    
-    args = parser.parse_args()
-    
-    # Set up dataset configuration
+    # ---------- Prompt construction ----------
+    def _max_input_len(self) -> int:
+        cfg = getattr(self.model, "config", None)
+        max_pos = getattr(cfg, "max_position_embeddings", None)
+        base = 2048 if max_pos is None else int(max_pos)
+        # budget a little for generation + special tokens
+        return max(256, base - self.max_new_tokens - 16)
+
+    def _apply_chat_template(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None) -> str:
+        tok = self.tokenizer
+        try:
+            return tok.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=tools if tools else None,
+            )
+        except Exception:
+            # Very simple fallback
+            tool_msg = f" (tools: {', '.join([t['function']['name'] for t in tools])})" if tools else ""
+            parts = []
+            if messages[0]["role"] != "system":
+                parts += [f"system: {tool_msg}"]
+                parts += [f"{m['role']}: {m['content']}" for m in messages]
+            else:
+                system_prompt = messages[0]["content"] + "\n" + tool_msg
+                parts += [f"system: {system_prompt}"]
+                parts += [f"{m['role']}: {m['content']}" for m in messages[1:]]
+            parts.append("assistant:")
+            return "\n".join(parts)
+
+    # ---------- Tool plumbing ----------
+    def query_knowledge_graph(self, entity_name: str) -> Dict[str, Any]:
+        """Resolve an entity name to an entity_id present in the graphs.
+        Returns a structured payload for the tool result.
+        """
+        matches = self.entity_recognizer.extract(entity_name, limit=1)
+        if not matches:
+            return {"ok": False, "error": f"Entity '{entity_name}' not found in knowledge graph"}
+        entity_id = matches[0].entity_id
+        # You can add more structured fields if your model benefits from them
+        return {"ok": True, "entity_id": entity_id, "entity_name": entity_name}
+
+    def _parse_tool_calls(self, response_text: str) -> List[Dict[str, Any]]:
+        """Parse tool calls emitted as JSON in the text (model-dependent)."""
+        tool_calls: List[Dict[str, Any]] = []
+        # Pattern for objects like {"name":"query_knowledge_graph","arguments":{...}}
+        import re
+
+        pattern = r"\{[^{}]*\"name\"\s*:\s*\"[^\"]+\"\s*,\s*\"arguments\"\s*:\s*\{[^{}]*\}[^{}]*\}"
+        for m in re.findall(pattern, response_text):
+            try:
+                obj = json.loads(m)
+                if isinstance(obj.get("arguments"), str):
+                    obj["arguments"] = json.loads(obj["arguments"])  # some models double-encode
+                tool_calls.append(obj)
+            except json.JSONDecodeError:
+                continue
+        return tool_calls
+
+    def _handle_tool_calls(self, calls: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
+        """Execute tool calls and return a function-message text + list of entity_ids."""
+        fn_text_lines: List[str] = []
+        entity_ids: List[str] = []
+        for call in calls:
+            if call.get("name") != "query_knowledge_graph":
+                continue
+            args = call.get("arguments", {})
+            entity_name = (args or {}).get("entity_name", "")
+            if not entity_name:
+                fn_text_lines.append("missing entity_name")
+                continue
+            result = self.query_knowledge_graph(entity_name)
+            if not result.get("ok"):
+                fn_text_lines.append(f"{entity_name} not found")
+                continue
+            eid = result["entity_id"]
+            entity_ids.append(eid)
+            # Expose a KG token so the model knows graphs will follow
+            fn_text_lines.append(f"{entity_name}{SPECIAL_KG_TOKEN}")
+        return "\n".join(fn_text_lines) + ("\n" if fn_text_lines else ""), entity_ids
+
+    # ---------- Generation ----------
+    def _attempt_generate(self, inputs: Dict[str, torch.Tensor], graphs: Optional[Batch] = None) -> torch.Tensor:
+        gen_kwargs: Dict[str, Any] = dict(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            do_sample=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        if graphs is not None:
+            gen_kwargs["graphs"] = graphs
+        try:
+            return self.model.generate(**gen_kwargs)
+        except RuntimeError as e:  # pragma: no cover
+            if "out of memory" in str(e).lower():
+                logger.warning("CUDA OOM; retrying with reduced max_new_tokens")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gen_kwargs["max_new_tokens"] = max(32, self.max_new_tokens // 2)
+                return self.model.generate(**gen_kwargs)
+            raise
+
+    # ---------- Public compare API ----------
+    def respond_compare(self, user_input: str) -> Tuple[str, str, List[Tuple[str, str, float]]]:
+        """Return (baseline_text, augmented_text, resolved_entities)."""
+        # 1) Append user to both histories
+        u_msg = {"role": "user", "content": user_input}
+        self.hist_baseline.append(dict(u_msg))
+        self.hist_augmented.append(dict(u_msg))
+
+        max_inp = self._max_input_len()
+
+        # 2) BASELINE (no tools, no graphs)
+        baseline_prompt = self._apply_chat_template(self.hist_baseline, tools=None)
+        baseline_inputs = self.tokenizer(
+            baseline_prompt, return_tensors="pt", truncation=True, max_length=max_inp
+        ).to(self.device)
+        with self.model.llm.disable_adapter(), torch.inference_mode():
+            g_baseline = self._attempt_generate(baseline_inputs, graphs=None)
+        # The model's generate method now returns only newly generated tokens
+        baseline_text = self.tokenizer.decode(g_baseline[0], skip_special_tokens=True).strip()
+        self.hist_baseline.append({"role": "assistant", "content": baseline_text})
+
+        # 3) AUGMENTED (tools-only)
+        # 3a) First pass: allow tool calling
+        aug_prompt = self._apply_chat_template(self.hist_augmented, tools=[KG_QUERY_TOOL])
+        aug_inputs = self.tokenizer(aug_prompt, return_tensors="pt", truncation=True, max_length=max_inp).to(self.device)
+        with torch.inference_mode():
+            g_first = self._attempt_generate(aug_inputs, graphs=self._get_graph_batch(self.graph_token_entity_ids))
+        # The model's generate method now returns only newly generated tokens
+        first_text = self.tokenizer.decode(g_first[0], skip_special_tokens=True).strip()
+        self.hist_augmented.append({"role": "assistant", "content": first_text})
+
+        tool_calls = self._parse_tool_calls(first_text)
+        
+        max_depth = 5
+        aug_res = first_text
+        resolved: List[Tuple[str, str, float]] = []
+        while len(tool_calls)>0 and max_depth > 0:
+            # 3b) Parse + execute tool calls
+            fn_text, new_entity_ids = self._handle_tool_calls(tool_calls)
+            
+            if new_entity_ids:
+                # Record entities as (mention?, id, confidence=1.0) — we don't store mention text here
+                resolved = [("tool_query", eid, 1.0) for eid in new_entity_ids]
+                self.graph_token_entity_ids.extend(new_entity_ids)
+            
+            # 3c) Add function result and produce final augmented answer
+            self.hist_augmented.append({
+                "role": 'tool' if "tool" in self.tokenizer.chat_template else 'assistant', 
+                "content": fn_text
+            })
+            aug_prompt2 = self._apply_chat_template(self.hist_augmented, tools=[KG_QUERY_TOOL])
+            aug_inputs2 = self.tokenizer(aug_prompt2, return_tensors="pt", truncation=True, max_length=max_inp).to(self.device)
+            graphs = self._get_graph_batch(self.graph_token_entity_ids)
+            graphs = graphs.to(self.device) if graphs is not None else None
+            with torch.inference_mode():
+                g_second = self._attempt_generate(aug_inputs2, graphs=graphs)
+                
+            augmented_text = self.tokenizer.decode(g_second[0], skip_special_tokens=True).strip()
+            self.hist_augmented.append({"role": "assistant", "content": augmented_text})
+            aug_res += "\n====\n" + fn_text + "\n====\n" + augmented_text
+
+            tool_calls = self._parse_tool_calls(augmented_text)
+            max_depth -= 1
+
+        return baseline_text, aug_res, resolved
+
+# ----------------------------
+# CLI runner
+# ----------------------------
+
+def _print_entities(ents: List[Tuple[str, str, float]]):
+    if not ents:
+        print("No entities resolved (augmented path).")
+        return
+    print("Resolved entities (augmented):")
+    for i, (m, eid, conf) in enumerate(ents, 1):
+        print(f"  [{i}] {m} -> {eid} ({conf:.0%})")
+
+
+def run_cli(bot: KGChatBot) -> None:
+    print("KG-LFM CLI (Compare Mode • Tools-Only) — type :help for commands")
+    last_ents: List[Tuple[str, str, float]] = []
+
+    while True:
+        try:
+            user = input("You> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("Exiting.")
+            break
+        if not user:
+            continue
+        low = user.lower()
+        if low in {":quit", ":exit", "q"}:
+            break
+        if low == ":help":
+            print(
+                (
+                    "\nCommands:\n"
+                    "  :help                 Show this help\n"
+                    "  :quit / :exit / q     Exit\n"
+                    "  :entities             Show last resolved entities (augmented path)\n"
+                    "  :graph <id|index>     Save graph image for an entity id or 1-based index\n\n"
+                    "About compare mode:\n"
+                    "  - BASELINE is generated with no tools and no graphs.\n"
+                    "  - KG-AUGMENTED allows tool calls to query the KG and then attaches graphs.\n"
+                ).strip()
+            )
+            continue
+        if low == ":entities":
+            _print_entities(last_ents)
+            continue
+        if low.startswith(":graph"):
+            parts = user.split()
+            if len(parts) < 2:
+                print("Usage: :graph <entity_id|index>")
+                continue
+            target = parts[1]
+            entity_id: Optional[str] = None
+            if target.isdigit():
+                idx = int(target) - 1
+                if 0 <= idx < len(last_ents):
+                    entity_id = last_ents[idx][1]
+            else:
+                for _, eid, _ in last_ents:
+                    if eid == target:
+                        entity_id = eid
+                        break
+            if not entity_id:
+                print("Entity not found in last list.")
+                continue
+            path = bot.visualize_graph(entity_id)
+            print(f"Graph image saved at: {path}" if path else f"Unable to render graph for {entity_id}")
+            continue
+
+        # Normal generation (compare mode)
+        baseline, augmented, ents = bot.respond_compare(user)
+        last_ents = ents
+        # Side-by-side style (stacked, with clear separators)
+        print_side_by_side(baseline, augmented, delimiter="|", col_padding=5)
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="KG-LFM Inference — CLI (Compare Mode, Tools-Only)")
+    p.add_argument("--model_path", type=str, required=True, help="Path to the trained KG-LFM model")
+    p.add_argument("--config", type=str, default=None, help="Path to dataset configuration YAML file")
+    p.add_argument("--lite", action="store_true", help="Use lite dataset")
+    p.add_argument("--max_new_tokens", type=int, default=512)
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top_p", type=float, default=0.9)
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    p.add_argument(
+        "--loglevel", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    p.add_argument(
+        "--system_prompt",
+        type=str,
+        default=(
+            "You are a helpful assistant answering the user queries."
+        ),
+        help="System prompt to seed the conversation",
+    )
+
+    args = p.parse_args()
+    logging.getLogger().setLevel(getattr(logging, args.loglevel))
+
+    # Dataset config
     if args.config:
         from KG_LFM.configuration import load_yaml_config
-        config = load_yaml_config(args.config)
-        dataset_config = config.dataset
+
+        cfg = load_yaml_config(args.config)
+        dataset_cfg: DatasetConfig = cfg.dataset
+        if args.lite:
+            dataset_cfg.lite = True
     else:
-        dataset_config = DatasetConfig(lite=args.lite)
-    
+        dataset_cfg = DatasetConfig(lite=args.lite)
+
     try:
-        # Initialize the chatbot
-        logger.info("Initializing KG-LFM chatbot...")
-        chatbot = KGChatBot(
+        bot = KGChatBot(
             model_path=args.model_path,
-            dataset_config=dataset_config,
+            dataset_config=dataset_cfg,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
-            device=args.device
+            device=args.device,
+            system_prompt=args.system_prompt,
         )
-        
-        # Create and launch the interface
-        logger.info("Creating Gradio interface...")
-        interface = create_gradio_interface(chatbot)
-        
-        logger.info(f"Launching interface on {args.host}:{args.port}")
-        interface.launch(
-            server_name=args.host,
-            server_port=args.port,
-            share=args.share
-        )
-        
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
     except Exception as e:
-        logger.error(f"Failed to start inference server: {e}")
-        sys.exit(1)
+        logger.error(f"Startup failed: {e}")
+        raise
+
+    try:
+        run_cli(bot)
+    except KeyboardInterrupt:
+        logger.info("Shutting down…")
+    except Exception as e:  # pragma: no cover
+        logger.error(f"Error occurred while running CLI: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
