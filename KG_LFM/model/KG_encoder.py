@@ -34,12 +34,15 @@ class ResidualVectorQuantization(nn.Module):
         Number of entries in each codebook.
     shared_codebook : bool, default False
         If True, every stage re-uses the same nn.Embedding object.
+    scale_commit: float, default 0.25
+        Scaling factor for the commitment loss on the overall loss.
     beta_commit : float, default 0.25
-        Weight for the commitment loss.
-    gamma_entropy : float, default 1e-2
+        Weight for the commitment loss on the encoder side.
+    gamma_entropy : float, default 1.0
         Weight for the entropy regularization loss.
-    lambda_res : float, default 1.0
+    lambda_res : float, default 0.5
         Weight for the residual loss.
+    temperature : float, default 1.0
     """
     def __init__(
         self,
@@ -47,25 +50,33 @@ class ResidualVectorQuantization(nn.Module):
         num_quantizers: int = 3,
         codebook_size: int = 256,
         shared_codebook: bool = False,
+        scale_commit=0.25,
         beta_commit=0.25, gamma_entropy=1.0, lambda_res=0.5,
+        temperature: float = 1.0
     ):
         super().__init__()
         self.dim = dim
         self.num_quantizers = num_quantizers
         self.codebook_size = codebook_size
         
+        self.scale_commit = scale_commit
         self.beta_commit = beta_commit
         self.gamma_entropy = gamma_entropy
         self.lambda_res = lambda_res
+        self.temperature = temperature
+
+        self.shared_codebook = shared_codebook
 
         # ── codebooks ──────────────────────────────────────────────────────────
         if shared_codebook:
-            shared = nn.Embedding(codebook_size, dim)
-            self.codebooks = nn.ModuleList([shared] * num_quantizers)
+            self.shared = nn.Embedding(codebook_size, dim)
+            self.codebooks = nn.ModuleList([self.shared])  # length 1
         else:
             self.codebooks = nn.ModuleList(
                 [nn.Embedding(codebook_size, dim) for _ in range(num_quantizers)]
             )
+            
+        self._init_weights()
             
     def _init_weights(self):
         """Initialize weights with proper scaling for stability."""
@@ -73,7 +84,6 @@ class ResidualVectorQuantization(nn.Module):
             nn.init.xavier_uniform_(cb.weight, gain=0.1)
 
     # -------- helpers ---------------------------------------------------------
-    @torch.no_grad()
     def _nearest_code(self, residual: torch.Tensor, table: nn.Embedding):
         """
         Args
@@ -87,10 +97,16 @@ class ResidualVectorQuantization(nn.Module):
         q   : (B, D)        quantized vectors
         """
         # (B, 1, D) × (1, K, D) → (B, K)
-        dist = torch.cdist(residual.unsqueeze(1), table.weight.unsqueeze(0)).squeeze(1)
-        idx = dist.argmin(-1)           # (B,)
-        return idx, table(idx), dist    # (B,), (B, D), (B, K)
-    
+        x = residual.float()                    # (B,D)
+        w = table.weight.float()                # (K,D)
+        x2 = (x * x).sum(-1, keepdim=True)      # (B,1)
+        w2 = (w * w).sum(-1).unsqueeze(0)       # (1,K)
+        dist2 = x2 + w2 - 2 * (x @ w.t())       # (B,K)
+
+        idx = dist2.argmin(-1)           # (B,)
+        return idx, table(idx), dist2    # (B,), (B, D), (B, K)
+
+    @torch.no_grad()
     def _compute_adaptive_entropy_weight(self, commit_loss, perplexity, batch_diversity):
         """
         Compute adaptive entropy weight based on commitment loss, perplexity, and batch diversity.
@@ -162,7 +178,7 @@ class ResidualVectorQuantization(nn.Module):
         -------
         quantized : (B, Q, D)   stacked quantized vectors with STE for gradient flow
         indices   : (B, Q)      codebook indices per stage
-        loss      : ()          scalar — residual-energy + β * commit loss
+        loss      : ()          scalar — residual + β * commit loss - entropy
         """
         assert x.dim() == 2 and x.size(1) == self.dim, \
             f"expected (batch, {self.dim}); got {tuple(x.shape)}"
@@ -171,16 +187,18 @@ class ResidualVectorQuantization(nn.Module):
         quantized_list, index_list = [], []
         
         if self.training:
-            total_commit = torch.tensor(0.0, device=x.device)
-            total_entropy = torch.tensor(0.0, device=x.device)
-        
+            total_commit = 0.0
+            total_entropy = 0.0
+
             # Compute batch diversity once
             with torch.no_grad():
                 batch_diversity = self._compute_batch_diversity(x)
 
-        for cb in self.codebooks:
+        for i in range(self.num_quantizers):
+            cb = self.codebooks[0] if self.shared_codebook else self.codebooks[i]
+            
             # 1. Pick the nearest codebook vector (this operation is non-differentiable)
-            idx, q, dist = self._nearest_code(residual, cb)
+            idx, q, dist2 = self._nearest_code(residual, cb)
 
             # 2. Apply the Straight-Through Estimator (STE)
             # This allows the gradient to be passed from 'q_ste' back to 'residual'
@@ -192,12 +210,11 @@ class ResidualVectorQuantization(nn.Module):
             index_list.append(idx)
             
             if self.training:
-                # 4. Calculate the commitment loss to train the codebook.
-                # The gradient for this loss should only affect the codebook, not the encoder.
-                commit_loss = F.mse_loss(residual.detach(), q)
-                
+                # 4. Calculate the commitment loss.
+                commit_loss = F.mse_loss(residual.detach(), q) + self.beta_commit * F.mse_loss(residual, q.detach())
+
                 # 5. Entropy regularization for better codebook utilization
-                prob_dist = F.softmax(-dist, dim=-1)
+                prob_dist = F.softmax(-dist2 / self.temperature, dim=-1)
                 entropy_loss = -(prob_dist * torch.log(prob_dist + 1e-8)).sum(-1).mean()
                 
                 # 6. Compute perplexity for adaptive scaling
@@ -210,26 +227,27 @@ class ResidualVectorQuantization(nn.Module):
                 )
             
                 # 8. Accumulate the total loss with adaptive entropy weight
-                total_commit += commit_loss
-                total_entropy += adaptive_entropy_weight * entropy_loss
-            
+                total_commit = total_commit + commit_loss
+                # need to use - as we want to maximize the entropy
+                total_entropy = total_entropy - adaptive_entropy_weight * entropy_loss
+
             # 9. Update the residual for the next quantization stage using the original 'q'.
             residual = residual - q
             
-
         quantized = torch.stack(quantized_list, dim=1)   # (B, Q, D)
         indices   = torch.stack(index_list,   dim=1)     # (B, Q)
         
         if self.training:
-            total_commit = self.beta_commit * total_commit / self.num_quantizers
+            total_commit = self.scale_commit * total_commit / self.num_quantizers
             total_entropy = total_entropy / self.num_quantizers
             
             # The residual loss encourages the encoder to produce outputs that are 
             # close to the codebook.
-            res_loss  = residual.pow(2).mean() * self.lambda_res
+            res_loss = residual.pow(2).mean() * self.lambda_res
 
-            logging.debug("Residual loss: %s, commit loss: %s, entropy loss: %s, batch diversity: %s",
-                        res_loss.item(), total_commit.item(), total_entropy.item(), batch_diversity.item())
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug("Residual loss: %s, commit loss: %s, entropy loss: %s, batch diversity: %s",
+                            res_loss.item(), total_commit.item(), total_entropy.item(), batch_diversity.item())
             # The total loss for the quantization module
             loss = res_loss + total_commit + total_entropy
         else:
@@ -303,23 +321,6 @@ class KGEncoder(nn.Module):
         
         self.graph_pooling = graph_pooling
         
-        # Initialize weights properly
-        self._init_weights()
-        
-    def _init_weights(self):
-        """Initialize weights with proper scaling for stability."""
-        # Initialize adapter layer with small weights
-        nn.init.xavier_uniform_(self.adapter.weight, gain=0.1)
-        nn.init.constant_(self.adapter.bias, 0)
-        
-        # Initialize output projection with small weights
-        nn.init.xavier_uniform_(self.output_projection.weight, gain=0.1)
-        nn.init.constant_(self.output_projection.bias, 0)
-        
-        # Initialize layer norm
-        nn.init.constant_(self.norm.weight, 1.0)
-        nn.init.constant_(self.norm.bias, 0)
-        
     def forward(self, graphs: Batch):
         """
         Forward pass for the KGEncoder.
@@ -387,10 +388,9 @@ class KGEncoder(nn.Module):
         # Normalize the output
         x = self.norm(x)
         
-        logging.debug(f"Output shape after adapter and normalization: {x.shape}")
         # Apply residual vector quantization
         quantized_x, indices, loss = self.vq(x)
-        logging.debug(f"Quantized output shape: {quantized_x.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
+        
         
         tokens = self.output_projection(quantized_x)
         
@@ -399,6 +399,9 @@ class KGEncoder(nn.Module):
         # Normalize the quantized output
         tokens = self.out_norm(tokens)
         
-        # Return the quantized representations
-        logging.debug(f"Quantized output shape: {tokens.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"Output shape after adapter and normalization: {x.shape}")
+            logging.debug(f"Quantized output shape: {quantized_x.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
+            # Return the quantized representations
+            logging.debug(f"Quantized output shape: {tokens.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
         return tokens, indices, loss
