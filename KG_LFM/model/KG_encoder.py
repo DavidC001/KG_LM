@@ -136,17 +136,22 @@ class ResidualVectorQuantization(nn.Module):
         if x.size(0) <= 1:
             return torch.tensor(0.0, device=x.device)
         
-        # Compute pairwise distances
-        pairwise_dist = torch.cdist(x, x)
+        # torch.cdist has incomplete support for bfloat16/float16 on some builds (raises: "cdist_cuda" not implemented for 'BFloat16').
+        # Temporarily upcast to float32 for the distance computation, then continue.
+        needs_cast = x.dtype in (torch.bfloat16, torch.float16)
+        x_for_dist = x.float() if needs_cast else x
+        
+        pairwise_dist = torch.cdist(x_for_dist, x_for_dist)
         
         # Remove diagonal (self-distances)
         mask = ~torch.eye(x.size(0), dtype=torch.bool, device=x.device)
         distances = pairwise_dist[mask]
         
-        # Diversity as normalized mean distance
-        diversity = distances.mean() / (x.norm(dim=1).mean() + 1e-8)
+        # Diversity as normalized mean distance (use same precision tensor as distances)
+        denom = (x_for_dist.norm(dim=1).mean() + 1e-8)
+        diversity = distances.mean() / denom
         
-        return torch.clamp(diversity, 0, 1)
+        return torch.clamp(diversity.to(x.device), 0, 1)
 
     # -------- forward ---------------------------------------------------------
     def forward(self, x: torch.Tensor):
@@ -169,8 +174,9 @@ class ResidualVectorQuantization(nn.Module):
             total_commit = torch.tensor(0.0, device=x.device)
             total_entropy = torch.tensor(0.0, device=x.device)
         
-        # Compute batch diversity once
-        batch_diversity = self._compute_batch_diversity(x)
+            # Compute batch diversity once
+            with torch.no_grad():
+                batch_diversity = self._compute_batch_diversity(x)
 
         for cb in self.codebooks:
             # 1. Pick the nearest codebook vector (this operation is non-differentiable)

@@ -178,6 +178,8 @@ class KG_LFMMetaModel(ABC):
         if osp.exists(llm_path):
             logging.info(f"Loading pretrained LLM from {llm_path}")
             model.llm = AutoModelForCausalLM.from_pretrained(llm_path, trust_remote_code=True)
+            if config.use_lora:
+                model.llm = PeftModel.from_pretrained(model.llm, llm_path, trust_remote_code=True)
         else:
             warnings.warn(
                 f"LLM directory not found at {llm_path}. "
@@ -585,21 +587,6 @@ class KG_LFMMetaForCausalLM(ABC):
         and sets sensible defaults if they are missing.
         """
         generation_config = copy.deepcopy(self.llm.generation_config)
-        
-        if generation_config.max_length == 20: # Default value in base GenerationConfig
-            generation_config.max_length = self.tokenizer.model_max_length or 2048
-            
-        if generation_config.pad_token_id is None:
-            generation_config.pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-            
-        if generation_config.eos_token_id is None:
-            eos_tokens = infer_stop_tokens(self.tokenizer)
-            if eos_tokens:
-                generation_config.eos_token_id = self.tokenizer.convert_tokens_to_ids(eos_tokens[0])
-
-        if generation_config.bos_token_id is None:
-             generation_config.bos_token_id = self.tokenizer.bos_token_id
-             
         return generation_config
 
 
@@ -631,7 +618,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
             trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token = self.llm.config.pad_token_id
 
         if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens({"additional_special_tokens": [SPECIAL_KG_TOKEN]})

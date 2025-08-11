@@ -344,12 +344,21 @@ class KG_LFM_Trainer:
                         input_ids=batch['input_ids'],
                         graphs=batch['graphs'],
                         attention_mask=batch['attention_mask'],
-                        labels=batch['input_ids'],
+                        labels=batch['labels'],
                         use_cache=False,
                     )
                     
                     # Gather loss across all devices
-                    loss = self.accelerator.gather(outputs.loss).mean()
+                    loss = self.accelerator.gather(outputs.loss)
+                    # discard nan loss
+                    loss = loss[~torch.isnan(loss)]
+                    # if empty skip
+                    if loss.numel() == 0:
+                        self.logger.warning(f"Skipping batch {batch_idx} due to NaN loss.")
+                        continue
+                    # Average the loss
+                    loss = loss.mean()
+                    
                     metrics = self.compute_val_metrics(loss)
                     self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
                     
@@ -417,7 +426,7 @@ class KG_LFM_Trainer:
                     input_ids=batch['input_ids'],
                     graphs=batch['graphs'],
                     attention_mask=batch['attention_mask'],
-                    labels=batch['input_ids'],
+                    labels=batch['labels'],
                     use_cache=False,
                 )
                 language_loss = outputs.loss
