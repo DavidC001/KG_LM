@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, Dataset
 import networkx as nx
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory
+from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory, grailqa_factory, grailqa_factory
 from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
 from KG_LFM.utils.Datasets.webQSP_data import WebQSPDataset
 
@@ -128,12 +128,14 @@ class KGLFM_DataLoader:
                 trex_bite_factory(conf), trex_star_graphs_factory(conf)
             ),
             "web-qsp": self._web_qsp_factory,  # Special case for WebQSP
+            "grailqa": grailqa_factory,  # GrailQA dataset
         }
         
         self.dataset_class = {
             "trirex": TriRexStarDataset,
             "trirex-bite": TriRexStarDataset,
             "web-qsp": WebQSPDataset,
+            "grailqa": WebQSPDataset,  # Use WebQSP dataset class for GrailQA
         }
         
 

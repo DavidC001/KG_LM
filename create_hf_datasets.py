@@ -5,6 +5,7 @@ from KG_LFM.utils.Datasets.factories.factory import (
     trirex_factory,
     trex_star_graphs_factory,
     web_qsp_factory,
+    grailqa_factory
 )
 from KG_LFM.configuration import ProjectConfig, load_yaml_config
 from argparse import ArgumentParser
@@ -44,8 +45,9 @@ def main(config: ProjectConfig):
     print(f"Validation trirex dataset size: {len(val)}")
     print(f"Test trirex dataset size: {len(test)}")
     
-    print("Creating dataset webQSP...")
     base = Path(config.dataset.base_path)
+    
+    print("Creating dataset webQSP...")
     sent_tar = base / 'WebQSP_sentences_v1' / 'publish' / 'WebQSP_sentences_v1.tar'
     star_tar = base / 'WebQSP_star_v1' / 'publish' / 'WebQSP_star_v1.tar'
     # If missing, try generating from raw file; otherwise skip gracefully
@@ -65,7 +67,16 @@ def main(config: ProjectConfig):
         print(f"Total graphs in webQSP dataset: {len(graphs)}")
     else:
         print("WebQSP dataset not created due to missing artifacts.")
+        
+    print("Creating dataset grailqa...")
+    sent_tar = base / 'GrailQA_sentences_v1' / 'publish' / 'GrailQA_sentences_v1.tar'
+    star_tar = base / 'GrailQA_star_v1' / 'publish' / 'GrailQA_star_v1.tar'
     
+    (train, val, test), graphs = grailqa_factory(config.dataset)
+    print(f"Train grailqa dataset size: {len(train)}")
+    print(f"Validation grailqa dataset size: {len(val)}")
+    print(f"Test grailqa dataset size: {len(test)}")
+
     print("All datasets created successfully.")
     
     
