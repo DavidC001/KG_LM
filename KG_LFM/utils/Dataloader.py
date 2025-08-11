@@ -57,6 +57,7 @@ class KGLFM_Collator:
         # Initialize result dictionary
         result = {
             'sentences': [sample['sentence'] for sample in batch],
+            "conversations": [sample['conversation'] for sample in batch],
             'subjects': [sample['subject'] for sample in batch],
             'predicates': [sample['predicate'] for sample in batch],
             'objects': [sample['object'] for sample in batch],
@@ -68,14 +69,24 @@ class KGLFM_Collator:
         for sample in batch:
             text_features.append({
                 'input_ids': sample['input_ids'],
-                'attention_mask': sample['attention_mask']
+                'attention_mask': sample['attention_mask'],
             })
-        
         # Apply HF collator
         collated_text = self.hf_collator(text_features)
         result['input_ids'] = collated_text['input_ids']
         result['attention_mask'] = collated_text['attention_mask']
-        
+
+        # Use HF collator for labels
+        label_features = []
+        for sample in batch:
+            label_features.append({
+                'input_ids': sample['labels'],
+                'attention_mask': sample['attention_mask'],
+            })
+        # Apply HF collator
+        collated_labels = self.hf_collator(label_features)
+        result['labels'] = collated_labels['input_ids']
+
         result['graphs'] = self._process_graph_batch(result['graphs'])
         
         # Add batch metadata
@@ -136,9 +147,9 @@ class KGLFM_DataLoader:
             config=dataset_config,
         )
         
-        print(f"Loaded {len(self.train_dataset)} training samples")
-        print(f"Loaded {len(self.val_dataset)} validation samples")
-        print(f"Loaded {len(self.test_dataset)} test samples")
+        print(f"Loaded {len(self.train_dataset)} training samples") if self.train_dataset else "No training dataset"
+        print(f"Loaded {len(self.val_dataset)} validation samples") if self.val_dataset else "No validation dataset"
+        print(f"Loaded {len(self.test_dataset)} test samples") if self.test_dataset else "No test dataset"
         print(f"Loaded {len(self.star_graphs)} star graphs")
     
     def _web_qsp_factory(self, config) -> Tuple[Tuple[Dataset, Dataset, Dataset], Dict[str, nx.DiGraph]]:
@@ -148,7 +159,7 @@ class KGLFM_DataLoader:
             (
                 None,  None,  # No train & val split for WebQSP
                 web_qsp_dataset
-            ), 
+            ),
             web_qsp_star_graphs
         )
 
@@ -299,7 +310,8 @@ if __name__ == "__main__":
         print(f"Batch {batch_idx}:")
         print(f"  Input IDs shape: {batch['tokenized_input']['input_ids'].shape}")
         print(f"  Attention mask shape: {batch['tokenized_input']['attention_mask'].shape}")
-        
+        print(f"  Labels shape: {batch['labels'].shape}")
+
         breakpoint()
 
         if batch_idx >= 1:

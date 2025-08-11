@@ -9,9 +9,34 @@ from transformers import PreTrainedTokenizer
 
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import SPECIAL_KG_TOKEN, DatasetConfig
+from KG_LFM.configuration import SPECIAL_KG_TOKEN, DatasetConfig, IGNORE_INDEX
 
 from torch_geometric.data import Data
+
+
+user_questions = [
+    "what do you know about {subject}?",
+    "tell me all you know about {subject}",
+    "what can you find about {subject}?",
+    "can you provide more details on {subject}?",
+    "give me background on {subject}.",
+    "what's important to know about {subject}?",
+    "describe {subject} in general terms.",
+    "summarize the key facts about {subject}.",
+    "what knowledge is available about {subject}?",
+    "give a high-level overview of {subject}.",
+    "what are the basics of {subject}?",
+    "explain {subject} briefly.",
+    "what is {subject} known for?",
+    "outline the main points about {subject}.",
+    "provide general information on {subject}.",
+    "what should I know first about {subject}?",
+    "share notable facts about {subject}.",
+    "what connections are relevant to {subject}?",
+    "what context is useful for understanding {subject}?",
+    "how would you characterize {subject} overall?",
+]
+
 
 class TriRexStarDataset(Dataset):
     """
@@ -63,28 +88,9 @@ class TriRexStarDataset(Dataset):
         sample = self.trirex_dataset[idx]
         
         # add to the sentence a special token for graph embedding after the subject
-        subject_boundaries = sample['subject']['boundaries']
-        start_subject = subject_boundaries[0]
-        end_subject = subject_boundaries[1]
-
-        # Insert SPECIAL_KG_TOKEN after the subject
-        sample['sentence'] = (
-            sample['sentence'][:end_subject] +
-            SPECIAL_KG_TOKEN +
-            sample['sentence'][end_subject:]
-        )
-
-        new_chars = len(SPECIAL_KG_TOKEN)
-        # add to the object boundaries the SPECIAL_KG_TOKEN token
-        object_boundaries = sample["object"]['boundaries']
-        start_object = object_boundaries[0] + new_chars
-        end_object = object_boundaries[1] + new_chars
-        
-        # Insert SPECIAL_KG_TOKEN token after the object
-        sample["object"]['boundaries'] = [start_object, end_object]
+        subject_text = sample['subject']['label']
 
         result = {
-            'sentence': sample['sentence'],
             'subject': sample['subject'],
             'predicate': sample['predicate'],
             'object': sample['object']
@@ -102,31 +108,59 @@ class TriRexStarDataset(Dataset):
         # Tokenize the sentence
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
-        
+
+        result["conversation"] = [
+            {
+                'role': 'user',
+                'content': user_questions[idx % len(user_questions)].format(subject=subject_text)
+            },
+            {
+                'role': 'tool' if "tool" in self.tokenizer.chat_template else 'assistant',
+                'content': subject_text + SPECIAL_KG_TOKEN
+            },
+            {
+                'role': 'assistant',
+                'content': sample['sentence']
+            }
+        ]
         # if tokenizer has chat template, use it
         try:
             sentence = self.tokenizer.apply_chat_template(
-                conversation=[
-                    {
-                        'role': 'assistant',
-                        'content': sample['sentence']
-                    }
-                ],
+                conversation=result["conversation"],
                 tokenize=False,
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
         except ValueError:
             # Fallback for tokenizers without chat template support
-            sentence = sample['sentence']
-        
+            sentence = f"user: {user_questions[idx % len(user_questions)].format(subject=subject_text)}\ntool: {SPECIAL_KG_TOKEN}\nassistant: {sample['sentence']}"
+
         tokenized = self.tokenizer(
             sentence,
             return_tensors='pt'
         )
+        
+        result["sentence"] = sentence
         result['input_ids'] = tokenized['input_ids'].squeeze(0)
         result['attention_mask'] = tokenized['attention_mask'].squeeze(0)
-            
+
+        # compute labels by masking everything except for the object
+        shift = sentence.find(sample["sentence"])
+        object_char_start, object_char_end = sample['object']['boundaries']
+        object_char_start += shift
+        object_char_end += shift
+        result['object']['boundaries'] = [object_char_start, object_char_end]
+        
+        # tokenized to char mappings
+        obj_tok_start = tokenized.char_to_token(object_char_start)
+        obj_tok_end = tokenized.char_to_token(object_char_end)
+        result["object"]["token_boundaries"] = [obj_tok_start, obj_tok_end]
+
+        # compute labels
+        labels = torch.full(result['input_ids'].shape, IGNORE_INDEX, dtype=result['input_ids'].dtype)
+        labels[obj_tok_start:obj_tok_end] = result['input_ids'][obj_tok_start:obj_tok_end]
+        result['labels'] = labels
+
         return result
     
     def _process_graph(self, graph: nx.DiGraph) -> Data:
@@ -201,13 +235,13 @@ if __name__ == "__main__":
         
     # Create dataset config
     dataset_config = DatasetConfig(lite=True)  # Use lite for faster loading
-    dataset_config.name = "web-qsp"  # Use WebQSP dataset
+    dataset_config.name = "trirex"  # Use WebQSP dataset
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
     
     # Load TRIRex dataset and graphs
-    trirex_dataset = trirex_factory(dataset_config)
+    trirex_dataset, _, _ = trirex_factory(dataset_config)
     graphs = trex_star_graphs_factory(dataset_config)
     
     
