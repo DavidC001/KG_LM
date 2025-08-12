@@ -52,9 +52,10 @@ class GrailQAStar(GeneratorBasedBuilder):
 
         return [
             SplitGenerator(
-                name=Split.ALL,
+                name=Split.TRAIN,
                 gen_kwargs={
                     "grailqa_star_dir": download_dir["grailqa_star_dir"],
+                    "split": "all"
                 },
             ),
         ]

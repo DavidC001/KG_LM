@@ -90,14 +90,7 @@ class GrailQA(GeneratorBasedBuilder):
                     "grailqa_sentences_dir": download_dir["grailqa_sentences_dir"],
                     "split": "validation",
                 },
-            ),
-            SplitGenerator(
-                name=Split.TEST,
-                gen_kwargs={
-                    "grailqa_sentences_dir": download_dir["grailqa_sentences_dir"],
-                    "split": "test",
-                },
-            ),
+            )
         ]
 
     def _generate_examples(self, grailqa_sentences_dir: str, split: str):
