@@ -1,20 +1,64 @@
 import bz2
-import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Generator, Any
+from typing import Dict, Optional
 from urllib.error import HTTPError
 
+import re
 import networkx as nx
 import requests
 from SPARQLWrapper import SPARQLWrapper, JSON
 
-# Can also be local qEndpoint: https://hub.docker.com/r/qacompany/qendpoint-wikidata
+
+# endpoint_url = "https://query.wikidata.org/sparql"  # modern endpoint path
 endpoint_url = "https://query.wikidata.org/bigdata/namespace/wdq/sparql"
 
-# Cache for Freebase to Wikidata ID mappings
-_freebase_to_wikidata_cache = {}
+def mid_to_qid(mid: str) -> str | None:
+    """
+    Returns the Wikidata Q-ID of an entity given its Freebase ID (P646)
+    :param freebase_id: Freebase ID
+    :return: Wikidata Q-ID or None
+    """
+    freebase_id = f"/m/{mid[2:]}"
+
+    query = f"""
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wikibase: <http://wikiba.se/ontology#>
+            PREFIX bd: <http://www.bigdata.com/rdf#>
+
+            SELECT ?entity WHERE {{
+                ?entity wdt:P646 "{freebase_id}".
+            }}
+        """
+
+    sparql = SPARQLWrapper(endpoint_url)
+    sparql.setQuery(query)
+    sparql.setReturnFormat(JSON)
+
+    results = None
+
+    while True:
+        try:
+            results = sparql.query().convert()
+        except Exception as e:
+            # If exception is HTTPException and code is 429
+            if isinstance(e, HTTPError) and e.code == 429:
+                retry_after = int(e.headers.get("Retry-After", 30))
+                time.sleep(retry_after)
+            else:
+                return None
+        if results:
+            break
+
+    # Extract the Wikidata ID from the query results
+    if results["results"]["bindings"]:
+        wikidata_id = results["results"]["bindings"][0]["entity"]["value"]
+        # Extracting the Q-ID from the full URI
+        return wikidata_id.split('/')[-1]
+    else:
+        return None
 
 
 def clean(label: str):
@@ -23,102 +67,6 @@ def clean(label: str):
     label = label.replace("\n", " ")
     label = label.strip()
     return label if label else None
-
-
-def freebase_to_wikidata(freebase_id: str) -> str | None:
-    """
-    Convert a Freebase ID to a Wikidata ID using SPARQL query.
-    Uses caching to avoid repeated queries.
-    
-    :param freebase_id: Freebase ID (e.g., 'm.02mjmr')
-    :return: Wikidata ID (e.g., 'Q76') or None if not found
-    """
-    if freebase_id in _freebase_to_wikidata_cache:
-        return _freebase_to_wikidata_cache[freebase_id]
-    
-    # Construct the Freebase URI
-    freebase_uri = f"http://rdf.freebase.com/ns/{freebase_id.replace('.', '/')}"
-    
-    query = f"""
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        
-        SELECT ?item WHERE {{
-            ?item wdt:P646 "{freebase_id}" .
-        }}
-    """
-    
-    sparql = SPARQLWrapper(endpoint_url)
-    sparql.setQuery(query)
-    sparql.setReturnFormat(JSON)
-    
-    results = None
-    retry_count = 0
-    max_retries = 3
-    
-    while retry_count < max_retries:
-        try:
-            results = sparql.query().convert()
-            break
-        except Exception as e:
-            retry_count += 1
-            if isinstance(e, HTTPError) and e.code == 429:
-                retry_after = int(e.headers.get("Retry-After", 30))
-                time.sleep(retry_after)
-            else:
-                logging.warning(f"Error querying Freebase to Wikidata for {freebase_id}: {e}")
-                time.sleep(2 ** retry_count)  # Exponential backoff
-    
-    wikidata_id = None
-    if results and results["results"]["bindings"]:
-        item_uri = results["results"]["bindings"][0]["item"]["value"]
-        wikidata_id = item_uri.split("/")[-1]
-    
-    # Cache the result (even if None to avoid repeated failed queries)
-    _freebase_to_wikidata_cache[freebase_id] = wikidata_id
-    return wikidata_id
-
-
-def wikidata_to_freebase(wikidata_id: str) -> str | None:
-    """
-    Convert a Wikidata ID to a Freebase ID using SPARQL query.
-    
-    :param wikidata_id: Wikidata ID (e.g., 'Q76')
-    :return: Freebase ID (e.g., 'm.02mjmr') or None if not found
-    """
-    query = f"""
-        PREFIX wd: <http://www.wikidata.org/entity/>
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        
-        SELECT ?freebaseId WHERE {{
-            wd:{wikidata_id} wdt:P646 ?freebaseId .
-        }}
-    """
-    
-    sparql = SPARQLWrapper(endpoint_url)
-    sparql.setQuery(query)
-    sparql.setReturnFormat(JSON)
-    
-    results = None
-    retry_count = 0
-    max_retries = 3
-    
-    while retry_count < max_retries:
-        try:
-            results = sparql.query().convert()
-            break
-        except Exception as e:
-            retry_count += 1
-            if isinstance(e, HTTPError) and e.code == 429:
-                retry_after = int(e.headers.get("Retry-After", 30))
-                time.sleep(retry_after)
-            else:
-                logging.warning(f"Error querying Wikidata to Freebase for {wikidata_id}: {e}")
-                time.sleep(2 ** retry_count)
-    
-    if results and results["results"]["bindings"]:
-        return results["results"]["bindings"][0]["freebaseId"]["value"]
-    
-    return None
 
 def get_pagerank_map(base_path: Path) -> Dict[str, float]:
     """

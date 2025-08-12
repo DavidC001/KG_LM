@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import networkx as nx
 from tqdm import tqdm
-from KG_LFM.utils.SparqlQueryEngine import get_pagerank_map, fetch_neighbors, get_entity_label, freebase_to_wikidata
+from KG_LFM.utils.SparqlQueryEngine import get_pagerank_map, fetch_neighbors, get_entity_label, mid_to_qid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -52,7 +52,7 @@ def grailqa_to_sentence_format(
     for answer_entity in answer_entities:
         # Convert Freebase ID to Wikidata if needed
         if answer_entity.startswith('m.'):
-            wikidata_id = freebase_to_wikidata(answer_entity)
+            wikidata_id = mid_to_qid(answer_entity)
             if not wikidata_id:
                 continue
             answer_entity = wikidata_id
@@ -142,10 +142,10 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
     base = Path(base_path)
     
     # Input raw file expected to be provided by the user
-    raw_input_file = base / "grailqa_v1.0_train.json"
-    raw_dev_file = base / "grailqa_v1.0_dev.json"
-    raw_test_file = base / "grailqa_v1.0_test_public.json"
-    
+    raw_input_file = base / f"grailqa_v{version}.0_train.json"
+    raw_dev_file = base / f"grailqa_v{version}.0_dev.json"
+    # raw_test_file = base / f"grailqa_v{version}.0_test_public.json" # lacks important fields for preprocessing
+
     # Output artifact locations
     artifacts_sentence_directory = base / f"GrailQA_sentences_v{version}"
     csv_sentence_directory = artifacts_sentence_directory / "csv"
@@ -172,7 +172,7 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
     input_files = [
         (raw_input_file, "train"),
         (raw_dev_file, "validation"),
-        (raw_test_file, "test")
+        # (raw_test_file, "test")
     ]
     
     available_files = [(f, split) for f, split in input_files if f.exists()]
@@ -184,7 +184,7 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
         )
         return False
 
-    pageranks = get_pagerank_map(base_path)
+    pageranks = get_pagerank_map(base)
 
     for raw_file, split in available_files:
         logging.info(f"Processing {split} split from {raw_file}")
@@ -195,7 +195,9 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
         sentence_folder_path = csv_sentence_directory / split
         sentence_folder_path.mkdir(parents=True, exist_ok=True)
 
-        for datapoint in tqdm(grailqa_datapoints, desc=f"Generating GrailQA {split} split"):
+        successful_conversions = 0
+        progress = tqdm(grailqa_datapoints, desc=f"Generating GrailQA {split} split")
+        for datapoint in progress:
             qid = str(datapoint.get('qid', ''))
             question_text = datapoint.get('question', '')
             level = datapoint.get('level', '')
@@ -205,7 +207,7 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
             graph_query = datapoint.get('graph_query', {})
             nodes = graph_query.get('nodes', [])
             if not nodes:
-                print(f"No nodes found for question {qid}")
+                tqdm.write(f"No nodes found for question {qid}")
                 continue
 
             # Find the central entity (usually the one that's not a question node and is an entity)
@@ -219,14 +221,14 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
                     
                     freebase_id = node.get('id', '')
                     # Convert Freebase ID to Wikidata
-                    wikidata_id = freebase_to_wikidata(freebase_id)
+                    wikidata_id = mid_to_qid(freebase_id)
                     if wikidata_id:
                         central_entity_id = wikidata_id
                         central_entity_label = node.get('friendly_name', '')
                         break
             
             if not central_entity_id:
-                print(f"No suitable central entity found for question {qid}")
+                tqdm.write(f"No suitable central entity found for question {qid}")
                 continue
 
             # Extract answer entities
@@ -236,24 +238,26 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
                 if answer.get('answer_type') == 'Entity':
                     answer_arg = answer.get('answer_argument', '')
                     if answer_arg.startswith('m.'):
-                        wikidata_id = freebase_to_wikidata(answer_arg)
+                        wikidata_id = mid_to_qid(answer_arg)
                         if wikidata_id:
                             answer_entities.append(wikidata_id)
 
             if not answer_entities:
-                print(f"No valid answer entities found for question {qid}")
+                tqdm.write(f"No valid answer entities found for question {qid}")
                 continue
 
             output_path = sentence_folder_path / f"{qid}_{central_entity_id}.csv"
             if output_path.exists():
-                print(f"File {output_path} already exists, skipping")
+                tqdm.write(f"File {output_path} already exists, skipping")
+                successful_conversions += 1
+                progress.set_description(f"Generated {successful_conversions} samples")
                 continue
 
             # Get or create graph
             G = fetch_neighbors(pageranks, central_entity_id, edge_limit=10_000)
             
             if not G:
-                print(f"Graph could not be fetched for entity {central_entity_id}")
+                tqdm.write(f"Graph could not be fetched for entity {central_entity_id}")
                 G = None
 
             # Save graph as JSON if it exists
@@ -271,10 +275,10 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
             )
             
             if not sentences:
-                print(f"No sentences generated for question {qid}")
+                tqdm.write(f"No sentences generated for question {qid}")
                 continue
-
-            print(f"Generated {len(sentences)} sentences for question {qid} and entity {central_entity_id}")
+            
+            successful_conversions += 1
             
             # Write to CSV
             with open(output_path, "w") as f:
@@ -289,6 +293,8 @@ def generate_grailqa(base_path: str | Path, version: int = 1) -> bool:
                 )
                 writer.writeheader()
                 writer.writerows(sentences)
+
+            progress.set_description(f"Generated {successful_conversions} samples")
 
     # Always recreate tars to ensure consistency
     create_graph_tar(json_star_directory, output_tar_star_file_path)
