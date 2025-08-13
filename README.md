@@ -23,6 +23,24 @@ The model is primarily trained and evaluated on the **Tri-Rex dataset**, which p
 - Factual statements with associated knowledge graph contexts
 - Graph neighborhoods around central entities
 
+Other datasets used are the test split of the web-QSP data mapped to WikiData entities, and the GrailQA dataset.
+
+### Data preparation
+
+To prepare the datasets, run the `create_hf_datasets.py` script with the appropriate configuration file.
+The script will use the base path of the search for the following dataset files:
+- TriRex_v1.tar (+lite) [webpage](https://zenodo.org/records/15166163)
+- TRExStar_v1.tar (+lite) [webpage](https://zenodo.org/records/15165974)
+- TrexBite_v1.tar (+lite) [webpage](https://zenodo.org/records/15165883)
+- grailqa_v1.0_train.json & grailqa_v1.0_dev.json (the test set lacks fields needed for our preprocessing) from this [archive](https://dl.orangedox.com/WyaCpL?dl=1) 
+- webqsp.examples.test.wikidata.json (used only for evaluation): you can get it from the folder `input` in the following [zip](https://public.ukp.informatik.tu-darmstadt.de/coling2018-graph-neural-networks-question-answering/WebQSP_WD_v1.zip) (link from [Github](https://github.com/UKPLab/coling2018-graph-neural-networks-question-answering/blob/master/WEBQSP_WD_README.md))
+- [train](https://github.com/askplatypus/wikidata-simplequestions/raw/master/annotated_wd_data_train_answerable.txt), [val](https://github.com/askplatypus/wikidata-simplequestions/raw/master/annotated_wd_data_valid_answerable.txt) and [test](https://github.com/askplatypus/wikidata-simplequestions/raw/master/annotated_wd_data_test_answerable.txt) splits of the simple questions dataset mapped to WD.
+These files need to be downloaded and placed in the base path provided.
+
+mapping file from freebase to WD is from this [repo](https://github.com/askplatypus/wikidata-simplequestions/tree/master)
+
+NOTE: some of the steps require internet access, if your compute nodes do not have it you can try to run the scipt for the lite version of the data, then you should be able to run the full version without internet access.
+
 ## 🔧 Configuration
 
 The model behavior is controlled through YAML configuration files in the `configs/` directory
