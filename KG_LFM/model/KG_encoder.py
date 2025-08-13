@@ -299,7 +299,7 @@ class KGEncoder(nn.Module):
         self.num_heads = num_heads
         
         # adapter layer with spectral normalization for stability
-        self.adapter = spectral_norm(nn.Linear(node_embedding_dim, node_embedding_dim))
+        self.adapter = nn.Linear(node_embedding_dim, node_embedding_dim)
         self.dropout = nn.Dropout(dropout)
         self.edge_dropout = nn.Dropout(dropout * 0.5)  # Edge-specific dropout
         self.attention_dropout = nn.Dropout(dropout * 0.3)  # Attention dropout
@@ -317,7 +317,7 @@ class KGEncoder(nn.Module):
         )
         
         # output projection layer with spectral normalization
-        self.output_projection = spectral_norm(nn.Linear(node_embedding_dim, final_embedding_dim))
+        self.output_projection = nn.Linear(node_embedding_dim, final_embedding_dim)
         
         self.graph_pooling = graph_pooling
         
@@ -402,6 +402,7 @@ class KGEncoder(nn.Module):
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(f"Output shape after adapter and normalization: {x.shape}")
             logging.debug(f"Quantized output shape: {quantized_x.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
-            # Return the quantized representations
             logging.debug(f"Quantized output shape: {tokens.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
+        
+        # Return the quantized representations
         return tokens, indices, loss
