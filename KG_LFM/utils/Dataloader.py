@@ -182,7 +182,7 @@ class KGLFM_DataLoader:
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
             persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            prefetch_factor=1, # to save memory, lower prefetching
+            prefetch_factor=1 if self.dataloader_config.num_workers > 0 else None
         )
     
     def get_val_dataloader(self) -> DataLoader:
@@ -204,7 +204,7 @@ class KGLFM_DataLoader:
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
             persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            prefetch_factor=1, # to save memory, lower prefetching
+            prefetch_factor=1 if self.dataloader_config.num_workers > 0 else None
         )
     
     def get_test_dataloader(self) -> DataLoader:
@@ -226,7 +226,7 @@ class KGLFM_DataLoader:
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
             persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            prefetch_factor=1, # to save memory, lower prefetching
+            prefetch_factor=1 if self.dataloader_config.num_workers > 0 else None
         )
     
     def _get_collator(self):
