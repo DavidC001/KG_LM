@@ -14,6 +14,8 @@
 
 source ./prepare_env.sh
 
+export TIME_BUDGET=$((3600*24-60*30)) 
+
 echo "Starting training with enhanced NCCL timeout and DeepSpeed settings..."
 echo "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: $TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"
 echo "NCCL_TIMEOUT: $NCCL_TIMEOUT"
@@ -35,7 +37,7 @@ head_node_ip=$(srun --nodes=1 --ntasks=1 -w $head_node hostname --ip-address)
 # Launch the training script with the specified configuration
 export LAUNCHER="accelerate launch --config_file configs/accelerate_config.yaml --main_process_ip $head_node_ip --main_process_port 29500"
 export PYTHON_FILE="train.py"
-export ARGS="--config $CONFIG_FILE"
+export ARGS="--config $CONFIG_FILE --time_budget $TIME_BUDGET"
 
 export CMD="$LAUNCHER $PYTHON_FILE $ARGS" 
 srun $CMD
