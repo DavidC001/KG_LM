@@ -54,7 +54,7 @@ class KGLFMEvaluator:
         
         # Load configuration
         self.config : ProjectConfig = load_yaml_config(config_path)
-        self.model_path = Path(self.config.train_conf.checkpoint_dir) / self.config.train_conf.run_name / "best_model"
+        self.model_path = Path(self.config.train_conf.start_from_checkpoint)
         self.config.train_conf.dataloader.batch_size = batch_size
         
         set_seed(self.config.seed)
@@ -174,17 +174,15 @@ class KGLFMEvaluator:
             self.tokenizer = self.model.tokenizer
             
             # if the config requires to tune the model also load clean model
-            if self.config.model.tune_language_model:
+            if self.model.config.tune_language_model:
                 self.clean_model = AutoModelForCausalLM.from_pretrained(
-                    self.config.model.llm_model_name,
-                    cache_dir=self.config.train_conf.cache_dir
+                    self.model.config.llm_model_name,
                 )
                 self.clean_tokenizer = AutoTokenizer.from_pretrained(
-                    self.config.model.llm_model_name,
-                    cache_dir=self.config.train_conf.cache_dir
+                    self.model.config.llm_model_name,
                 )
                 self.clean_model.eval()
-            elif self.config.model.use_lora:
+            elif self.model.config.use_lora:
                 self.clean_model = self.llm_no_lora
                 self.clean_tokenizer = self.tokenizer
             else:
@@ -226,7 +224,7 @@ class KGLFMEvaluator:
             self.logger.info("Preparing accelerator...")
         
         # Prepare model and dataloader
-        if self.config.model.tune_language_model:
+        if self.model.config.tune_language_model:
             self.model, self.clean_model, self.dataloader = self.accelerator.prepare(
                 self.model, self.clean_model, self.dataloader
             )
@@ -252,7 +250,7 @@ class KGLFMEvaluator:
             new_logits[batch_pos] = torch.concat(
                 [
                     logits[batch_pos, :pos_kg_token[1][i]+1, :], 
-                    logits[batch_pos, pos_kg_token[1][i] + self.config.model.num_quantizers:, :],
+                    logits[batch_pos, pos_kg_token[1][i] + self.model.config.num_quantizers:, :],
                 ], 
                 dim=0
             )
@@ -281,9 +279,9 @@ class KGLFMEvaluator:
             hit_k_correct = {k: 0 for k in k_values}
             total_objects = 0
             average_num_tokens = 0
-            
+
             with torch.no_grad():
-                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Computing Hit@k metrics", disable=not self.accelerator.is_main_process)):
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc=f"Computing Hit@k metrics for {name}", disable=not self.accelerator.is_main_process)):
                     if self.max_samples and (batch_idx * self.batch_size * self.accelerator.num_processes) >= self.max_samples:
                         break
 
@@ -344,7 +342,7 @@ class KGLFMEvaluator:
                         # Calculate average number of tokens of entire input sequence by summing all position of input_ids which are not padding
                         average_num_tokens += (
                             (batch['attention_mask'][sample_idx] == 1).sum().item() +
-                            torch.sum(batch['input_ids'][sample_idx] == self.model.special_kg_token).item() * self.config.model.num_quantizers
+                            torch.sum(batch['input_ids'][sample_idx] == self.model.special_kg_token).item() * self.model.config.num_quantizers
                         )
 
                         # Compute ranks for each token
