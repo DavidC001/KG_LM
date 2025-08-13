@@ -48,17 +48,17 @@ def train_kg_lfm(config):
         config_obj = load_yaml_config(base_config_path)
         
         # Update the configuration with the sweep parameters
-        config_obj.train_conf.KG_learning_rate = config["KG_learning_rate"]
-        config_obj.train_conf.LLM_learning_rate = config["LLM_learning_rate"]
-        config_obj.train_conf.weight_decay = config["weight_decay"]
         config_obj.model.num_heads = config["num_heads"]
         config_obj.model.num_quantizers = config["num_quantizers"]
         config_obj.model.codebook_size = config["codebook_size"]
-        
+        config_obj.model.lora_r = config["lora_r"]
+        config_obj.model.lora_alpha = config["lora_r"] * 2
+        config_obj.model.lora_target_modules = config["lora_target_modules"]
+
         # Ensure the run name is unique for each trial
         trial_id = str(uuid.uuid4())
-        config_obj.train_conf.run_name = f"{config_obj.train_conf.run_name}_{trial_id}"
-        
+        config_obj.train_conf.run_name = f"RAY_{config_obj.train_conf.run_name}_{trial_id}_{config['lora_r']}_{config['lora_alpha']}_{config['lora_target_modules']}"
+
         logger.info(f"Starting training for trial {trial_id} with config: {config}")
         
         # Initialize Accelerator using config file
@@ -82,8 +82,8 @@ def train_kg_lfm(config):
             config=config_obj, 
             run_name=config_obj.train_conf.run_name,
             resume=False,
-            enable_wandb=False,  # Disable wandb for Ray Tune
-            save_checkpoints=False,  # Let Ray handle checkpoints
+            enable_wandb=True,
+            save_checkpoints=True,
             metrics_tracker=RayTuneMetricsTracker(),
             accelerator=accelerator  # Pass the accelerator we created
         )
@@ -160,11 +160,11 @@ def main():
             ),
             points_to_evaluate=[
                 {
-                    "KG_learning_rate": 5e-4,
-                    "LLM_learning_rate": 1e-4,
-                    "num_heads": 8,
+                    "num_heads": 16,
                     "num_quantizers": 10,
                     "codebook_size": 256,
+                    "lora_r": 16,
+                    "lora_target_modules": ["q_proj", "k_proj"],
                     "base_config": base_config_path
                 },
             ],
@@ -174,16 +174,13 @@ def main():
         
         # Limit concurrency for better performance
         algo = ConcurrencyLimiter(algo, max_concurrent=num_concurrent_trials)
-
-        scheduler = AsyncHyperBandScheduler()
         
         param_space = {
-            "KG_learning_rate": tune.loguniform(1e-4, 1e-3),
-            "LLM_learning_rate": tune.loguniform(1e-4, 1e-3),
-            "weight_decay": tune.loguniform(1e-3, 1e-1),
-            "num_heads": tune.choice([4, 8, 16]),
-            "num_quantizers": tune.choice([4, 8, 10, 16]),
-            "codebook_size": tune.choice([128, 256, 512]),
+            "num_heads": tune.choice([8, 16, 32]),
+            "num_quantizers": tune.choice([5, 10, 20]),
+            "codebook_size": tune.choice([64, 128, 256]),
+            "lora_r": tune.choice([8, 16, 32]),
+            "lora_target_modules": tune.choice([["q_proj", "k_proj", "v_proj"], ["q_proj", "k_proj"], ["all-linear"]]),
             "base_config": base_config_path,
             "time_budget_s": max(time_budget//4, 8*3600-5*60)  # Ensure at least 8 hours for each trial
         }
