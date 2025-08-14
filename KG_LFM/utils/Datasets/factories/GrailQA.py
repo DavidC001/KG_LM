@@ -1,15 +1,9 @@
 import csv
-import json
 import logging
-import tarfile
 from pathlib import Path
-from typing import List, Dict, Tuple, Any
-import networkx as nx
-from tqdm import tqdm
+from typing import List, Any
 from datasets import GeneratorBasedBuilder, SplitGenerator, Split, BuilderConfig, DatasetInfo
 from datasets.features import Features, Value, Sequence
-
-from KG_LFM.utils.SparqlQueryEngine import get_pagerank_map, fetch_neighbors, get_entity_label, freebase_to_wikidata
 
 logger = logging.getLogger(__name__)
 
