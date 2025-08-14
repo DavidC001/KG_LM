@@ -244,7 +244,6 @@ def generate_webqsp(base_path: str | Path, version: int = 1) -> bool:
 
             # Create sentence format
             sentences = to_sentence_format(pageranks, question_text, answer_ids, boundaries, G)
-            print(f"Generated sentences: {sentences} for question {question_id} and entity {entity_id}")
             # Write to CSV
             with open(output_path, "w") as f:
                 writer = csv.DictWriter(
