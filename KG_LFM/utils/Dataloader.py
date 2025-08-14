@@ -122,7 +122,7 @@ class KGLFM_DataLoader:
         self.dataset_name = dataset_config.name
         
         # Load datasets
-        print(f"Loading {dataset_config.name} and TRExStar datasets...")
+        print(f"Loading {dataset_config.name} datasets...")
         
         dataset_factory = {
             "trirex": lambda conf: (
