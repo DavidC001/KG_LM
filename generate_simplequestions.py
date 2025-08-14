@@ -145,7 +145,8 @@ def process_simplequestions_split(
     """Process a single split of the SimpleQuestions dataset."""
     
     with open(split_file, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(tqdm(f, desc=f"Processing {split_name}")):
+        lines = f.readlines()
+        for line_num, line in enumerate(tqdm(lines, desc=f"Processing {split_name}", total=len(lines))):
             data = parse_simplequestions_line(line)
             if not data:
                 print(f"Skipping malformed line {line_num} in {split_name}")
@@ -165,8 +166,9 @@ def process_simplequestions_split(
             question_id = f"{split_name}_{line_num}_{subject_id}"
             
             output_path = sentence_folder_path / f"{question_id}.csv"
-            if output_path.exists():
-                print(f"File {output_path} already exists, skipping")
+            graph_output_path = star_folder_path / f"{question_id}.json"
+            if output_path.exists() and graph_output_path.exists():
+                # print(f"Files {output_path} and {graph_output_path} already exist, skipping")
                 continue
             
             # Get or create graph
@@ -229,10 +231,10 @@ def generate_simplequestions(base_path: str | Path, version: int = 1) -> bool:
     base = Path(base_path)
     
     # Input raw files expected to be provided by the user
-    train_file = base / "annotated_wd_data_train.txt"
-    valid_file = base / "annotated_wd_data_valid.txt"  
-    test_file = base / "annotated_wd_data_test.txt"
-    
+    train_file = base / "annotated_wd_data_train_answerable.txt"
+    valid_file = base / "annotated_wd_data_valid_answerable.txt"
+    test_file = base / "annotated_wd_data_test_answerable.txt"
+
     # Check if at least one input file exists
     input_files = [train_file, valid_file, test_file]
     if not any(f.exists() for f in input_files):
@@ -265,7 +267,7 @@ def generate_simplequestions(base_path: str | Path, version: int = 1) -> bool:
     json_star_directory.mkdir(parents=True, exist_ok=True)
     publish_star_directory.mkdir(parents=True, exist_ok=True)
 
-    pageranks = get_pagerank_map(base_path)
+    pageranks = get_pagerank_map(base)
 
     # Process each split
     splits = [
@@ -298,19 +300,10 @@ def generate_simplequestions(base_path: str | Path, version: int = 1) -> bool:
 def _main():
     parser = argparse.ArgumentParser(description='Generate SimpleQuestions artifacts using a base path.')
     parser.add_argument('--version', type=int, default=1, help='Version number of the dataset (e.g., 1)')
-    parser.add_argument('--base-path', type=str, default=None, help='Base path for dataset artifacts')
+    parser.add_argument('--base-path', type=str, default=None, help='Base path for dataset artifacts', required=True)
     args = parser.parse_args()
 
-    if args.base_path is None:
-        try:
-            from KG_LFM.configuration import ProjectConfig
-            cfg = ProjectConfig()
-            base_path = cfg.dataset.base_path
-        except Exception:
-            print("Base path not provided and config unavailable; please pass --base-path.")
-            return
-    else:
-        base_path = args.base_path
+    base_path = args.base_path
 
     ok = generate_simplequestions(base_path=base_path, version=args.version)
     if not ok:

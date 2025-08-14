@@ -267,19 +267,10 @@ def generate_webqsp(base_path: str | Path, version: int = 1) -> bool:
 def _main():
     parser = argparse.ArgumentParser(description='Generate WebQSP artifacts using a base path.')
     parser.add_argument('--version', type=int, default=1, help='Version number of the dataset (e.g., 1)')
-    parser.add_argument('--base-path', type=str, default=None, help='Base path for dataset artifacts')
+    parser.add_argument('--base-path', type=str, default=None, help='Base path for dataset artifacts', required=True)
     args = parser.parse_args()
 
-    if args.base_path is None:
-        try:
-            from KG_LFM.configuration import ProjectConfig
-            cfg = ProjectConfig()
-            base_path = cfg.dataset.base_path
-        except Exception:
-            print("Base path not provided and config unavailable; please pass --base-path.")
-            return
-    else:
-        base_path = args.base_path
+    base_path = args.base_path
 
     ok = generate_webqsp(base_path=base_path, version=args.version)
     if not ok:
