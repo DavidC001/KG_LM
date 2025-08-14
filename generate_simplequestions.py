@@ -166,7 +166,7 @@ def process_simplequestions_split(
             question_id = f"{split_name}_{line_num}_{subject_id}"
             
             output_path = sentence_folder_path / f"{question_id}.csv"
-            graph_output_path = star_folder_path / f"{question_id}.json"
+            graph_output_path = star_folder_path / f"{subject_id}.json"
             if output_path.exists() and graph_output_path.exists():
                 # print(f"Files {output_path} and {graph_output_path} already exist, skipping")
                 continue
