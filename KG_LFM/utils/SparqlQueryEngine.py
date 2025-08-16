@@ -1,17 +1,64 @@
 import bz2
-import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Generator, Any
+from typing import Dict, Optional
 from urllib.error import HTTPError
 
+import re
 import networkx as nx
 import requests
 from SPARQLWrapper import SPARQLWrapper, JSON
 
-# Can also be local qEndpoint: https://hub.docker.com/r/qacompany/qendpoint-wikidata
+
+# endpoint_url = "https://query.wikidata.org/sparql"  # modern endpoint path
 endpoint_url = "https://query.wikidata.org/bigdata/namespace/wdq/sparql"
+
+def mid_to_qid(mid: str) -> str | None:
+    """
+    Returns the Wikidata Q-ID of an entity given its Freebase ID (P646)
+    :param freebase_id: Freebase ID
+    :return: Wikidata Q-ID or None
+    """
+    freebase_id = f"/m/{mid[2:]}"
+
+    query = f"""
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wikibase: <http://wikiba.se/ontology#>
+            PREFIX bd: <http://www.bigdata.com/rdf#>
+
+            SELECT ?entity WHERE {{
+                ?entity wdt:P646 "{freebase_id}".
+            }}
+        """
+
+    sparql = SPARQLWrapper(endpoint_url)
+    sparql.setQuery(query)
+    sparql.setReturnFormat(JSON)
+
+    results = None
+
+    while True:
+        try:
+            results = sparql.query().convert()
+        except Exception as e:
+            # If exception is HTTPException and code is 429
+            if isinstance(e, HTTPError) and e.code == 429:
+                retry_after = int(e.headers.get("Retry-After", 30))
+                time.sleep(retry_after)
+            else:
+                return None
+        if results:
+            break
+
+    # Extract the Wikidata ID from the query results
+    if results["results"]["bindings"]:
+        wikidata_id = results["results"]["bindings"][0]["entity"]["value"]
+        # Extracting the Q-ID from the full URI
+        return wikidata_id.split('/')[-1]
+    else:
+        return None
 
 
 def clean(label: str):
