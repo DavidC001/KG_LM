@@ -74,37 +74,6 @@ def to_sentence_format(
         })
     return answers
 
-def create_graph_from_datapoint(graph_data: List[Any]) -> nx.Graph:
-    """Create a NetworkX graph from the graph data in the new format"""
-    G = nx.Graph()
-    
-    # Process the first element of the graph data which contains the graph structure
-    graph_info = graph_data[0]
-    
-    # Add nodes and edges based on the graph structure
-    # This is a simplified version - you'll need to adapt it based on your exact graph structure
-    for edge in graph_info.get('edges', []):
-        left_entity = edge.get('leftentityid')
-        right_entity = edge.get('rightentityid')
-        relation_id = edge.get('relationid')
-        
-        if left_entity and right_entity and relation_id:
-            # Add nodes if they don't exist
-            if not G.has_node(left_entity):
-                G.add_node(left_entity)
-            if not G.has_node(right_entity):
-                G.add_node(right_entity)
-            
-            # Add edge
-            G.add_edge(left_entity, right_entity, id=relation_id, label=relation_id)
-    
-    # Set central node if it exists (typically the question variable)
-    for edge in graph_info.get('edges', []):
-        if edge.get('leftentityid') == '?qvar':
-            G.graph['central_node'] = edge.get('rightentityid')
-            break
-    
-    return G
 
 def create_sentence_tar(data_directory: Path, output_tar_file_path: Path):
     # Check if the csv directory exists
