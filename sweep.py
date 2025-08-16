@@ -51,13 +51,10 @@ def train_kg_lfm(config):
         config_obj.model.num_heads = config["num_heads"]
         config_obj.model.num_quantizers = config["num_quantizers"]
         config_obj.model.codebook_size = config["codebook_size"]
-        config_obj.model.lora_r = config["lora_r"]
-        config_obj.model.lora_alpha = config["lora_r"] * 2
-        config_obj.model.lora_target_modules = config["lora_target_modules"]
 
         # Ensure the run name is unique for each trial
         trial_id = str(uuid.uuid4())
-        config_obj.train_conf.run_name = f"RAY_{config_obj.train_conf.run_name}_{trial_id}_{config['lora_r']}_{config['lora_alpha']}_{config['lora_target_modules']}"
+        config_obj.train_conf.run_name = f"RAY_{config_obj.train_conf.run_name}_{trial_id}_{config_obj.model.num_heads}_{config_obj.model.num_quantizers}_{config_obj.model.codebook_size}"
 
         logger.info(f"Starting training for trial {trial_id} with config: {config}")
         
@@ -84,7 +81,7 @@ def train_kg_lfm(config):
             resume=False,
             enable_wandb=True,
             save_checkpoints=True,
-            metrics_tracker=RayTuneMetricsTracker(),
+            metrics_tracker=RayTuneMetricsTracker,
             accelerator=accelerator  # Pass the accelerator we created
         )
         
@@ -139,6 +136,7 @@ def main():
     
     base_config_path = args.base_config
     time_budget = args.time_budget
+    time_budget = max(time_budget//4, 8*3600-5*60)
     num_concurrent_trials = args.num_concurrent_trials
     
     ray.init(
@@ -149,8 +147,16 @@ def main():
     exp_name = "kg_lfm_hyperparameter_sweep"
     path = os.path.join(storage_path, exp_name)
     
+    param_space = {
+        "num_heads": tune.choice([8, 16, 32]),
+        "num_quantizers": tune.choice([5, 10, 20]),
+        "codebook_size": tune.choice([64, 128, 256]),
+        "base_config": base_config_path,
+        "time_budget_s": time_budget  # Ensure at least 8 hours for each trial
+    }
+    
     if tune.Tuner.can_restore(path):
-        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, restart_errored=True, resume_unfinished=False)
+        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, restart_errored=True, resume_unfinished=False, param_space=param_space)
     else:
         algo = OptunaSearch(
             sampler=optuna.samplers.TPESampler(
@@ -163,27 +169,14 @@ def main():
                     "num_heads": 16,
                     "num_quantizers": 10,
                     "codebook_size": 256,
-                    "lora_r": 16,
-                    "lora_target_modules": ["q_proj", "k_proj"],
-                    "base_config": base_config_path
                 },
             ],
-            metric="validation_loss",
+            metric="hit@10",
             mode="min"
         )
         
         # Limit concurrency for better performance
         algo = ConcurrencyLimiter(algo, max_concurrent=num_concurrent_trials)
-        
-        param_space = {
-            "num_heads": tune.choice([8, 16, 32]),
-            "num_quantizers": tune.choice([5, 10, 20]),
-            "codebook_size": tune.choice([64, 128, 256]),
-            "lora_r": tune.choice([8, 16, 32]),
-            "lora_target_modules": tune.choice([["q_proj", "k_proj", "v_proj"], ["q_proj", "k_proj"], ["all-linear"]]),
-            "base_config": base_config_path,
-            "time_budget_s": max(time_budget//4, 8*3600-5*60)  # Ensure at least 8 hours for each trial
-        }
         
         tuner = tune.Tuner(
             trainable=launch_torch_trainer,

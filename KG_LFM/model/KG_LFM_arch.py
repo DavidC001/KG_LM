@@ -180,6 +180,10 @@ class KG_LFMMetaModel(ABC):
             model.llm = AutoModelForCausalLM.from_pretrained(llm_path, trust_remote_code=True)
             if config.use_lora:
                 model.llm = PeftModel.from_pretrained(model.llm, llm_path, trust_remote_code=True)
+                # make require grad True for all parameters in the LoRA layers
+                for name, param in model.llm.named_parameters():
+                    if "lora" in name or config.tune_language_model:
+                        param.requires_grad = True
         else:
             warnings.warn(
                 f"LLM directory not found at {llm_path}. "
