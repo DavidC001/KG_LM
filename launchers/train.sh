@@ -6,7 +6,7 @@
 #SBATCH --account=iscrc_kg-lfm          # account name
 #SBATCH --partition=boost_usr_prod      # partition name
 #SBATCH --gpus-per-node=4               # number of GPUs per node
-#SBATCH --cpus-per-gpu=8                # number of CPU cores per GPU
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=480GB                     # total memory per node
 #SBATCH --chdir=.                       # start from current directory
 #SBATCH --mail-type=END,FAIL            # email notification on job end or failure

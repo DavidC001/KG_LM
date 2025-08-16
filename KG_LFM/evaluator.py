@@ -34,6 +34,95 @@ from accelerate.utils import set_seed, broadcast_object_list
 
 from copy import deepcopy
 
+def align_logits_with_labels(logits: torch.Tensor, labels: torch.Tensor, num_quantizers: int, special_kg_token: int) -> torch.Tensor:
+    """Align logits with labels by removing KG tokens from the GNN."""
+    
+    # if size already matches, return logits
+    if logits.size(1) == labels.size(1):
+        return logits
+    
+    pos_kg_token = torch.where(labels == special_kg_token)
+    new_logits = torch.ones((labels.size(0), labels.size(1), logits.size(2)), dtype=logits.dtype, device=logits.device)
+    
+    # Remove special tokens from GNN
+    for i in range(pos_kg_token[0].size(0)):
+        batch_pos = pos_kg_token[0][i]
+        new_logits[batch_pos] = torch.concat(
+            [
+                logits[batch_pos, :pos_kg_token[1][i]+1, :], 
+                logits[batch_pos, pos_kg_token[1][i] + num_quantizers:, :],
+            ], 
+            dim=0
+        )
+        
+    return new_logits
+
+def compute_hit_k(
+        logits: torch.Tensor, input_ids: torch.Tensor, k_values: List[int],
+        object_boundaries: List[Tuple[int, int]], num_quantizers: int,
+        attention_mask: torch.Tensor, special_token: int, tokenizer
+    ):
+    # Align logits with labels by removing KG tokens
+    logits = align_logits_with_labels(logits, input_ids, num_quantizers, special_token)
+    # Shift for causal LM: predict next token
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+
+    logger = logging.getLogger()
+
+    hit_k_correct = {k: 0 for k in k_values}
+    total_objects = 0
+    average_num_tokens = 0
+
+    # Process each sample in the batch
+    for sample_idx in range(input_ids.size(0)):
+        sample_logits = shift_logits[sample_idx]  # (seq_len, vocab_size)
+        sample_labels = shift_labels[sample_idx]  # (seq_len,)
+        
+        sample_boundaries = object_boundaries[sample_idx]
+        # Get the positions of the object tokens, -1 is because of the shift
+        object_positions = [i for i in range(sample_boundaries[0] - 1, sample_boundaries[1] - 1)]
+        
+        if not object_positions:
+            logger.warning(f"No object tokens found for a sample in batch. Skipping.")
+            continue
+        
+        total_objects += 1
+        
+        # Get logits for the object tokens
+        object_logits = sample_logits[object_positions]  # (num_object_tokens, vocab_size)
+        object_labels = sample_labels[object_positions]  # (num_object_tokens,)
+        
+        # for debugging print the correspondent tokens decoded
+        if logger.isEnabledFor(logging.DEBUG):
+            decoded_tokens = tokenizer.decode(object_labels)
+            logger.debug(f"Decoded tokens for sample: {decoded_tokens}")
+            # decoding from logits
+            decoded_logits = tokenizer.decode(object_logits.argmax(dim=-1))
+            logger.debug(f"Decoded logits for sample: {decoded_logits}")
+        # Calculate average number of tokens of entire input sequence by summing all position of input_ids which are not padding
+        average_num_tokens += (
+            (attention_mask[sample_idx] == 1).sum().item() +
+            torch.sum(input_ids[sample_idx] == special_token).item() * num_quantizers
+        )
+        # Compute ranks for each token
+        token_ranks = []
+        for logits, true_label in zip(object_logits, object_labels):
+            # Get the rank of the true label in the sorted logits (descending order)
+            sorted_indices = torch.argsort(logits, descending=True)
+            rank = (sorted_indices == true_label).nonzero(as_tuple=True)[0].item() + 1  # +1 for 1-based rank
+            token_ranks.append(rank)
+        
+        # Sequence rank is the maximum of all token ranks
+        sequence_rank = max(token_ranks)
+        
+        # Check Hit@k for each k value
+        for k in k_values:
+            if sequence_rank <= k:
+                hit_k_correct[k] += 1
+
+    return hit_k_correct, average_num_tokens, total_objects
+
 class KGLFMEvaluator:
     """Comprehensive evaluator for KG-LFM model."""
     
@@ -234,29 +323,6 @@ class KGLFMEvaluator:
             )
             self.clean_model = self.model  # Use the same model if not tuning
 
-    def _align_logits_with_labels(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Align logits with labels by removing KG tokens from the GNN."""
-        
-        # if size already matches, return logits
-        if logits.size(1) == labels.size(1):
-            return logits
-        
-        pos_kg_token = torch.where(labels == self.model.special_kg_token)
-        new_logits = torch.ones((labels.size(0), labels.size(1), logits.size(2)), dtype=logits.dtype, device=logits.device)
-        
-        # Remove special tokens from GNN
-        for i in range(pos_kg_token[0].size(0)):
-            batch_pos = pos_kg_token[0][i]
-            new_logits[batch_pos] = torch.concat(
-                [
-                    logits[batch_pos, :pos_kg_token[1][i]+1, :], 
-                    logits[batch_pos, pos_kg_token[1][i] + self.model.config.num_quantizers:, :],
-                ], 
-                dim=0
-            )
-            
-        return new_logits
-
     def compute_hit_k_metrics(self, k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, float]:
         """Compute Hit@k metrics for object label prediction.
         
@@ -297,70 +363,27 @@ class KGLFMEvaluator:
                     model_input = {
                         'input_ids': batch['input_ids'],
                         'attention_mask': batch['attention_mask'],
-                        "labels": batch['input_ids'],
                     }
                     if batch['graphs']: model_input['graphs'] = batch['graphs']
 
                     outputs = model(**model_input)
                     # Get logits and labels
                     logits = outputs.logits
-                    labels = batch['input_ids']
-                    
-                    # Align logits with labels by removing KG tokens
-                    logits = self._align_logits_with_labels(logits, labels)
-                    
-                    # Shift for causal LM: predict next token
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    
-                    # Process each sample in the batch
-                    for sample_idx in range(labels.size(0)):
-                        sample_logits = shift_logits[sample_idx]  # (seq_len, vocab_size)
-                        sample_labels = shift_labels[sample_idx]  # (seq_len,)
+                    input_ids = batch['input_ids']
 
-                        sample_boundaries = object_boundaries[sample_idx]
-                        # Get the positions of the object tokens, -1 is because of the shift
-                        object_positions = [i for i in range(sample_boundaries[0] - 1, sample_boundaries[1]-1)]
+                    hit_k_correct, batch_avg_num_tokens, new_objects = compute_hit_k(
+                        logits, input_ids, k_values,
+                        object_boundaries, self.model.config.num_quantizers,
+                        batch['attention_mask'],
+                        special_token=self.model.special_kg_token, tokenizer=self.tokenizer
+                    )
 
-                        if not object_positions:
-                            if self.accelerator.is_main_process:
-                                self.logger.warning(f"No object tokens found for sample {sample_idx} in batch {batch_idx}. Skipping.")
-                            continue
-                        
-                        total_objects += 1
-                        
-                        # Get logits for the object tokens
-                        object_logits = sample_logits[object_positions]  # (num_object_tokens, vocab_size)
-                        object_labels = sample_labels[object_positions]  # (num_object_tokens,)
-                        
-                        
-                        # for debugging print the correspondent tokens decoded
-                        if self.accelerator.is_main_process and self.logger.isEnabledFor(logging.DEBUG):
-                            decoded_tokens = self.tokenizer.decode(object_labels)
-                            self.logger.debug(f"Decoded tokens for sample {sample_idx} in batch {batch_idx}: {decoded_tokens}")
+                    average_num_tokens += batch_avg_num_tokens
+                    total_objects += new_objects
 
-                        # Calculate average number of tokens of entire input sequence by summing all position of input_ids which are not padding
-                        average_num_tokens += (
-                            (batch['attention_mask'][sample_idx] == 1).sum().item() +
-                            torch.sum(batch['input_ids'][sample_idx] == self.model.special_kg_token).item() * self.model.config.num_quantizers
-                        )
+                    for k in k_values:
+                        hit_k_correct[k] += hit_k_correct[k]
 
-                        # Compute ranks for each token
-                        token_ranks = []
-                        for logits, true_label in zip(object_logits, object_labels):
-                            # Get the rank of the true label in the sorted logits (descending order)
-                            sorted_indices = torch.argsort(logits, descending=True)
-                            rank = (sorted_indices == true_label).nonzero(as_tuple=True)[0].item() + 1  # +1 for 1-based rank
-                            token_ranks.append(rank)
-                        
-                        # Sequence rank is the maximum of all token ranks
-                        sequence_rank = max(token_ranks)
-                        
-                        # Check Hit@k for each k value
-                        for k in k_values:
-                            if sequence_rank <= k:
-                                hit_k_correct[k] += 1
-            
             # Gather hit counts and total objects from all processes
             hit_k_tensors = {}
             for k in k_values:
