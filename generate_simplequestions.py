@@ -60,6 +60,10 @@ def to_sentence_format(
 ) -> List[Dict]:
     """Convert SimpleQuestions format to sentence format."""
     central_node_id = G.graph['central_node']
+    if central_node_id != subject_id:
+        print(f"Subject node {subject_id} not found in graph")
+        return []
+
     central_node = G.nodes[central_node_id]
     central_node_label = central_node.get('label')
     central_node_rank = central_node.get('rank')
@@ -178,19 +182,13 @@ def process_simplequestions_split(
                 print(f"Graph could not be fetched for entity {subject_id}")
                 continue
             
-            # Save graph as JSON
-            star_entity_path = star_folder_path / f"{subject_id}.json"
-            if not star_entity_path.exists():
-                graph_json_data = nx.node_link_data(G)
-                with open(star_entity_path, 'w') as f:
-                    json.dump(graph_json_data, f, indent=4)
-            
             # Get subject label for boundary detection
             subject_node = G.nodes.get(subject_id)
             if subject_node:
                 subject_label = subject_node.get('label', subject_id)
             else:
-                subject_label = get_entity_label(subject_id) or subject_id
+                print(f"Subject node {subject_id} not found in graph")
+                continue
             
             # Find entity boundaries
             boundaries = find_entity_boundaries_in_question(question, subject_label)
@@ -204,6 +202,13 @@ def process_simplequestions_split(
             if not sentences:
                 print(f"No valid sentences generated for line {line_num}")
                 continue
+            
+            # Save graph as JSON
+            star_entity_path = star_folder_path / f"{subject_id}.json"
+            if not star_entity_path.exists():
+                graph_json_data = nx.node_link_data(G)
+                with open(star_entity_path, 'w') as f:
+                    json.dump(graph_json_data, f, indent=4)
             
             # Write to CSV
             with open(output_path, "w") as f:
