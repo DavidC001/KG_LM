@@ -8,11 +8,11 @@ dataset:
   preload_nodes_embeddings: False
 
 train_conf:
-  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/trirex-KG_LFM-new/best_model"
+  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/trirex-QA-15-256/best_model"
 
   dataloader:
     shuffle: True
-    num_workers: 1
+    num_workers: 0
 
     include_graphs: True
     return_tensors: "pt"

@@ -9,7 +9,7 @@ def none_or_int(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate KG-LFM model")
-    parser.add_argument("--config", type=str, default="configs/pretrain_config.yaml",
+    parser.add_argument("--config", type=str, default="configs/base_config.yaml",
                        help="Path to the configuration file")
     parser.add_argument("--output_file", type=str, default="eval/out.json",
                        help="Path to save evaluation results JSON")

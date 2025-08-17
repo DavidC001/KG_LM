@@ -127,7 +127,7 @@ def main(config: ProjectConfig):
     
 if __name__ == "__main__":
     parser = ArgumentParser(description="Create Hugging Face datasets for Tri-REx and WebQSP.")
-    parser.add_argument("--config", type=str, default="configs/pretrain_config.yaml", help="Path to YAML config file")
+    parser.add_argument("--config", type=str, default="configs/base_config.yaml", help="Path to YAML config file")
     parser.add_argument("--lite", action="store_true", help="Create lite dataset")
     parser.add_argument("--full", action="store_true", help="Create full dataset")
 
