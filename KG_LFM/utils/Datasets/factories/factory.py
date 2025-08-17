@@ -131,6 +131,11 @@ def grailqa_factory(conf: DatasetConfig) -> Tuple[Dataset, Dataset, Dataset, Dic
         data = json.loads(datapoint['json'])
         graphs[datapoint['entity']] = nx.node_link_graph(data)
 
+    # filter out all samples from dataset which do not have a graph
+    train_dataset = train_dataset.filter(lambda x: x['subject']['id'] in graphs)
+    validation_dataset = validation_dataset.filter(lambda x: x['subject']['id'] in graphs)
+    test_dataset = test_dataset.filter(lambda x: x['subject']['id'] in graphs)
+
     return (train_dataset, validation_dataset, test_dataset), graphs
 
 
@@ -154,5 +159,10 @@ def simplequestions_factory(conf: DatasetConfig) -> Tuple[Tuple[Dataset, Dataset
     for datapoint in tqdm(simplequestions_star_builder.as_dataset(split="all"), desc="Loading SimpleQuestions nx graphs"):
         data = json.loads(datapoint['json'])
         graphs[datapoint['entity']] = nx.node_link_graph(data)
+
+    # filter out all samples from dataset which do not have a graph
+    train_dataset = train_dataset.filter(lambda x: x['subject']['id'] in graphs)
+    validation_dataset = validation_dataset.filter(lambda x: x['subject']['id'] in graphs)
+    test_dataset = test_dataset.filter(lambda x: x['subject']['id'] in graphs)
 
     return (train_dataset, validation_dataset, test_dataset), graphs
