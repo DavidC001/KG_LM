@@ -69,8 +69,7 @@ class KGEncoder(nn.Module):
         # adapter layer with spectral normalization for stability
         self.adapter = nn.Linear(node_embedding_dim, node_embedding_dim)
         self.dropout = nn.Dropout(dropout)
-        self.edge_dropout = nn.Dropout(dropout * 0.5)  # Edge-specific dropout
-        self.attention_dropout = nn.Dropout(dropout * 0.3)  # Attention dropout
+        self.num_quantizers = num_quantizers
 
         # normalization layer
         self.norm = nn.LayerNorm(node_embedding_dim)
@@ -114,17 +113,14 @@ class KGEncoder(nn.Module):
         edge_attr = edge_attr.to(self.conv.lin_l.weight.device)
         
         logging.debug("Moved tensors")
-        
-        # Apply edge dropout before GATv2Conv
+
+        # edge and node dropout
         if self.training:
-            edge_attr = self.edge_dropout(edge_attr)
-        
+            edge_attr = self.dropout(edge_attr)
+            x = self.dropout(x)
+
         # Apply GATv2Conv
         x = self.conv(x, edge_index, edge_attr)
-        
-        # Apply attention dropout after GAT
-        if self.training:
-            x = self.attention_dropout(x)
         
         logging.debug("Applied GATv2Conv")
         
@@ -154,7 +150,6 @@ class KGEncoder(nn.Module):
         x = self.norm(x)
 
         # ugly solution to problem of vector quantization not working with half precision
-        original_dtype = x.dtype
         x = x.float()
         self.vq.float()
         
@@ -163,11 +158,21 @@ class KGEncoder(nn.Module):
         commit_loss = commit_loss.flatten().mean()
         loss = commit_loss + residual_loss
 
-        # all codes is (quant, B, ...) we want B to be first
-        all_codes = all_codes.permute(1, 0, 2)
+        dtype = self.output_projection.weight.dtype
 
-        all_codes = all_codes.to(original_dtype)
-        tokens = self.dropout(all_codes)
+        all_codes = all_codes.to(dtype=dtype)
+
+        # apply the STE trick to get gradients to the encoder
+        residual = x.to(dtype=dtype)
+        tokens = []
+        for i in range(self.num_quantizers):
+            tokens.append( x + (all_codes[i] - x).detach())
+            residual = residual - all_codes[i].detach()
+
+        tokens = torch.stack(tokens) # (num_quantizers, B, dim)
+        tokens = tokens.permute(1, 0, 2)  # (B, num_quantizers, dim)
+        tokens = tokens.to(dtype=dtype)  # Ensure tokens have the correct dtype
+        tokens = self.dropout(tokens)
         tokens = self.output_projection(tokens)
         
         # Normalize the quantized output
