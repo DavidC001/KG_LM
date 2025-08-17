@@ -318,11 +318,12 @@ class KG_LFMMetaForCausalLM(ABC):
                 None, # Return standard embeddings
                 labels,
                 RVQ_loss,
+                None  # No indices for graph embeddings
             )
 
         logging.debug(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
         # Encode the knowledge graphs into embeddings that will replace KG tokens
-        graph_features, _, RVQ_loss = self.encode_graphs(graphs)
+        graph_features, indices, RVQ_loss = self.encode_graphs(graphs)
         graph_features = graph_features.to(self.llm.dtype)
         processed_graph = 0
         
@@ -517,6 +518,7 @@ class KG_LFMMetaForCausalLM(ABC):
             new_input_embeds_padded,  # The main output: text + graph embeddings
             new_labels,
             RVQ_loss,  # Return the RVQ loss for training purposes
+            indices
         )
     
     @torch.inference_mode()
@@ -546,6 +548,7 @@ class KG_LFMMetaForCausalLM(ABC):
             attention_mask,
             _,
             inputs_embeds,
+            _,
             _,
             _
         ) = self.prepare_inputs_labels_for_multimodal(
@@ -678,7 +681,8 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                RVQ_loss
+                RVQ_loss,
+                indices
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -710,6 +714,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         # If RVQ_loss is not None, add it to the model's loss for training
         if return_dict:
             out["RVQ_loss"] = RVQ_loss
+            out["RVQ_indices"] = indices
         else:
             out = (out[0] + RVQ_loss,) + out[1:]
             

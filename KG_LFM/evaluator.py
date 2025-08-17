@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
 import gc
+import torch, logging
+from typing import List, Tuple
 
 import torch
 from tqdm.auto import tqdm
@@ -58,70 +60,82 @@ def align_logits_with_labels(logits: torch.Tensor, labels: torch.Tensor, num_qua
     return new_logits
 
 def compute_hit_k(
-        logits: torch.Tensor, input_ids: torch.Tensor, k_values: List[int],
-        object_boundaries: List[Tuple[int, int]], num_quantizers: int,
-        attention_mask: torch.Tensor, special_token: int, tokenizer
-    ):
-    # Align logits with labels by removing KG tokens
-    logits = align_logits_with_labels(logits, input_ids, num_quantizers, special_token)
-    # Shift for causal LM: predict next token
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = input_ids[..., 1:].contiguous()
-
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    k_values: List[int],
+    object_boundaries: List[Tuple[int, int]],
+    num_quantizers: int,
+    attention_mask: torch.Tensor,
+    special_token: int,
+    tokenizer
+):
     logger = logging.getLogger()
 
-    hit_k_correct = {k: 0 for k in k_values}
-    total_objects = 0
-    average_num_tokens = 0
+    # 1) Align & shift for causal LM
+    logits = align_logits_with_labels(logits, input_ids, num_quantizers, special_token)
+    shift_logits = logits[..., :-1, :]           # (B, L-1, V)
+    shift_labels = input_ids[..., 1:]            # (B, L-1)
+    B, Lm1, V = shift_logits.shape
+    device = shift_logits.device
 
-    # Process each sample in the batch
-    for sample_idx in range(input_ids.size(0)):
-        sample_logits = shift_logits[sample_idx]  # (seq_len, vocab_size)
-        sample_labels = shift_labels[sample_idx]  # (seq_len,)
-        
-        sample_boundaries = object_boundaries[sample_idx]
-        # Get the positions of the object tokens, -1 is because of the shift
-        object_positions = [i for i in range(sample_boundaries[0] - 1, sample_boundaries[1] - 1)]
-        
-        if not object_positions:
-            logger.warning(f"No object tokens found for a sample in batch. Skipping.")
+    # 2) Build a boolean mask for object token positions (shifted by -1 due to causal LM)
+    object_mask = torch.zeros((B, Lm1), dtype=torch.bool, device=device)
+    for b, (start, end) in enumerate(object_boundaries):
+        # Shift boundaries by -1 since we're working with shift_logits and shift_labels
+        # which are offset by 1 position due to causal LM prediction
+        if start is None or end is None:
+            logger.warning(f"Invalid object boundaries for sample {b}: start={start}, end={end}")
             continue
+            
+        s = max(0, start - 1)  # shift start by -1, ensure >= 0
+        e = min(Lm1, max(start, end - 1))  # shift end by -1, ensure <= Lm1, and >= start
         
-        total_objects += 1
-        
-        # Get logits for the object tokens
-        object_logits = sample_logits[object_positions]  # (num_object_tokens, vocab_size)
-        object_labels = sample_labels[object_positions]  # (num_object_tokens,)
-        
-        # for debugging print the correspondent tokens decoded
-        if logger.isEnabledFor(logging.DEBUG):
-            decoded_tokens = tokenizer.decode(object_labels)
-            logger.debug(f"Decoded tokens for sample: {decoded_tokens}")
-            # decoding from logits
-            decoded_logits = tokenizer.decode(object_logits.argmax(dim=-1))
-            logger.debug(f"Decoded logits for sample: {decoded_logits}")
-        # Calculate average number of tokens of entire input sequence by summing all position of input_ids which are not padding
-        average_num_tokens += (
-            (attention_mask[sample_idx] == 1).sum().item() +
-            torch.sum(input_ids[sample_idx] == special_token).item() * num_quantizers
-        )
-        # Compute ranks for each token
-        token_ranks = []
-        for logits, true_label in zip(object_logits, object_labels):
-            # Get the rank of the true label in the sorted logits (descending order)
-            sorted_indices = torch.argsort(logits, descending=True)
-            rank = (sorted_indices == true_label).nonzero(as_tuple=True)[0].item() + 1  # +1 for 1-based rank
-            token_ranks.append(rank)
-        
-        # Sequence rank is the maximum of all token ranks
-        sequence_rank = max(token_ranks)
-        
-        # Check Hit@k for each k value
-        for k in k_values:
-            if sequence_rank <= k:
-                hit_k_correct[k] += 1
+        if s < e:
+            object_mask[b, s:e] = True
+        else:
+            logger.warning(f"No valid object tokens found for sample {b} after shifting: start={start}->{s}, end={end}->{e}")
 
-    return hit_k_correct, average_num_tokens, total_objects
+    has_object = object_mask.any(dim=1)          # (B,)
+    total_objects = int(has_object.sum().item())
+
+    # 3) (Same semantics as your running sum; caller can divide later if needed)
+    tot_num_tokens = int(
+        attention_mask.eq(1).sum().item()
+        + input_ids.eq(special_token).sum().item() * num_quantizers
+    )
+
+    if total_objects == 0:
+        return {k: 0 for k in k_values}, tot_num_tokens, total_objects
+
+    with torch.no_grad():
+        # 4) True logits and vectorized rank computation
+        #     true_logits: (B, L-1)
+        true_logits = shift_logits.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+        #     ranks: 1 + count of logits strictly greater than the true logit
+        ranks = 1 + (shift_logits > true_logits.unsqueeze(-1)).sum(dim=-1)  # (B, L-1), int64
+
+        # 5) Sequence-level rank = max rank across object positions
+        big = torch.iinfo(ranks.dtype).max
+        seq_ranks = torch.full((B,), big, dtype=ranks.dtype, device=device)
+        # Mask out non-object positions to 0 so max() only sees object tokens
+        masked_max = ranks.masked_fill(~object_mask, 0).amax(dim=1)
+        seq_ranks = torch.where(has_object, masked_max, seq_ranks)          # (B,)
+
+    # 6) Hit@k counts (sequence is a hit if its max rank <= k)
+    k_values_sorted = sorted(set(k_values))
+    hit_k_batch_correct = {k: int((seq_ranks <= k).sum().item()) for k in k_values_sorted}
+
+    # Optional: debug decode (kept cheap; only runs if DEBUG is enabled)
+    if logger.isEnabledFor(logging.DEBUG):
+        for b in range(B):
+            if has_object[b]:
+                obj_pos = object_mask[b]
+                labels_b = shift_labels[b][obj_pos]
+                logits_b = shift_logits[b][obj_pos]
+                logger.debug(f"Decoded tokens[{b}]: {tokenizer.batch_decode(labels_b.tolist())}")
+                logger.debug(f"Decoded argmax[{b}]: {tokenizer.batch_decode(logits_b.argmax(dim=-1).tolist())}")
+
+    return hit_k_batch_correct, tot_num_tokens, total_objects
 
 class KGLFMEvaluator:
     """Comprehensive evaluator for KG-LFM model."""
@@ -303,7 +317,10 @@ class KGLFMEvaluator:
             tokenizer=self.tokenizer,
             split=split
         )
-        
+
+        # disable shuffling for evaluation
+        self.dataloader.shuffle = False
+
         if self.accelerator.is_main_process:
             self.logger.info(f"Data loader setup complete. {len(self.dataloader)} batches available.")
     
@@ -371,7 +388,7 @@ class KGLFMEvaluator:
                     logits = outputs.logits
                     input_ids = batch['input_ids']
 
-                    hit_k_correct, batch_avg_num_tokens, new_objects = compute_hit_k(
+                    hit_k_correct_batch, batch_avg_num_tokens, new_objects = compute_hit_k(
                         logits, input_ids, k_values,
                         object_boundaries, self.model.config.num_quantizers,
                         batch['attention_mask'],
@@ -382,7 +399,7 @@ class KGLFMEvaluator:
                     total_objects += new_objects
 
                     for k in k_values:
-                        hit_k_correct[k] += hit_k_correct[k]
+                        hit_k_correct[k] += hit_k_correct_batch[k]
 
             # Gather hit counts and total objects from all processes
             hit_k_tensors = {}

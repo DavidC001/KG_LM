@@ -319,7 +319,7 @@ class KG_LFM_Trainer:
 
     def compute_val_metrics(
             self, 
-            language_loss: torch.Tensor, RVQ_loss: torch.Tensor, 
+            language_loss: torch.Tensor, RVQ_loss: torch.Tensor,
             logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor,
             object_boundaries: List[Tuple[int]]
         ) -> Dict[str, float]:
@@ -347,7 +347,7 @@ class KG_LFM_Trainer:
             f"Hit@{k}": v / total_objects if total_objects > 0 else 0
             for k, v in hit_k_correct.items()
         }
-
+        
         metrics = {
             'language_loss': language_loss_val,
             'RVQ_loss': RVQ_loss_val,
@@ -364,7 +364,8 @@ class KG_LFM_Trainer:
         # Calculate number of batches to process instead of samples
         total_batches = len(dataloader)
         num_batches = max(1, int(total_batches * percentage_eval))
-        
+        codebook_indices_seen = [set() for _ in range(self.config.model.num_quantizers)]
+
         self.logger.info(f"Evaluating {num_batches}/{total_batches} batches ({num_batches/total_batches*100:.1f}%)")
         
         with torch.no_grad():
@@ -372,31 +373,33 @@ class KG_LFM_Trainer:
                 if batch_idx >= num_batches:
                     break
                     
-                # try:
-                # DeepSpeed handles mixed precision automatically 
-                outputs = self.model(
-                    input_ids=batch['input_ids'],
-                    graphs=batch['graphs'],
-                    attention_mask=batch['attention_mask'],
-                    labels=batch['labels'],
-                    use_cache=False,
-                )
-                
-                metrics = self.compute_val_metrics(
-                    outputs.loss, outputs.RVQ_loss,
-                    outputs.logits, batch['input_ids'], 
-                    batch['attention_mask'],
-                    [batch['objects'][i]['token_boundaries'] for i in range(len(batch['objects']))]
-                )
-                self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                try:
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        graphs=batch['graphs'],
+                        attention_mask=batch['attention_mask'],
+                        labels=batch['labels'],
+                        use_cache=False,
+                    )
                     
-                # except Exception as e:
-                #     self.logger.info(f"Error in evaluation batch {batch_idx}: {e}")
-                #     # Clear cache on error
-                #     self.clear_memory()
-                #     # Ensure synchronization even on error
-                #     self.accelerator.wait_for_everyone()
-                #     continue
+                    metrics = self.compute_val_metrics(
+                        outputs.loss, outputs.RVQ_loss,
+                        outputs.logits, batch['input_ids'],
+                        batch['attention_mask'],
+                        [batch['objects'][i]['token_boundaries'] for i in range(len(batch['objects']))]
+                    )
+                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
+
+                    for i in range(self.config.model.num_quantizers):
+                        codebook_indices_seen[i].update(outputs.RVQ_indices[:, i].tolist())
+
+                except Exception as e:
+                    self.logger.info(f"Error in evaluation batch {batch_idx}: {e}")
+                    # Clear cache on error
+                    self.clear_memory()
+                    # Ensure synchronization even on error
+                    self.accelerator.wait_for_everyone()
+                    continue
         
         # Final cleanup
         self.clear_memory()
@@ -404,7 +407,19 @@ class KG_LFM_Trainer:
         
         averages = self.metrics_tracker.get_averages()
         self.metrics_tracker.reset()  # Reset tracker for next evaluation
-        
+
+        vocab_size = self.config.model.codebook_size
+        codebook_utilization = {
+            f"codebook/codebook_utilization_{i}": len(codebook_indices_seen[i]) / vocab_size
+            for i in range(self.config.model.num_quantizers)
+        }
+        overall_codebook_utilization = sum(codebook_utilization.values()) / self.config.model.num_quantizers
+
+        averages.update({
+            "codebook/overall_codebook_utilization": overall_codebook_utilization,
+            **codebook_utilization
+        })
+
         return averages
 
     def train_step(self):
@@ -480,19 +495,27 @@ class KG_LFM_Trainer:
                     total_CE_loss += language_loss / self.grad_accumulation_steps
                     self.accelerator.backward(loss)
                 
+                if self.accelerator.sync_gradients: # TRUE when accumulating gradients
+
+                    if self.clip_grad_norm > 0:
+                        norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+
+                    metrics = self.compute_train_metrics(total_RVQ_loss, total_CE_loss)
+                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    
+                    log_metrics = {
+                        f"train/{k}": v for k, v in metrics.items()
+                    }
+                    log_metrics["train/clip_grad_norm"] = norm if self.clip_grad_norm > 0 else 0.0
+                    self.accelerator.log(log_metrics, step=self.global_step)
+                    
+                    total_CE_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                    total_RVQ_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                    
                 # does NOTHING when using deepspeed
                 self.optimizer.step() 
                 self.optimizer.zero_grad()
                 
-                if self.accelerator.sync_gradients: # TRUE when accumulating gradients
-                    # update global step and logging
-                    metrics = self.compute_train_metrics(total_RVQ_loss, total_CE_loss)
-                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    log_metrics = {
-                        f"train/{k}": v for k, v in metrics.items()
-                    }
-                    self.accelerator.log(log_metrics, step=self.global_step)
-
                 self.global_step += 1
                 progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
                 progress_bar.update(1)
