@@ -9,7 +9,7 @@ from transformers import PreTrainedTokenizer
 
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
+from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN, IGNORE_INDEX
 
 from torch_geometric.data import Data
 
@@ -43,7 +43,7 @@ class WebQSPDataset(Dataset):
             self.tokenizer.add_special_tokens({'additional_special_tokens': [SPECIAL_KG_TOKEN]})
 
     def __len__(self) -> int:
-        return len(self.trirex_dataset)
+        return len(self.webqsp_dataset)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
@@ -63,16 +63,7 @@ class WebQSPDataset(Dataset):
         sample = self.webqsp_dataset[idx]
 
         # add to the question a special token for graph embedding after the subject
-        subject_boundaries = sample['subject']['boundaries']
-        start_subject = subject_boundaries[0]
-        end_subject = subject_boundaries[1]
-
-        # Insert SPECIAL_KG_TOKEN after the subject
-        sample['question'] = (
-            sample['question'][:end_subject] +
-            SPECIAL_KG_TOKEN +
-            sample['question'][end_subject:]
-        )
+        subject_text = sample['subject']['label']
 
         result = {
             'subject': sample['subject'],
@@ -93,19 +84,25 @@ class WebQSPDataset(Dataset):
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
         
+        
+        result["conversation"]=[
+            {
+                'role': 'user',
+                'content': sample['question']
+            },
+            {
+                'role': 'tool' if "tool" in self.tokenizer.chat_template else 'assistant',
+                'content': subject_text + SPECIAL_KG_TOKEN
+            },
+            {
+                'role': 'assistant',
+                'content': sample['answer']
+            }
+        ]
         # if tokenizer has chat template, use it
         try:
             sentence = self.tokenizer.apply_chat_template(
-                conversation=[
-                    {
-                        'role': 'user',
-                        'content': sample['question']
-                    },
-                    {
-                        'role': 'assistant',
-                        'content': sample['answer']
-                    }
-                ],
+                conversation=result["conversation"],
                 tokenize=False,
                 add_generation_prompt=False,
                 enable_thinking=False,
@@ -114,28 +111,35 @@ class WebQSPDataset(Dataset):
         except ValueError:
             print("Tokenizer does not support chat templates. Using fallback method.")
             # Fallback for tokenizers without chat template support
-            sentence = "Question: " + sample['question'] + " Answer: " + sample['answer']
-        
+            sentence = f"user: {sample['question']} \ntool: {subject_text}{SPECIAL_KG_TOKEN}  \nassistant: {sample['answer']}"
         result['sentence'] = sentence
         
         # find the index of the answer in the sentence
         answer_start = sentence.find(sample['answer'])
         if answer_start == -1:
             raise ValueError("Answer not found in the tokenized sentence.")
-        
         # Adjust the start and end indices of the object boundaries
         result['object']['boundaries'] = [
             answer_start,
             answer_start + len(sample['answer'])
         ]
-        
+
         tokenized = self.tokenizer(
             sentence,
             return_tensors='pt'
         )
         result['input_ids'] = tokenized['input_ids'].squeeze(0)
         result['attention_mask'] = tokenized['attention_mask'].squeeze(0)
-            
+        
+        # compute labels by masking everything except for the object
+        tok_obj_start = tokenized.char_to_token(result['object']['boundaries'][0])
+        tok_obj_end = tokenized.char_to_token(result['object']['boundaries'][1])
+        result["object"]["token_boundaries"] = (tok_obj_start, tok_obj_end)
+
+        labels = torch.full(result['input_ids'].shape, IGNORE_INDEX, dtype=result['input_ids'].dtype)
+        labels[tok_obj_start:tok_obj_end] = result['input_ids'][tok_obj_start:tok_obj_end]
+        result['labels'] = labels
+
         return result
     
     def _process_graph(self, graph: nx.DiGraph) -> Data:

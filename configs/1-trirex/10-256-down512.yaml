@@ -1,40 +1,39 @@
 seed: 42
 
 dataset:
-  name: "web-qsp"
+  name: "trirex"
   lite: False
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM/graph_embs"
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "KG_LFM"
+  run_name: "trirex-KG-LFM-10-256-down512"
     
   epochs: 10
-  early_stopping_patience: 4
-  scheduler_patience: 2
-  steps_train: 0.25  # 33% of the training set
-  eval_perc: 0.5
+  early_stopping_patience: 2
+  scheduler_patience: 1
+  steps_train: 8192
+  eval_perc: 0.25
 
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 2 # more randomness
   clip_grad_norm: 1.0
 
-  KG_learning_rate: 1e-5
+  KG_learning_rate: 1e-4
   LLM_learning_rate: 1e-5
   weight_decay: 0.01
 
-  rvq_loss_weight: 0.25
+  rvq_loss_weight: 0.5
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
   
-  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/pre-KG_LFM/best_model"
   resume : True
 
   dataloader:
     batch_size: 8
     shuffle: True
-    num_workers: 1
+    num_workers: 2
 
     include_graphs: True
     return_tensors: "pt"
@@ -47,12 +46,13 @@ model:
   llm_model_name: "Qwen/Qwen3-8B"
   
   # Graph Encoder Configuration
-  graph_pooling: True
+  graph_pooling: False
 
   dropout: 0.2  
   num_heads: 16
   num_quantizers: 10
   codebook_size: 256
+  codebook_dim: 512
   shared_codebook: False
   
   # Training Configuration

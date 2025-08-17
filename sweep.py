@@ -48,17 +48,14 @@ def train_kg_lfm(config):
         config_obj = load_yaml_config(base_config_path)
         
         # Update the configuration with the sweep parameters
-        config_obj.train_conf.KG_learning_rate = config["KG_learning_rate"]
-        config_obj.train_conf.LLM_learning_rate = config["LLM_learning_rate"]
-        config_obj.train_conf.weight_decay = config["weight_decay"]
         config_obj.model.num_heads = config["num_heads"]
         config_obj.model.num_quantizers = config["num_quantizers"]
         config_obj.model.codebook_size = config["codebook_size"]
-        
+
         # Ensure the run name is unique for each trial
         trial_id = str(uuid.uuid4())
-        config_obj.train_conf.run_name = f"{config_obj.train_conf.run_name}_{trial_id}"
-        
+        config_obj.train_conf.run_name = f"RAY_{config_obj.train_conf.run_name}_{trial_id}_{config_obj.model.num_heads}_{config_obj.model.num_quantizers}_{config_obj.model.codebook_size}"
+
         logger.info(f"Starting training for trial {trial_id} with config: {config}")
         
         # Initialize Accelerator using config file
@@ -82,9 +79,9 @@ def train_kg_lfm(config):
             config=config_obj, 
             run_name=config_obj.train_conf.run_name,
             resume=False,
-            enable_wandb=False,  # Disable wandb for Ray Tune
-            save_checkpoints=False,  # Let Ray handle checkpoints
-            metrics_tracker=RayTuneMetricsTracker(),
+            enable_wandb=True,
+            save_checkpoints=True,
+            metrics_tracker=RayTuneMetricsTracker,
             accelerator=accelerator  # Pass the accelerator we created
         )
         
@@ -139,6 +136,7 @@ def main():
     
     base_config_path = args.base_config
     time_budget = args.time_budget
+    time_budget = max(time_budget//4, 8*3600-5*60)
     num_concurrent_trials = args.num_concurrent_trials
     
     ray.init(
@@ -149,8 +147,16 @@ def main():
     exp_name = "kg_lfm_hyperparameter_sweep"
     path = os.path.join(storage_path, exp_name)
     
+    param_space = {
+        "num_heads": tune.choice([8, 16, 32]),
+        "num_quantizers": tune.choice([5, 10, 20]),
+        "codebook_size": tune.choice([64, 128, 256]),
+        "base_config": base_config_path,
+        "time_budget_s": time_budget  # Ensure at least 8 hours for each trial
+    }
+    
     if tune.Tuner.can_restore(path):
-        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, restart_errored=True, resume_unfinished=False)
+        tuner = tune.Tuner.restore(path, trainable=launch_torch_trainer, restart_errored=True, resume_unfinished=False, param_space=param_space)
     else:
         algo = OptunaSearch(
             sampler=optuna.samplers.TPESampler(
@@ -160,33 +166,17 @@ def main():
             ),
             points_to_evaluate=[
                 {
-                    "KG_learning_rate": 5e-4,
-                    "LLM_learning_rate": 1e-4,
-                    "num_heads": 8,
+                    "num_heads": 16,
                     "num_quantizers": 10,
                     "codebook_size": 256,
-                    "base_config": base_config_path
                 },
             ],
-            metric="validation_loss",
+            metric="hit@10",
             mode="min"
         )
         
         # Limit concurrency for better performance
         algo = ConcurrencyLimiter(algo, max_concurrent=num_concurrent_trials)
-
-        scheduler = AsyncHyperBandScheduler()
-        
-        param_space = {
-            "KG_learning_rate": tune.loguniform(1e-4, 1e-3),
-            "LLM_learning_rate": tune.loguniform(1e-4, 1e-3),
-            "weight_decay": tune.loguniform(1e-3, 1e-1),
-            "num_heads": tune.choice([4, 8, 16]),
-            "num_quantizers": tune.choice([4, 8, 10, 16]),
-            "codebook_size": tune.choice([128, 256, 512]),
-            "base_config": base_config_path,
-            "time_budget_s": max(time_budget//4, 8*3600-5*60)  # Ensure at least 8 hours for each trial
-        }
         
         tuner = tune.Tuner(
             trainable=launch_torch_trainer,

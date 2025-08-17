@@ -9,7 +9,7 @@ def none_or_int(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate KG-LFM model")
-    parser.add_argument("--config", type=str, default="configs/pretrain_config.yaml",
+    parser.add_argument("--config", type=str, default="configs/base_config.yaml",
                        help="Path to the configuration file")
     parser.add_argument("--output_file", type=str, default="eval/out.json",
                        help="Path to save evaluation results JSON")
@@ -19,15 +19,16 @@ def main():
                        help="Batch size for evaluation")
     parser.add_argument("--max_samples", type=none_or_int, default=None,
                        help="Maximum number of samples to evaluate (for quick testing)")
-    
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug mode")
+
     args = parser.parse_args()
     
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.INFO if not args.debug else logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(f'logs/eval.log'),
-            logging.StreamHandler()
+            logging.StreamHandler() if args.debug else logging.FileHandler(f'logs/eval.log')
         ]
     )
     

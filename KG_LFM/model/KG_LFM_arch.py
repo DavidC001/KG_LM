@@ -42,24 +42,40 @@ class KG_LFMConfig(AutoConfig):
     
     model_type = "kg_lfm"
     llm_model_name: str = "Qwen/Qwen3-8B"
-    
-    node_embedding_dim: int = 1024  # Dimension of node embeddings
-    edge_embedding_dim: int = 1024  # Dimension of edge embeddings
-    graph_pooling: bool = True  # Whether to apply global mean pooling to the graph representations
-    
-    dropout: float = 0.2  # Dropout rate for the model
-    num_heads: int = 1  # Number of attention heads in GATv2Conv
-    num_quantizers: int = 3  # Number of quantizers for residual vector quantization
-    
-    codebook_size: int = 512  # Size of the codebook for vector quantization
-    shared_codebook: bool = False  # Whether to use a shared codebook across quantizers
-    
-    tune_language_model: bool = False  # Whether to tune the language model
-    tune_kg_encoder: bool = False  # Whether to tune the knowledge graph encoder
-    
-    use_lora: bool = True  # Whether to use LoRA for training
-    lora_r: int = 8  # Rank for LoRA
-    lora_alpha: int = 16  # Alpha for LoRA scaling
+    "Name of the LLM model"
+
+    node_embedding_dim: int = 1024  
+    "Dimension of node embeddings"
+    edge_embedding_dim: int = 1024  
+    "Dimension of edge embeddings"
+    graph_pooling: bool = True  
+    "Whether to apply global mean pooling to the graph representations"
+
+    dropout: float = 0.2  
+    "Dropout rate for the model"
+    num_heads: int = 1  
+    "Number of attention heads in GATv2Conv"
+    num_quantizers: int = 3  
+    "Number of quantizers for residual vector quantization"
+
+    codebook_size: int = 512  
+    "Size of the codebook for vector quantization"
+    codebook_dim: int = 0  
+    "Dimension of the downsampled codebook. If 0, no downsampling is applied."
+    shared_codebook: bool = False  
+    "Whether to use a shared codebook across quantizers"
+
+    tune_language_model: bool = False  
+    "Whether to tune the language model"
+    tune_kg_encoder: bool = False  
+    "Whether to tune the knowledge graph encoder"
+
+    use_lora: bool = True  
+    "Whether to use LoRA for training"
+    lora_r: int = 8  
+    "Rank for LoRA"
+    lora_alpha: int = 16  
+    "Alpha for LoRA scaling"
     lora_target_modules: List[str] = ["q_proj", "k_proj"]
 
 def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
@@ -92,6 +108,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.num_heads = model_args.num_heads
     config.num_quantizers = model_args.num_quantizers
     config.codebook_size = model_args.codebook_size
+    config.codebook_dim = model_args.codebook_dim
     config.shared_codebook = model_args.shared_codebook
     config.tune_language_model = model_args.tune_language_model
     config.tune_kg_encoder = model_args.tune_kg_encoder
@@ -141,6 +158,7 @@ class KG_LFMMetaModel(ABC):
             num_heads=config.num_heads,
             num_quantizers=config.num_quantizers,
             codebook_size=config.codebook_size,
+            codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
             shared_codebook=config.shared_codebook,
             graph_pooling=config.graph_pooling
         )
@@ -178,6 +196,12 @@ class KG_LFMMetaModel(ABC):
         if osp.exists(llm_path):
             logging.info(f"Loading pretrained LLM from {llm_path}")
             model.llm = AutoModelForCausalLM.from_pretrained(llm_path, trust_remote_code=True)
+            if config.use_lora:
+                model.llm = PeftModel.from_pretrained(model.llm, llm_path, trust_remote_code=True)
+                # make require grad True for all parameters in the LoRA layers
+                for name, param in model.llm.named_parameters():
+                    if "lora" in name or config.tune_language_model:
+                        param.requires_grad = True
         else:
             warnings.warn(
                 f"LLM directory not found at {llm_path}. "
@@ -312,11 +336,12 @@ class KG_LFMMetaForCausalLM(ABC):
                 None, # Return standard embeddings
                 labels,
                 RVQ_loss,
+                None  # No indices for graph embeddings
             )
 
         logging.debug(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
         # Encode the knowledge graphs into embeddings that will replace KG tokens
-        graph_features, _, RVQ_loss = self.encode_graphs(graphs)
+        graph_features, indices, RVQ_loss = self.encode_graphs(graphs)
         graph_features = graph_features.to(self.llm.dtype)
         processed_graph = 0
         
@@ -511,6 +536,7 @@ class KG_LFMMetaForCausalLM(ABC):
             new_input_embeds_padded,  # The main output: text + graph embeddings
             new_labels,
             RVQ_loss,  # Return the RVQ loss for training purposes
+            indices
         )
     
     @torch.inference_mode()
@@ -563,6 +589,7 @@ class KG_LFMMetaForCausalLM(ABC):
             _,
             inputs_embeds,
             _,
+            _,
             _
         ) = self.prepare_inputs_labels_for_multimodal(
             input_ids, None, attention_mask, None, None, graphs
@@ -611,21 +638,6 @@ class KG_LFMMetaForCausalLM(ABC):
         and sets sensible defaults if they are missing.
         """
         generation_config = copy.deepcopy(self.llm.generation_config)
-        
-        if generation_config.max_length == 20: # Default value in base GenerationConfig
-            generation_config.max_length = self.tokenizer.model_max_length or 2048
-            
-        if generation_config.pad_token_id is None:
-            generation_config.pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-            
-        if generation_config.eos_token_id is None:
-            eos_tokens = infer_stop_tokens(self.tokenizer)
-            if eos_tokens:
-                generation_config.eos_token_id = self.tokenizer.convert_tokens_to_ids(eos_tokens[0])
-
-        if generation_config.bos_token_id is None:
-             generation_config.bos_token_id = self.tokenizer.bos_token_id
-             
         return generation_config
 
 
@@ -657,7 +669,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
             trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token = self.llm.config.pad_token_id
 
         if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens({"additional_special_tokens": [SPECIAL_KG_TOKEN]})
@@ -713,7 +725,8 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                RVQ_loss
+                RVQ_loss,
+                indices
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -745,6 +758,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         # If RVQ_loss is not None, add it to the model's loss for training
         if return_dict:
             out["RVQ_loss"] = RVQ_loss
+            out["RVQ_indices"] = indices
         else:
             out = (out[0] + RVQ_loss,) + out[1:]
             

@@ -4,7 +4,11 @@ from torch.utils.data import DataLoader, Dataset
 import networkx as nx
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory, trex_bite_factory, web_qsp_factory
+from KG_LFM.utils.Datasets.factories.factory import (
+    trirex_factory, trex_star_graphs_factory, trex_bite_factory, 
+    web_qsp_factory, grailqa_factory, grailqa_factory,
+    simplequestions_factory
+)
 from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
 from KG_LFM.utils.Datasets.webQSP_data import WebQSPDataset
 
@@ -57,6 +61,7 @@ class KGLFM_Collator:
         # Initialize result dictionary
         result = {
             'sentences': [sample['sentence'] for sample in batch],
+            "conversations": [sample['conversation'] for sample in batch],
             'subjects': [sample['subject'] for sample in batch],
             'predicates': [sample['predicate'] for sample in batch],
             'objects': [sample['object'] for sample in batch],
@@ -68,14 +73,24 @@ class KGLFM_Collator:
         for sample in batch:
             text_features.append({
                 'input_ids': sample['input_ids'],
-                'attention_mask': sample['attention_mask']
+                'attention_mask': sample['attention_mask'],
             })
-        
         # Apply HF collator
         collated_text = self.hf_collator(text_features)
         result['input_ids'] = collated_text['input_ids']
         result['attention_mask'] = collated_text['attention_mask']
-        
+
+        # Use HF collator for labels
+        label_features = []
+        for sample in batch:
+            label_features.append({
+                'input_ids': sample['labels'],
+                'attention_mask': sample['attention_mask'],
+            })
+        # Apply HF collator
+        collated_labels = self.hf_collator(label_features)
+        result['labels'] = collated_labels['input_ids']
+
         result['graphs'] = self._process_graph_batch(result['graphs'])
         
         # Add batch metadata
@@ -107,7 +122,7 @@ class KGLFM_DataLoader:
         self.dataset_name = dataset_config.name
         
         # Load datasets
-        print(f"Loading {dataset_config.name} and TRExStar datasets...")
+        print(f"Loading {dataset_config.name} datasets...")
         
         dataset_factory = {
             "trirex": lambda conf: (
@@ -117,12 +132,16 @@ class KGLFM_DataLoader:
                 trex_bite_factory(conf), trex_star_graphs_factory(conf)
             ),
             "web-qsp": self._web_qsp_factory,  # Special case for WebQSP
+            "grailqa": grailqa_factory,  # GrailQA dataset
+            "simple-questions": simplequestions_factory,
         }
         
         self.dataset_class = {
             "trirex": TriRexStarDataset,
             "trirex-bite": TriRexStarDataset,
             "web-qsp": WebQSPDataset,
+            "grailqa": WebQSPDataset, 
+            "simple-questions": WebQSPDataset
         }
         
 
@@ -136,9 +155,9 @@ class KGLFM_DataLoader:
             config=dataset_config,
         )
         
-        print(f"Loaded {len(self.train_dataset)} training samples")
-        print(f"Loaded {len(self.val_dataset)} validation samples")
-        print(f"Loaded {len(self.test_dataset)} test samples")
+        print(f"Loaded {len(self.train_dataset)} training samples") if self.train_dataset else "No training dataset"
+        print(f"Loaded {len(self.val_dataset)} validation samples") if self.val_dataset else "No validation dataset"
+        print(f"Loaded {len(self.test_dataset)} test samples") if self.test_dataset else "No test dataset"
         print(f"Loaded {len(self.star_graphs)} star graphs")
     
     def _web_qsp_factory(self, config) -> Tuple[Tuple[Dataset, Dataset, Dataset], Dict[str, nx.DiGraph]]:
@@ -148,7 +167,7 @@ class KGLFM_DataLoader:
             (
                 None,  None,  # No train & val split for WebQSP
                 web_qsp_dataset
-            ), 
+            ),
             web_qsp_star_graphs
         )
 
@@ -171,7 +190,7 @@ class KGLFM_DataLoader:
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
             persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            prefetch_factor=1, # to save memory, lower prefetching
+            prefetch_factor=1 if self.dataloader_config.num_workers > 0 else None
         )
     
     def get_val_dataloader(self) -> DataLoader:
@@ -193,7 +212,7 @@ class KGLFM_DataLoader:
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
             persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            prefetch_factor=1, # to save memory, lower prefetching
+            prefetch_factor=1 if self.dataloader_config.num_workers > 0 else None
         )
     
     def get_test_dataloader(self) -> DataLoader:
@@ -215,7 +234,7 @@ class KGLFM_DataLoader:
             collate_fn=self.collator,
             pin_memory=self.dataloader_config.pin_memory,
             persistent_workers=self.dataloader_config.persistent_workers and self.dataloader_config.num_workers > 0,
-            prefetch_factor=1, # to save memory, lower prefetching
+            prefetch_factor=1 if self.dataloader_config.num_workers > 0 else None
         )
     
     def _get_collator(self):
@@ -299,7 +318,8 @@ if __name__ == "__main__":
         print(f"Batch {batch_idx}:")
         print(f"  Input IDs shape: {batch['tokenized_input']['input_ids'].shape}")
         print(f"  Attention mask shape: {batch['tokenized_input']['attention_mask'].shape}")
-        
+        print(f"  Labels shape: {batch['labels'].shape}")
+
         breakpoint()
 
         if batch_idx >= 1:

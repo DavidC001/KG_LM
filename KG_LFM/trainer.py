@@ -7,11 +7,11 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from collections import defaultdict
 import gc
-
+from copy import deepcopy
 import psutil
 
 import torch
@@ -28,6 +28,7 @@ from tqdm.auto import tqdm
 from KG_LFM.configuration import ProjectConfig
 from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
 from KG_LFM.utils.Dataloader import create_dataloader
+from KG_LFM.evaluator import compute_hit_k
 
 # import abstract class abc
 from abc import ABC, abstractmethod
@@ -50,9 +51,10 @@ class MetricsTracker(ABC):
 class DefaultMetricsTracker(MetricsTracker):
     """Track and compute running averages of metrics using defaultdict."""
 
-    def __init__(self):
+    def __init__(self, accelerator: Accelerator):
         self.values = defaultdict(float)
         self.counts = defaultdict(int)
+        self.accelerator = accelerator
 
     def reset(self):
         """Resets the tracker."""
@@ -66,9 +68,17 @@ class DefaultMetricsTracker(MetricsTracker):
             self.counts[key] += count
 
     def get_averages(self) -> Dict[str, float]:
-        """Get the current average of all tracked metrics."""
-        return {key: self.values[key] / self.counts[key]
-                for key in self.values if self.counts[key] > 0}
+        """Get the current average of all tracked metrics. Aggregating from all processes."""
+        result = {}
+        for key, value in self.values.items():
+            all_counts = self.accelerator.gather(torch.tensor(self.counts[key], device=self.accelerator.device))
+            all_value = self.accelerator.gather(torch.tensor(value, device=self.accelerator.device))
+            
+            counts = all_counts.sum().item()
+            value = all_value.sum().item()
+
+            result[key] = value / counts if counts > 0 else 0.0
+        return result
 
 class KG_LFM_Trainer:
     """
@@ -81,7 +91,7 @@ class KG_LFM_Trainer:
                  resume: Optional[bool] = False, 
                  enable_wandb: bool = True,
                  save_checkpoints: bool = True,
-                 metrics_tracker: Optional[MetricsTracker] = DefaultMetricsTracker(),
+                 metrics_tracker: Optional[type] = DefaultMetricsTracker,
                  accelerator: Optional[Accelerator] = None
                 ):
         self.config = config
@@ -89,8 +99,7 @@ class KG_LFM_Trainer:
         self.resume = resume
         self.enable_wandb = enable_wandb
         self.save_checkpoints = save_checkpoints
-
-        self.metrics_tracker : MetricsTracker = metrics_tracker
+        set_seed(self.config.seed)
 
         # Initialize Accelerator and set seed for reproducibility
         if accelerator is not None:
@@ -105,9 +114,9 @@ class KG_LFM_Trainer:
                 kwargs_handlers=[kwargs],
                 step_scheduler_with_optimizer=False,  # Let us handle this manually
             )
-            
-        set_seed(self.config.seed)
-
+        
+        self.metrics_tracker : MetricsTracker = metrics_tracker(self.accelerator)
+        
         self.device = self.accelerator.device
 
         # Setup logging
@@ -168,7 +177,7 @@ class KG_LFM_Trainer:
             if wandb.run is not None:
                 self.logger.info(f"Resuming existing wandb run: {wandb.run.id}")
             
-            wandb_config = self.config.to_dict() # Assuming a method to convert config to dict
+            wandb_config = deepcopy(self.config).to_dict() # Assuming a method to convert config to dict
             
             run_id = self.wandb_run_id
             
@@ -245,7 +254,7 @@ class KG_LFM_Trainer:
         # Enhanced optimizer with different learning rates for different components
         kg_encoder_params = [p for n, p in self.model.named_parameters() if 'kg_encoder' in n and p.requires_grad]
         llm_params = [p for n, p in self.model.named_parameters() if 'kg_encoder' not in n and p.requires_grad]
-        
+
         param_groups = []
         if kg_encoder_params:
             param_groups.append({
@@ -293,32 +302,57 @@ class KG_LFM_Trainer:
             torch.cuda.empty_cache()
         gc.collect()
 
-    def compute_train_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
+    def compute_train_metrics(self, RVQ_loss: torch.Tensor, CE_loss: torch.Tensor) -> Dict[str, float]:
         """Compute metrics from loss."""
         # Ensure loss is a scalar tensor and safely convert to float
-        if hasattr(loss, 'item'):
-            loss_val = loss.item()
-        else:
-            loss_val = float(loss)
+        RVQ_loss_val = RVQ_loss.flatten().mean().item()
+        CE_loss_val = CE_loss.flatten().mean().item()
             
         metrics = {
-            'training_loss': loss_val,
-            'learning_rate': self.optimizer.param_groups[0]['lr']
+            'language_loss': CE_loss_val,
+            'RVQ_loss': RVQ_loss_val,
+            'encoder_learning_rate': self.optimizer.param_groups[0]['lr'],
+            'llm_learning_rate': self.optimizer.param_groups[1]['lr'] if len(self.optimizer.param_groups) > 1 else 0
         }
         
         return metrics
-    
-    def compute_val_metrics(self, loss: torch.Tensor) -> Dict[str, float]:
+
+    def compute_val_metrics(
+            self, 
+            language_loss: torch.Tensor, RVQ_loss: torch.Tensor,
+            logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+            object_boundaries: List[Tuple[int]]
+        ) -> Dict[str, float]:
         """Compute validation metrics from loss."""
         # Ensure loss is a scalar tensor and safely convert to float
-        if hasattr(loss, 'item'):
-            loss_val = loss.item()
-        else:
-            loss_val = float(loss)
+        language_loss_val = language_loss.flatten()
+        RVQ_loss_val = RVQ_loss.flatten()
+        
+        if torch.isnan(language_loss_val).any() or torch.isnan(RVQ_loss_val).any():
+            self.logger.warning("NaN detected in validation losses")
 
+        language_loss_val = language_loss_val.mean().item()
+        RVQ_loss_val = RVQ_loss_val.mean().item()
+        
+        hit_k_correct, average_num_tokens, total_objects = compute_hit_k(
+            logits, input_ids, [1,3,5,10],
+            object_boundaries, self.config.model.num_quantizers,
+            attention_mask, special_token=self.model.special_kg_token, 
+            tokenizer=self.model.tokenizer
+        )
+
+        average_num_tokens = average_num_tokens / total_objects if total_objects > 0 else 0
+
+        hit_k_correct = {
+            f"Hit@{k}": v / total_objects if total_objects > 0 else 0
+            for k, v in hit_k_correct.items()
+        }
+        
         metrics = {
-            'validation_loss': loss_val,
-            'learning_rate': self.optimizer.param_groups[0]['lr']
+            'language_loss': language_loss_val,
+            'RVQ_loss': RVQ_loss_val,
+            **hit_k_correct,
+            'average_num_tokens': average_num_tokens
         }
 
         return metrics
@@ -330,7 +364,8 @@ class KG_LFM_Trainer:
         # Calculate number of batches to process instead of samples
         total_batches = len(dataloader)
         num_batches = max(1, int(total_batches * percentage_eval))
-        
+        codebook_indices_seen = [set() for _ in range(self.config.model.num_quantizers)]
+
         self.logger.info(f"Evaluating {num_batches}/{total_batches} batches ({num_batches/total_batches*100:.1f}%)")
         
         with torch.no_grad():
@@ -339,23 +374,25 @@ class KG_LFM_Trainer:
                     break
                     
                 try:
-                    # DeepSpeed handles mixed precision automatically 
                     outputs = self.model(
                         input_ids=batch['input_ids'],
                         graphs=batch['graphs'],
                         attention_mask=batch['attention_mask'],
-                        labels=batch['input_ids'],
+                        labels=batch['labels'],
                         use_cache=False,
                     )
                     
-                    # Gather loss across all devices
-                    loss = self.accelerator.gather(outputs.loss).mean()
-                    metrics = self.compute_val_metrics(loss)
+                    metrics = self.compute_val_metrics(
+                        outputs.loss, outputs.RVQ_loss,
+                        outputs.logits, batch['input_ids'],
+                        batch['attention_mask'],
+                        [batch['objects'][i]['token_boundaries'] for i in range(len(batch['objects']))]
+                    )
                     self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    
-                    # Delete outputs to free memory immediately
-                    del outputs, loss
-                    
+
+                    for i in range(self.config.model.num_quantizers):
+                        codebook_indices_seen[i].update(outputs.RVQ_indices[:, i].tolist())
+
                 except Exception as e:
                     self.logger.info(f"Error in evaluation batch {batch_idx}: {e}")
                     # Clear cache on error
@@ -366,13 +403,23 @@ class KG_LFM_Trainer:
         
         # Final cleanup
         self.clear_memory()
-        
-        # Wait for all processes to complete evaluation before returning
         self.accelerator.wait_for_everyone()
         
         averages = self.metrics_tracker.get_averages()
         self.metrics_tracker.reset()  # Reset tracker for next evaluation
-        
+
+        vocab_size = self.config.model.codebook_size
+        codebook_utilization = {
+            f"codebook/codebook_utilization_{i}": len(codebook_indices_seen[i]) / vocab_size
+            for i in range(self.config.model.num_quantizers)
+        }
+        overall_codebook_utilization = sum(codebook_utilization.values()) / self.config.model.num_quantizers
+
+        averages.update({
+            "codebook/overall_codebook_utilization": overall_codebook_utilization,
+            **codebook_utilization
+        })
+
         return averages
 
     def train_step(self):
@@ -396,8 +443,9 @@ class KG_LFM_Trainer:
             total=self.steps_train
         )
 
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-        
+        total_RVQ_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+        total_CE_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+
         step = 0
         while step < self.steps_train:
             # get batch, reset iterator if needed
@@ -417,7 +465,7 @@ class KG_LFM_Trainer:
                     input_ids=batch['input_ids'],
                     graphs=batch['graphs'],
                     attention_mask=batch['attention_mask'],
-                    labels=batch['input_ids'],
+                    labels=batch['labels'],
                     use_cache=False,
                 )
                 language_loss = outputs.loss
@@ -441,25 +489,33 @@ class KG_LFM_Trainer:
                 is_valid_loss = self.accelerator.gather(is_valid_loss).all()
                 # Skip invalid losses
                 if not is_valid_loss:
-                    self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
+                    self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward. Language Loss: {language_loss.item()}, RVQ Loss: {RVQ_loss.item()}")
                 else:
-                    total_loss += loss / self.grad_accumulation_steps
+                    total_RVQ_loss += RVQ_loss / self.grad_accumulation_steps
+                    total_CE_loss += language_loss / self.grad_accumulation_steps
                     self.accelerator.backward(loss)
                 
+                if self.accelerator.sync_gradients: # TRUE when accumulating gradients
+
+                    if self.clip_grad_norm > 0:
+                        norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+
+                    metrics = self.compute_train_metrics(total_RVQ_loss, total_CE_loss)
+                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
+                    
+                    log_metrics = {
+                        f"train/{k}": v for k, v in metrics.items()
+                    }
+                    log_metrics["train/clip_grad_norm"] = norm if self.clip_grad_norm > 0 else 0.0
+                    self.accelerator.log(log_metrics, step=self.global_step)
+                    
+                    total_CE_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                    total_RVQ_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                    
                 # does NOTHING when using deepspeed
                 self.optimizer.step() 
                 self.optimizer.zero_grad()
                 
-                if self.accelerator.sync_gradients: # TRUE when accumulating gradients
-                    # update global step and logging
-                    metrics = self.compute_train_metrics(total_loss)
-                    total_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-                    self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
-                    log_metrics = {
-                        f"train/{k}": v for k, v in metrics.items()
-                    }
-                    self.accelerator.log(log_metrics, step=self.global_step)
-
                 self.global_step += 1
                 progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
                 progress_bar.update(1)
@@ -625,30 +681,31 @@ class KG_LFM_Trainer:
             # ACTIVATE TRAINING STEP
             current_epoch = step_idx // steps_per_epoch
             step_in_epoch = step_idx % steps_per_epoch
-            self.logger.info(f"--- Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) ---")
-            
+            self.accelerator.print(f"--- Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) ---")
+
             train_metrics = self.train_step()
             self.accelerator.wait_for_everyone()
             
             val_metrics = self._evaluation_loop(self.val_dataloader, "Validation", self.percentage_eval)
             self.accelerator.wait_for_everyone()
-            
-            self.scheduler.step(val_metrics['validation_loss'])  # Step scheduler based on validation loss
-            
+
+            self.scheduler.step(val_metrics['language_loss'])  # Step scheduler based on validation loss
+
             log_metrics = {
                 "epoch": current_epoch + 1,
                 "step": step_idx + 1,
-                **{f"train_epoch/{k}": v for k, v in train_metrics.items()},
-                **{f"val_epoch/{k}": v for k, v in val_metrics.items()},
+                **{f"train_step/{k}": v for k, v in train_metrics.items()},
+                **{f"val_step/{k}": v for k, v in val_metrics.items()},
             }
-            
             self.accelerator.log(log_metrics, step=self.global_step)
             
-            self.logger.info(f"Step {step_idx + 1}/{total_training_steps} | Train Loss: {train_metrics['training_loss']:.4f} | Val Loss: {val_metrics['validation_loss']:.4f} | LR: {train_metrics['learning_rate']:.6f}")
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) - Train Metrics: {train_metrics} - Val Metrics: {val_metrics}")
+                time.sleep(60)
 
-            is_best = val_metrics['validation_loss'] < self.best_val_loss
+            is_best = val_metrics['language_loss'] < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_metrics['validation_loss']
+                self.best_val_loss = val_metrics['language_loss']
                 self.epochs_without_improvement = 0
                 self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}")
             else:

@@ -74,37 +74,6 @@ def to_sentence_format(
         })
     return answers
 
-def create_graph_from_datapoint(graph_data: List[Any]) -> nx.Graph:
-    """Create a NetworkX graph from the graph data in the new format"""
-    G = nx.Graph()
-    
-    # Process the first element of the graph data which contains the graph structure
-    graph_info = graph_data[0]
-    
-    # Add nodes and edges based on the graph structure
-    # This is a simplified version - you'll need to adapt it based on your exact graph structure
-    for edge in graph_info.get('edges', []):
-        left_entity = edge.get('leftentityid')
-        right_entity = edge.get('rightentityid')
-        relation_id = edge.get('relationid')
-        
-        if left_entity and right_entity and relation_id:
-            # Add nodes if they don't exist
-            if not G.has_node(left_entity):
-                G.add_node(left_entity)
-            if not G.has_node(right_entity):
-                G.add_node(right_entity)
-            
-            # Add edge
-            G.add_edge(left_entity, right_entity, id=relation_id, label=relation_id)
-    
-    # Set central node if it exists (typically the question variable)
-    for edge in graph_info.get('edges', []):
-        if edge.get('leftentityid') == '?qvar':
-            G.graph['central_node'] = edge.get('rightentityid')
-            break
-    
-    return G
 
 def create_sentence_tar(data_directory: Path, output_tar_file_path: Path):
     # Check if the csv directory exists
@@ -244,7 +213,6 @@ def generate_webqsp(base_path: str | Path, version: int = 1) -> bool:
 
             # Create sentence format
             sentences = to_sentence_format(pageranks, question_text, answer_ids, boundaries, G)
-            print(f"Generated sentences: {sentences} for question {question_id} and entity {entity_id}")
             # Write to CSV
             with open(output_path, "w") as f:
                 writer = csv.DictWriter(
@@ -268,19 +236,10 @@ def generate_webqsp(base_path: str | Path, version: int = 1) -> bool:
 def _main():
     parser = argparse.ArgumentParser(description='Generate WebQSP artifacts using a base path.')
     parser.add_argument('--version', type=int, default=1, help='Version number of the dataset (e.g., 1)')
-    parser.add_argument('--base-path', type=str, default=None, help='Base path for dataset artifacts')
+    parser.add_argument('--base-path', type=str, default=None, help='Base path for dataset artifacts', required=True)
     args = parser.parse_args()
 
-    if args.base_path is None:
-        try:
-            from KG_LFM.configuration import ProjectConfig
-            cfg = ProjectConfig()
-            base_path = cfg.dataset.base_path
-        except Exception:
-            print("Base path not provided and config unavailable; please pass --base-path.")
-            return
-    else:
-        base_path = args.base_path
+    base_path = args.base_path
 
     ok = generate_webqsp(base_path=base_path, version=args.version)
     if not ok:

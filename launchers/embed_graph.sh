@@ -21,7 +21,7 @@ conda activate CF
 # if no argument is provided, use default config
 if [ -z "$1" ]; then
     echo "No config file provided, using default config."
-    export CONFIG_FILE="configs/pretrain_config.yaml"
+    export CONFIG_FILE="configs/base_config.yaml"
 else
     export CONFIG_FILE=$1
 fi

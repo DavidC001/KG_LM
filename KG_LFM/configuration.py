@@ -107,6 +107,9 @@ class ModelConfig:
     shared_codebook: bool = False
     """Whether to use a shared codebook across quantizers. Defaults to False."""
     
+    codebook_dim: int = 0
+    """Dimension of the downsampled codebook. If 0, no downsampling is applied."""
+
     # Training Configuration
     tune_language_model: bool = False
     """Whether to tune the language model base parameters (does not affect lora params) during training. Defaults to False."""

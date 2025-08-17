@@ -1,26 +1,26 @@
 seed: 42
 
 dataset:
-  name: "trirex"
+  name: "trirex-bite"
   lite: False
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM/graph_embs"
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "trirex-KG_LFM"
+  run_name: "KG-LFM-bite"
     
   epochs: 10
-  early_stopping_patience: 1
+  early_stopping_patience: 2
   scheduler_patience: 1
-  steps_train: 4096
-  eval_perc: 0.1
+  steps_train: 8192
+  eval_perc: 0.25
 
-  gradient_accumulation_steps: 2 # to simulate same number of optimizer steps then the actual ones, evan if noisy
+  gradient_accumulation_steps: 2 # more randomness
   clip_grad_norm: 1.0
 
-  KG_learning_rate: 5e-4
-  LLM_learning_rate: 1e-4
+  KG_learning_rate: 1e-4
+  LLM_learning_rate: 1e-5
   weight_decay: 0.01
 
   rvq_loss_weight: 0.5
@@ -29,11 +29,12 @@ train_conf:
   checkpoint_frequency: 5
   
   resume : True
+  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/trirex-KG-LFM-15-256/best_model"
 
   dataloader:
     batch_size: 8
     shuffle: True
-    num_workers: 1
+    num_workers: 2
 
     include_graphs: True
     return_tensors: "pt"
@@ -46,11 +47,11 @@ model:
   llm_model_name: "Qwen/Qwen3-8B"
   
   # Graph Encoder Configuration
-  graph_pooling: True
+  graph_pooling: False
 
   dropout: 0.2  
-  num_heads: 32
-  num_quantizers: 16
+  num_heads: 16
+  num_quantizers: 15
   codebook_size: 256
   shared_codebook: False
   
@@ -59,8 +60,8 @@ model:
   tune_kg_encoder: True
   
   use_lora: True
-  lora_r: 16
-  lora_alpha: 32
+  lora_r: 8
+  lora_alpha: 16
   lora_target_modules: ["q_proj", "k_proj"]
 
   # Graph Node Embedding Configuration

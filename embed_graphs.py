@@ -1,12 +1,19 @@
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
-from KG_LFM.utils.Datasets.factories.factory import trex_star_graphs_factory, web_qsp_factory
+from KG_LFM.utils.Datasets.factories.factory import (
+    trex_star_graphs_factory, 
+    web_qsp_factory,
+    grailqa_factory,
+    simplequestions_factory
+)
 from KG_LFM.configuration import load_yaml_config, ProjectConfig
 from argparse import ArgumentParser
 
 graph_build_functions= {
     "trirex": trex_star_graphs_factory,
     "trirex-bite": trex_star_graphs_factory,
-    "web-qsp": lambda config: web_qsp_factory(config)[1]
+    "web-qsp": lambda config: web_qsp_factory(config)[1],
+    "grailqa": lambda config: grailqa_factory(config)[1],
+    "simple-questions": lambda config: simplequestions_factory(config)[1],
 }
 
 def main(config: ProjectConfig, batch_size: int = 128):
