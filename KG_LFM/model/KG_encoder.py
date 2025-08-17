@@ -82,7 +82,10 @@ class KGEncoder(nn.Module):
             num_quantizers=num_quantizers,
             codebook_size=codebook_size,
             shared_codebook=shared_codebook,
-            threshold_ema_dead_code = 2
+            # from SoundStream paper
+            threshold_ema_dead_code = 2,
+            kmeans_init = True,   # set to True
+            kmeans_iters = 10     # number of kmeans iterations to calculate the centroids for the codebook on init
         )
 
         # output projection layer with spectral normalization

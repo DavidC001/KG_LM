@@ -489,7 +489,7 @@ class KG_LFM_Trainer:
                 is_valid_loss = self.accelerator.gather(is_valid_loss).all()
                 # Skip invalid losses
                 if not is_valid_loss:
-                    self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward.")
+                    self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward. Language Loss: {language_loss.item()}, RVQ Loss: {RVQ_loss.item()}")
                 else:
                     total_RVQ_loss += RVQ_loss / self.grad_accumulation_steps
                     total_CE_loss += language_loss / self.grad_accumulation_steps

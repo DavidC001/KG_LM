@@ -42,24 +42,40 @@ class KG_LFMConfig(AutoConfig):
     
     model_type = "kg_lfm"
     llm_model_name: str = "Qwen/Qwen3-8B"
-    
-    node_embedding_dim: int = 1024  # Dimension of node embeddings
-    edge_embedding_dim: int = 1024  # Dimension of edge embeddings
-    graph_pooling: bool = True  # Whether to apply global mean pooling to the graph representations
-    
-    dropout: float = 0.2  # Dropout rate for the model
-    num_heads: int = 1  # Number of attention heads in GATv2Conv
-    num_quantizers: int = 3  # Number of quantizers for residual vector quantization
-    
-    codebook_size: int = 512  # Size of the codebook for vector quantization
-    shared_codebook: bool = False  # Whether to use a shared codebook across quantizers
-    
-    tune_language_model: bool = False  # Whether to tune the language model
-    tune_kg_encoder: bool = False  # Whether to tune the knowledge graph encoder
-    
-    use_lora: bool = True  # Whether to use LoRA for training
-    lora_r: int = 8  # Rank for LoRA
-    lora_alpha: int = 16  # Alpha for LoRA scaling
+    "Name of the LLM model"
+
+    node_embedding_dim: int = 1024  
+    "Dimension of node embeddings"
+    edge_embedding_dim: int = 1024  
+    "Dimension of edge embeddings"
+    graph_pooling: bool = True  
+    "Whether to apply global mean pooling to the graph representations"
+
+    dropout: float = 0.2  
+    "Dropout rate for the model"
+    num_heads: int = 1  
+    "Number of attention heads in GATv2Conv"
+    num_quantizers: int = 3  
+    "Number of quantizers for residual vector quantization"
+
+    codebook_size: int = 512  
+    "Size of the codebook for vector quantization"
+    codebook_dim: int = 0  
+    "Dimension of the downsampled codebook. If 0, no downsampling is applied."
+    shared_codebook: bool = False  
+    "Whether to use a shared codebook across quantizers"
+
+    tune_language_model: bool = False  
+    "Whether to tune the language model"
+    tune_kg_encoder: bool = False  
+    "Whether to tune the knowledge graph encoder"
+
+    use_lora: bool = True  
+    "Whether to use LoRA for training"
+    lora_r: int = 8  
+    "Rank for LoRA"
+    lora_alpha: int = 16  
+    "Alpha for LoRA scaling"
     lora_target_modules: List[str] = ["q_proj", "k_proj"]
 
 def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
@@ -92,6 +108,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.num_heads = model_args.num_heads
     config.num_quantizers = model_args.num_quantizers
     config.codebook_size = model_args.codebook_size
+    config.codebook_dim = model_args.codebook_dim
     config.shared_codebook = model_args.shared_codebook
     config.tune_language_model = model_args.tune_language_model
     config.tune_kg_encoder = model_args.tune_kg_encoder
@@ -141,6 +158,7 @@ class KG_LFMMetaModel(ABC):
             num_heads=config.num_heads,
             num_quantizers=config.num_quantizers,
             codebook_size=config.codebook_size,
+            codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
             shared_codebook=config.shared_codebook,
             graph_pooling=config.graph_pooling
         )
