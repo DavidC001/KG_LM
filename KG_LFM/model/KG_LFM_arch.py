@@ -598,15 +598,16 @@ class KG_LFMMetaForCausalLM(ABC):
         inputs_embeds = inputs_embeds.to(self.llm.dtype)
         
         #decode back input_embeds for inspection
-        emb_mat = self.llm.get_input_embeddings().weight
-        logits = inputs_embeds[0] @ emb_mat.T
-        decoded = logits.argmax(dim=-1)
-        decoded_text = self.tokenizer.batch_decode(decoded, skip_special_tokens=True)
-        print(decoded_text)
+        # emb_mat = self.llm.get_input_embeddings().weight
+        # logits = inputs_embeds[0] @ emb_mat.T
+        # decoded = logits.argmax(dim=-1)
+        # decoded_text = self.tokenizer.batch_decode(decoded, skip_special_tokens=True)
+        # print(decoded_text)
 
         # Call underlying LLM generate
         full_outputs = self.llm.generate(
             inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
             attention_mask=attention_mask,
             generation_config=gen_config,
             **forward_only_kwargs
