@@ -16,7 +16,7 @@ export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 
 source ~/.bashrc
-conda activate CF
+source ./prepare_env.sh
 
 # if no argument is provided, use default config
 if [ -z "$1" ]; then

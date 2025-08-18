@@ -16,7 +16,7 @@ export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 
 source ~/.bashrc
-conda activate CF
+source ./prepare_env.sh
 
 # if no argument is provided, use default config
 if [ -z "$1" ]; then
@@ -26,12 +26,12 @@ else
     export CONFIG_FILE=$1
 fi
 
-# second argument is batch size, default is 64
+# second argument is batch size, default is 128
 if [ -z "$2" ]; then
-    echo "No batch size provided, using default batch size of 64."
-    export BATCH_SIZE=64
+    echo "No batch size provided, using default batch size of 128."
+    export BATCH_SIZE=128
 else
     export BATCH_SIZE=$2
 fi
 
-python graph_embedder.py --config $CONFIG_FILE --batch_size $BATCH_SIZE
+python embed_graphs.py --config $CONFIG_FILE --batch_size $BATCH_SIZE

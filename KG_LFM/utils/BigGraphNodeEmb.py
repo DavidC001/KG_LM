@@ -59,7 +59,7 @@ class BigGraphAligner:
             model_kwargs={
                 "attn_implementation": "flash_attention_2",
                 "device_map": "cuda:0",
-                "torch_dtype": torch.float16
+                "torch_dtype": torch.bfloat16
             } if torch.cuda.is_available() else {},
             tokenizer_kwargs={"padding_side": "left"},
         )
@@ -132,7 +132,7 @@ class BigGraphAligner:
         # Save Entity embeddings
         dataset = torch.cat(all_embeddings, dim=0)
         with h5py.File(f'{self.folder}/init/embeddings_entity_0.v0.h5', 'w') as hf:
-            hf.create_dataset("embeddings", data=dataset.cpu().numpy(), dtype=np.float32)
+            hf.create_dataset("embeddings", data=dataset.cpu().float().numpy(), dtype=np.float32)
             hf.attrs[FORMAT_VERSION_ATTR] = FORMAT_VERSION
 
         # Batch encode relations
@@ -146,7 +146,7 @@ class BigGraphAligner:
         # Save Relation embeddings
         dataset = torch.cat(all_embeddings, dim=0)
         with h5py.File(f'{self.folder}/init/embeddings_relation_0.v0.h5', 'w') as hf:
-            hf.create_dataset("embeddings", data=dataset.cpu().numpy(), dtype=np.float32)
+            hf.create_dataset("embeddings", data=dataset.cpu().float().numpy(), dtype=np.float32)
             hf.attrs[FORMAT_VERSION_ATTR] = FORMAT_VERSION
 
         print("BigGraphAligner prepared successfully.")
