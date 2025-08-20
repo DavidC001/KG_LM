@@ -281,7 +281,7 @@ class KG_LFM_Trainer:
             self.optimizer,
             mode="min",
             factor=0.5,
-            patience=max(1,self.config.train_conf.early_stopping_patience // 2),
+            patience=self.config.train_conf.scheduler_patience,
             verbose=True
         )
 
@@ -689,7 +689,7 @@ class KG_LFM_Trainer:
             val_metrics = self._evaluation_loop(self.val_dataloader, "Validation", self.percentage_eval)
             self.accelerator.wait_for_everyone()
 
-            self.scheduler.step(val_metrics['language_loss'])  # Step scheduler based on validation loss
+            self.scheduler.step(val_metrics[self.config.train_conf.scheduler_metric])  # Step scheduler based on validation loss
 
             log_metrics = {
                 "epoch": current_epoch + 1,
@@ -722,7 +722,7 @@ class KG_LFM_Trainer:
             if should_checkpoint and self.save_checkpoints:
                 self.save_checkpoint(current_epoch, is_best)
 
-            if self.epochs_without_improvement >= patience:
+            if self.epochs_without_improvement > patience:
                 self.logger.info(f"Early stopping triggered after {patience} train loops without improvement.")
                 break
             

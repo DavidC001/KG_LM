@@ -150,6 +150,9 @@ class TrainConfig:
     scheduler_patience: int = 2
     """Patience for the ReduceLROnPlateau scheduler. Defaults to 2."""
     
+    scheduler_metric: str = "validation_loss"
+    """Metric to monitor for the learning rate scheduler. Defaults to 'validation_loss'."""
+    
     KG_learning_rate: float = 1e-4
     """Learning rate for the KG optimizer. Defaults to 1e-4."""
     
