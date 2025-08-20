@@ -413,7 +413,11 @@ class KG_LFM_Trainer:
             f"codebook/codebook_utilization_{i}": len(codebook_indices_seen[i]) / vocab_size
             for i in range(self.config.model.num_quantizers)
         }
-        overall_codebook_utilization = sum(codebook_utilization.values()) / self.config.model.num_quantizers
+        if not self.config.model.shared_codebook:
+            overall_codebook_utilization = sum(codebook_utilization.values()) / self.config.model.num_quantizers
+        else:
+            seen_idx = set.union(*codebook_indices_seen)
+            overall_codebook_utilization = len(seen_idx) / vocab_size
 
         averages.update({
             "codebook/overall_codebook_utilization": overall_codebook_utilization,

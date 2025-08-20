@@ -158,7 +158,9 @@ class TriRexStarDataset(Dataset):
 
         # compute labels
         labels = torch.full(result['input_ids'].shape, IGNORE_INDEX, dtype=result['input_ids'].dtype)
-        labels[obj_tok_start:obj_tok_end] = result['input_ids'][obj_tok_start:obj_tok_end]
+        # search for start of assistant message
+        sentence_tok_start = tokenized.char_to_token(shift)
+        labels[sentence_tok_start:] = result['input_ids'][sentence_tok_start:]
         result['labels'] = labels
 
         return result
