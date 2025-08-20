@@ -21,6 +21,10 @@ def main():
                        help="Maximum number of samples to evaluate (for quick testing)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug mode")
+    parser.add_argument("--no_baseline", action="store_true",
+                       help="Disable baseline model evaluation")
+    parser.add_argument("--no_text", action="store_true",
+                       help="Disable textualization evaluation")
 
     args = parser.parse_args()
     
@@ -36,7 +40,9 @@ def main():
     evaluator = KGLFMEvaluator(
         config_path=args.config,
         batch_size=args.batch_size,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        no_baseline=args.no_baseline,
+        no_text=args.no_text
     )
     
     # Run evaluation

@@ -8,22 +8,23 @@ dataset:
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "trirex-KG-LFM-10-256"
+  run_name: "tri-KG-LFM-10-256"
     
   epochs: 10
-  early_stopping_patience: 2
-  scheduler_patience: 1
+  early_stopping_patience: 1
+  scheduler_patience: 0
+  scheduler_metric: "Hit@10"
   steps_train: 8192
   eval_perc: 0.25
 
   gradient_accumulation_steps: 2 # more randomness
   clip_grad_norm: 1.0
 
-  KG_learning_rate: 1e-4
+  KG_learning_rate: 5e-4
   LLM_learning_rate: 1e-5
   weight_decay: 0.01
 
-  rvq_loss_weight: 0.5
+  rvq_loss_weight: 1
   
   checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
   checkpoint_frequency: 5
@@ -60,8 +61,8 @@ model:
   tune_kg_encoder: True
   
   use_lora: True
-  lora_r: 8
-  lora_alpha: 16
+  lora_r: 4
+  lora_alpha: 8
   lora_target_modules: ["q_proj", "k_proj"]
 
   # Graph Node Embedding Configuration

@@ -144,12 +144,16 @@ class KGLFMEvaluator:
         self,
         config_path: str,
         batch_size: int = 8,
-        max_samples: Optional[int] = None
+        max_samples: Optional[int] = None,
+        no_baseline: bool = False,
+        no_text: bool = False
     ):
         self.config_path = config_path
         self.batch_size = batch_size
         self.max_samples = max_samples
-        
+        self.no_baseline = no_baseline
+        self.no_text = no_text
+
         # Initialize accelerator
         self.accelerator = Accelerator()
         
@@ -271,40 +275,50 @@ class KGLFMEvaluator:
         if self.accelerator.is_main_process:
             self.logger.info(f"Loading model from {self.model_path}")
         
+        self.tests = {}
+        
         try:
             self.model = KG_LFM.from_pretrained(self.model_path)
             self.model.eval()
             self.tokenizer = self.model.tokenizer
             
             # if the config requires to tune the model also load clean model
-            if self.model.config.tune_language_model:
-                self.clean_model = AutoModelForCausalLM.from_pretrained(
-                    self.model.config.llm_model_name,
-                )
-                self.clean_tokenizer = AutoTokenizer.from_pretrained(
-                    self.model.config.llm_model_name,
-                )
-                self.clean_model.eval()
-            elif self.model.config.use_lora:
-                self.clean_model = self.llm_no_lora
-                self.clean_tokenizer = self.tokenizer
-            else:
-                self.clean_model = self.model
-                self.clean_tokenizer = self.tokenizer
-            
-            if self.accelerator.is_main_process:
-                self.logger.info("Model loaded successfully")
-                self.logger.info("Clean model loaded successfully")
+            if  not self.no_baseline:
+                if self.model.config.tune_language_model:
+                    self.clean_model = AutoModelForCausalLM.from_pretrained(
+                        self.model.config.llm_model_name,
+                    )
+                    self.clean_tokenizer = AutoTokenizer.from_pretrained(
+                        self.model.config.llm_model_name,
+                    )
+                    self.clean_model.eval()
+                elif self.model.config.use_lora:
+                    self.clean_model = self.llm_no_lora
+                    self.clean_tokenizer = self.tokenizer
+                else:
+                    self.clean_model = self.model
+                    self.clean_tokenizer = self.tokenizer
+                
+                if self.accelerator.is_main_process:
+                    self.logger.info("Model loaded successfully")
+                    self.logger.info("Clean model loaded successfully")
+
+                self.tests.update({
+                    "original_LLM": (self.remove_kg_stuff, self.clean_model),
+                })
+
+                if not self.no_text:
+                    self.tests.update({
+                        "textualization": (self.kg_textualization, self.clean_model),
+                    })
         except Exception as e:
             if self.accelerator.is_main_process:
                 self.logger.error(f"Error loading model: {e}")
             raise
         
-        self.tests = {
-            "original_LLM": (self.remove_kg_stuff, self.clean_model),
-            "textualization": (self.kg_textualization, self.clean_model),
+        self.tests.update({
             "KG_LFM": (lambda x: x, self.model),  # No preprocessing needed for KG_LFM
-        }
+        })
     
     def setup_data(self, split: str = "test"):
         """Setup data loaders for evaluation."""
@@ -469,7 +483,9 @@ class KGLFMEvaluator:
         for eval_name, eval_func in evaluations.items():
             if self.accelerator.is_main_process:
                 self.logger.info(f"Running {eval_name}...")
+                
             self.results[eval_name] = eval_func()
+            
             # Clear GPU memory after each evaluation
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

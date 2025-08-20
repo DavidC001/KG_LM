@@ -98,6 +98,9 @@ class ModelConfig:
     num_heads: int = 1
     """Number of attention heads in GATv2Conv. Defaults to 1."""
     
+    gat_layers: int = 1
+    """Number of GATv2 layers to apply."""
+
     num_quantizers: int = 3
     """Number of quantizers for residual vector quantization. Defaults to 3."""
     
@@ -149,6 +152,9 @@ class TrainConfig:
     
     scheduler_patience: int = 2
     """Patience for the ReduceLROnPlateau scheduler. Defaults to 2."""
+    
+    scheduler_metric: str = "validation_loss"
+    """Metric to monitor for the learning rate scheduler. Defaults to 'validation_loss'."""
     
     KG_learning_rate: float = 1e-4
     """Learning rate for the KG optimizer. Defaults to 1e-4."""

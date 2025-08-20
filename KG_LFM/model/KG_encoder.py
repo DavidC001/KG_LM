@@ -6,8 +6,7 @@ returns for each the residual vector quantized representsion for each graph.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv
-from torch.nn.utils import spectral_norm
+from torch_geometric.nn import TransformerConv, GraphNorm
 import logging
 
 from vector_quantize_pytorch import ResidualVQ
@@ -26,16 +25,10 @@ import torch.nn.functional as F
 class KGEncoder(nn.Module):
     def __init__(
         self, 
-        node_embedding_dim, 
-        edge_embedding_dim,
-        final_embedding_dim,
-        dropout=0.2,
-        num_heads=1,
-        num_quantizers=3,
-        codebook_size=512,
-        codebook_dim=0,
-        shared_codebook=False,
-        graph_pooling=True
+        node_embedding_dim, edge_embedding_dim, final_embedding_dim, std_tokens,
+        dropout=0.2, num_heads=1, gat_layers=3, graph_pooling=True, 
+        num_quantizers=3, codebook_size=512, codebook_dim=0, shared_codebook=False,
+        beta_commit=0.25,
     ):
         """
         Initializes the KGEncoder model.
@@ -44,52 +37,67 @@ class KGEncoder(nn.Module):
             node_embedding_dim (int): Dimension of the node embeddings.
             edge_embedding_dim (int): Dimension of the edge embeddings.
             final_embedding_dim (int): Dimension of the final output embeddings.
+            std_tokens (float): Standard deviation of the token embeddings.
             dropout (float): Dropout rate for the model.
             num_heads (int): Number of attention heads in GATv2Conv.
+            gat_layers (int): Number of GATv2Conv layers.
+            graph_pooling (bool): Whether to apply global mean pooling to the graph representations.
             num_quantizers (int): Number of quantizers for residual vector quantization.
             codebook_size (int): Size of the codebook for vector quantization.
             codebook_dim (int): Dimension of the downsampled codebook. If 0, no downsampling is applied.
             shared_codebook (bool): Whether to use a shared codebook across quantizers.
-            graph_pooling (bool): Whether to apply global mean pooling to the graph representations.
-            
+            beta_commit (float): Commitment loss weight for the vector quantization.
         """
         super(KGEncoder, self).__init__()
         self.node_embedding_dim = node_embedding_dim
         self.edge_embedding_dim = edge_embedding_dim
+        
+        self.convs = nn.ModuleList([
+            TransformerConv(
+                in_channels=node_embedding_dim,
+                out_channels=node_embedding_dim // num_heads,
+                heads=num_heads,
+                edge_dim=edge_embedding_dim,
+                dropout=dropout,
+                concat=True
+            )
+            for _ in range(gat_layers)
+        ])
+        self.norms = nn.ModuleList([GraphNorm(node_embedding_dim) for _ in range(gat_layers)])
 
-        self.conv = GATv2Conv(
-            in_channels=node_embedding_dim,
-            out_channels=node_embedding_dim,
-            edge_dim=edge_embedding_dim,
-            heads=num_heads,
-            dropout=dropout,
-        )
         self.num_heads = num_heads
         
-        # adapter layer with spectral normalization for stability
-        self.adapter = nn.Linear(node_embedding_dim, node_embedding_dim)
         self.dropout = nn.Dropout(dropout)
         self.num_quantizers = num_quantizers
 
-        # normalization layer
-        self.norm = nn.LayerNorm(node_embedding_dim)
-        self.out_norm = nn.LayerNorm(final_embedding_dim)
-
+        if codebook_dim > 0:
+            self.downsample = nn.Linear(node_embedding_dim, codebook_dim)
+            self.downsample_norm = nn.LayerNorm(codebook_dim)
+            self.upsample = nn.Linear(codebook_dim, node_embedding_dim)
+            self.upsample_norm = nn.LayerNorm(node_embedding_dim)
         
+        self.codebook_dim = codebook_dim
+
         self.vq = ResidualVQ(
-            dim=node_embedding_dim,
-            codebook_dim=codebook_dim if codebook_dim > 0 else None,
+            dim=node_embedding_dim if codebook_dim == 0 else codebook_dim,
             num_quantizers=num_quantizers,
             codebook_size=codebook_size,
             shared_codebook=shared_codebook,
-            # from SoundStream paper
+            use_cosine_sim = True,
             threshold_ema_dead_code = 2,
-            kmeans_init = True,   # set to True
-            kmeans_iters = 10     # number of kmeans iterations to calculate the centroids for the codebook on init
         )
+        self.beta_commit = beta_commit
+        self.kg_bias = nn.Parameter(torch.zeros(final_embedding_dim))
+        self.text_embs_std = std_tokens
 
         # output projection layer with spectral normalization
-        self.output_projection = nn.Linear(node_embedding_dim, final_embedding_dim)
+        self.skip_to_final = nn.Linear(node_embedding_dim, final_embedding_dim)
+        self.output_projection = nn.Sequential(
+            nn.Linear(node_embedding_dim, 4 * node_embedding_dim),
+            nn.ReLU(),
+            nn.Linear(4 * node_embedding_dim, final_embedding_dim),
+        )
+        self.output_norm = nn.LayerNorm(final_embedding_dim)
         
         self.graph_pooling = graph_pooling
         
@@ -107,31 +115,19 @@ class KGEncoder(nn.Module):
         x, edge_index, edge_attr = graphs.x, graphs.edge_index, graphs.edge_attr
         
         logging.debug("Got graph data")
-        
-        x = x.to(dtype=self.conv.lin_l.weight.dtype)
-        edge_attr = edge_attr.to(dtype=self.conv.lin_l.weight.dtype)
-        
-        x = x.to(self.conv.lin_l.weight.device)
-        edge_index = edge_index.to(self.conv.lin_l.weight.device)
-        edge_attr = edge_attr.to(self.conv.lin_l.weight.device)
-        
-        logging.debug("Moved tensors")
 
-        # edge and node dropout
-        if self.training:
-            edge_attr = self.dropout(edge_attr)
-            x = self.dropout(x)
+        # Apply graph convolution layers
+        for i, conv in enumerate(self.convs):
+            device = self.convs[i].lin_query.weight.device
+            dtype = self.convs[i].lin_query.weight.dtype
+            x = x.to(device, dtype=dtype)
+            edge_attr = edge_attr.to(device, dtype=dtype)
+            edge_index = edge_index.to(device)
 
-        # Apply GATv2Conv
-        x = self.conv(x, edge_index, edge_attr)
-        
-        logging.debug("Applied GATv2Conv")
-        
-        # average the output across all heads
-        x = x.view(x.shape[0], self.num_heads, -1).mean(dim=1)
-        
-        logging.debug("reshaped tensors")
-        
+            x_in = x
+            x = conv(x, edge_index, edge_attr)
+            x = self.norms[i](x + x_in, graphs.batch.to(x.device))
+
         if self.graph_pooling:
             x = global_mean_pool(x, graphs.batch.to(x.device))
         else:
@@ -146,11 +142,10 @@ class KGEncoder(nn.Module):
             x = x[first_indices]
         
         logging.debug(f"Graph embeddings shape after GATv2Conv: {x.shape}") 
-        
-        # Apply adapter layer
-        x = self.adapter(x)
-        # Normalize the output
-        x = self.norm(x)
+
+        if self.codebook_dim > 0:
+            x = self.downsample(x)
+            x = self.downsample_norm(x)
 
         # ugly solution to problem of vector quantization not working with half precision
         x = x.float()
@@ -159,28 +154,39 @@ class KGEncoder(nn.Module):
         quantized, indices, commit_loss, all_codes = self.vq(x, return_all_codes=True)
         residual_loss = F.mse_loss(x, quantized)
         commit_loss = commit_loss.flatten().mean()
-        loss = commit_loss + residual_loss
+        loss = commit_loss * self.beta_commit + residual_loss
 
-        dtype = self.output_projection.weight.dtype
-
+        dtype = self.kg_bias.dtype
         all_codes = all_codes.to(dtype=dtype)
 
         # apply the STE trick to get gradients to the encoder
         residual = x.to(dtype=dtype)
         tokens = []
         for i in range(self.num_quantizers):
-            tokens.append( x + (all_codes[i] - x).detach())
+            tokens.append( residual + (all_codes[i] - residual).detach())
             residual = residual - all_codes[i].detach()
 
         tokens = torch.stack(tokens) # (num_quantizers, B, dim)
         tokens = tokens.permute(1, 0, 2)  # (B, num_quantizers, dim)
         tokens = tokens.to(dtype=dtype)  # Ensure tokens have the correct dtype
-        tokens = self.dropout(tokens)
-        tokens = self.output_projection(tokens)
         
-        # Normalize the quantized output
-        tokens = self.out_norm(tokens)
+        if self.codebook_dim > 0:
+            tokens = self.upsample(tokens)
+            tokens = self.upsample_norm(tokens)
         
+        # in forward, after (optional) upsample:
+        tokens = self.dropout(tokens)                             # [B, Q, node_D]
+        proj = self.output_projection(tokens)                     # [B, Q, final_D]
+        skip = self.skip_to_final(tokens)                         # [B, Q, final_D]
+        tokens = self.output_norm(proj + skip)                    # residual in final space
+
+        # per-batch standardization
+        g_mu = tokens.mean(dim=(-2,-1), keepdim=True)
+        g_std = tokens.std(dim=(-2,-1), keepdim=True).clamp_min(1e-6)
+        tokens = (tokens - g_mu) / g_std
+        # match text emb std
+        tokens = tokens * self.text_embs_std + self.kg_bias
+
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(f"Output shape after adapter and normalization: {x.shape}")
             logging.debug(f"Quantized output shape: {all_codes.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")

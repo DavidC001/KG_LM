@@ -14,8 +14,6 @@
 
 source ./prepare_env.sh
 
-export TIME_BUDGET=$((3600*24-60*30)) 
-
 echo "Starting training with enhanced NCCL timeout and DeepSpeed settings..."
 echo "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: $TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"
 echo "NCCL_TIMEOUT: $NCCL_TIMEOUT"
@@ -27,6 +25,14 @@ if [ -z "$1" ]; then
 else
     export CONFIG_FILE=$1
     echo "Using provided config file: $CONFIG_FILE"
+fi
+
+if [ -z "$2" ]; then
+    echo "Time budget not provided, using default value."
+    export TIME_BUDGET=$((3600*24-60*30))
+else
+    export TIME_BUDGET=$2
+    echo "Using provided time budget: $TIME_BUDGET"
 fi
 
 # Get the list of allocated nodes
