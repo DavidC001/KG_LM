@@ -475,8 +475,15 @@ class KGChatBot:
         baseline_inputs = self.tokenizer(
             baseline_prompt, return_tensors="pt", truncation=True, max_length=max_inp
         ).to(self.device)
-        with self.model.llm.disable_adapter(), torch.inference_mode():
-            g_baseline = self._attempt_generate(baseline_inputs, graphs=None)
+        
+        with torch.inference_mode():
+            # check if llm has method disable_adapter
+            if hasattr(self.model.llm, "disable_adapter"):
+                with self.model.llm.disable_adapter():
+                    g_baseline = self._attempt_generate(baseline_inputs, graphs=None)
+            else:
+                g_baseline = self._attempt_generate(baseline_inputs, graphs=None)
+
         # The model's generate method now returns only newly generated tokens
         baseline_text = self.tokenizer.decode(g_baseline[0], skip_special_tokens=True).strip()
         self.hist_baseline.append({"role": "assistant", "content": baseline_text})
@@ -609,7 +616,7 @@ def main() -> None:
     p.add_argument("--model_path", type=str, required=True, help="Path to the trained KG-LFM model")
     p.add_argument("--config", type=str, default=None, help="Path to dataset configuration YAML file")
     p.add_argument("--lite", action="store_true", help="Use lite dataset")
-    p.add_argument("--max_new_tokens", type=int, default=512)
+    p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
