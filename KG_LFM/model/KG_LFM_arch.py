@@ -55,6 +55,8 @@ class KG_LFMConfig(AutoConfig):
     "Dropout rate for the model"
     num_heads: int = 1  
     "Number of attention heads in GATv2Conv"
+    gat_layers: int = 1
+    """Number of GATv2 layers to apply."""
     num_quantizers: int = 3  
     "Number of quantizers for residual vector quantization"
 
@@ -106,6 +108,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.graph_pooling = model_args.graph_pooling
     config.dropout = model_args.dropout
     config.num_heads = model_args.num_heads
+    config.gat_layers = model_args.gat_layers
     config.num_quantizers = model_args.num_quantizers
     config.codebook_size = model_args.codebook_size
     config.codebook_dim = model_args.codebook_dim
@@ -145,8 +148,6 @@ class KG_LFMMetaModel(ABC):
             )
             self.llm : PeftModel = get_peft_model(self.llm, lora_config)
         
-        self.text_embs_std = self.llm.get_input_embeddings().weight.std().item()
-        
         self.llm_embedding_dim = self.llm.config.hidden_size
         
         # Initialize the KGEncoder with the specified dimensions
@@ -156,11 +157,14 @@ class KG_LFMMetaModel(ABC):
             final_embedding_dim=self.llm_embedding_dim,
             dropout=config.dropout,
             num_heads=config.num_heads,
+            gat_layers=config.gat_layers if hasattr(config, "gat_layers") else 1,
             num_quantizers=config.num_quantizers,
             codebook_size=config.codebook_size,
             codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
             shared_codebook=config.shared_codebook,
-            graph_pooling=config.graph_pooling
+            graph_pooling=config.graph_pooling,
+            beta_commit=0.25,
+            std_tokens=self.llm.get_input_embeddings().weight.std().item()
         )
 
         assert (
@@ -343,6 +347,7 @@ class KG_LFMMetaForCausalLM(ABC):
         # Encode the knowledge graphs into embeddings that will replace KG tokens
         graph_features, indices, RVQ_loss = self.encode_graphs(graphs)
         graph_features = graph_features.to(self.llm.dtype)
+
         processed_graph = 0
         
         logging.debug(f"Graph features shape: {graph_features.shape}, RVQ loss: {RVQ_loss}")
