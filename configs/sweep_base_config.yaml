@@ -46,13 +46,16 @@ model:
   llm_model_name: "Qwen/Qwen3-8B"
   
   # Graph Encoder Configuration
-  graph_pooling: True
+  graph_pooling: False
 
   dropout: 0.2  
   num_heads: 32
   num_quantizers: 16
   codebook_size: 256
   shared_codebook: False
+  dead_codebook_threshold: 0.0625 
+  # {total batch_size}/{codebook_size}/2 
+  # meaning that the code need to be used around once every {codebook_size}*2 samples
   
   # Training Configuration
   tune_language_model: False

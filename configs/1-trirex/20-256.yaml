@@ -8,12 +8,13 @@ dataset:
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "tri-KG-LFM-10-512"
+  run_name: "tri-KG-LFM-20-256"
     
   epochs: 10
-  early_stopping_patience: 1
-  scheduler_patience: 0
+  early_stopping_patience: 2
+  scheduler_patience: 1
   scheduler_metric: "Hit@10"
+  scheduler_mode: "max"
   steps_train: 8192
   eval_perc: 0.25
 
@@ -51,10 +52,13 @@ model:
 
   dropout: 0.2  
   num_heads: 16
-  num_quantizers: 10
-  codebook_size: 512
+  num_quantizers: 20
+  codebook_size: 256
   codebook_dim: 0
   shared_codebook: False
+  dead_codebook_threshold: 0.0625 
+  # {total batch_size}/{codebook_size}/2 
+  # meaning that the code need to be used around once every {codebook_size}*2 samples
   
   # Training Configuration
   tune_language_model: False
