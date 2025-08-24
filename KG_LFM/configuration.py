@@ -113,6 +113,9 @@ class ModelConfig:
     codebook_dim: int = 0
     """Dimension of the downsampled codebook. If 0, no downsampling is applied."""
 
+    dead_codebook_threshold: float = 0.5
+    """Threshold for dead codebook entries."""
+
     # Training Configuration
     tune_language_model: bool = False
     """Whether to tune the language model base parameters (does not affect lora params) during training. Defaults to False."""
