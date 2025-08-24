@@ -1,0 +1,78 @@
+seed: 42
+
+dataset:
+  name: "trirex"
+  lite: True  # Use lite version for testing
+  base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM"
+  graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM/graph_embs"
+  preload_nodes_embeddings: False
+
+train_conf:
+  run_name: "kg-decoder-test"
+    
+  epochs: 1  # Short training for testing
+  early_stopping_patience: 2
+  scheduler_patience: 1
+  steps_train: 100  # Small number of steps for testing
+  eval_perc: 0.1
+
+  gradient_accumulation_steps: 2
+  clip_grad_norm: 1.0
+
+  KG_learning_rate: 1e-4
+  LLM_learning_rate: 1e-5
+  weight_decay: 0.01
+
+  rvq_loss_weight: 0.5
+  
+  checkpoint_dir: "/leonardo_work/IscrC_KG-LFM/checkpoints"
+  checkpoint_frequency: 1
+  
+  resume : False
+
+  dataloader:
+    batch_size: 2  # Small batch size for testing
+    shuffle: True
+    num_workers: 2
+
+    include_graphs: True
+    return_tensors: "pt"
+
+    pin_memory: False
+    persistent_workers: False
+
+model:
+  # LLM Configuration
+  llm_model_name: "Qwen/Qwen3-8B"
+  
+  # Graph Encoder Configuration
+  graph_pooling: True  # Enable pooling for simpler decoder
+
+  dropout: 0.2  
+  num_heads: 4
+  gat_layers: 2
+  num_quantizers: 3
+  codebook_size: 128
+  codebook_dim: 0
+  shared_codebook: False
+  dead_codebook_threshold: 0.125
+  
+  # Training Configuration
+  tune_language_model: False
+  tune_kg_encoder: True
+  tune_kg_decoder: True  # Enable decoder training
+  
+  use_lora: True
+  lora_r: 4
+  lora_alpha: 8
+  lora_target_modules: ["q_proj", "k_proj"]
+
+  # KG Decoder Configuration
+  use_kg_decoder: True  # Enable the decoder
+  max_nodes: 20  # Smaller for testing
+  num_edge_types: 500
+  reconstruction_weight: 1.0
+  structure_weight: 0.1
+
+  # Graph Node Embedding Configuration
+  graph_nodes_embedding_model: "Qwen/Qwen3-Embedding-8B"

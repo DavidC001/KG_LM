@@ -131,6 +131,21 @@ class ModelConfig:
     tune_kg_encoder: bool = True
     """Whether to tune the knowledge graph encoder during training. Defaults to True."""
     
+    tune_kg_decoder: bool = True
+    """Whether to tune the knowledge graph decoder during training. Defaults to False."""
+    
+    # KG Decoder Configuration
+    use_kg_decoder: bool = False
+    """Whether to use the KG decoder for reconstruction. Defaults to False."""
+    max_nodes: int = 50
+    """Maximum number of nodes in a graph for decoder. Defaults to 50."""
+    num_edge_types: int = 1000
+    """Number of edge types for structure prediction. Defaults to 1000."""
+    reconstruction_weight: float = 1.0
+    """Weight for reconstruction loss. Defaults to 1.0."""
+    structure_weight: float = 0.1
+    """Weight for graph structure prediction loss. Defaults to 0.1."""
+    
     # Graph Node Embedding Configuration
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Defaults to 'Qwen/Qwen3-Embedding-0.6B'."""

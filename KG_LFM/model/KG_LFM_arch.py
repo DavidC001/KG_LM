@@ -17,6 +17,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import torch
 from KG_LFM.model.KG_encoder import KGEncoder
+from KG_LFM.model.KG_decoder import KGDecoder
 
 from torch_geometric.data import Batch
 
@@ -73,6 +74,8 @@ class KG_LFMConfig(AutoConfig):
     "Whether to tune the language model"
     tune_kg_encoder: bool = False  
     "Whether to tune the knowledge graph encoder"
+    tune_kg_decoder: bool = False  
+    "Whether to tune the knowledge graph decoder"
 
     use_lora: bool = True  
     "Whether to use LoRA for training"
@@ -81,6 +84,18 @@ class KG_LFMConfig(AutoConfig):
     lora_alpha: int = 16  
     "Alpha for LoRA scaling"
     lora_target_modules: List[str] = ["q_proj", "k_proj"]
+
+    # KG Decoder Configuration
+    use_kg_decoder: bool = False  
+    "Whether to use the KG decoder for reconstruction"
+    max_nodes: int = 50  
+    "Maximum number of nodes in a graph for decoder"
+    num_edge_types: int = 1000  
+    "Number of edge types for structure prediction"
+    reconstruction_weight: float = 1.0  
+    "Weight for reconstruction loss"
+    structure_weight: float = 0.1  
+    "Weight for graph structure prediction loss"
 
 def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     """
@@ -118,10 +133,16 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.dead_codebook_threshold = model_args.dead_codebook_threshold
     config.tune_language_model = model_args.tune_language_model
     config.tune_kg_encoder = model_args.tune_kg_encoder
+    config.tune_kg_decoder = model_args.tune_kg_decoder
     config.use_lora = model_args.use_lora
     config.lora_r = model_args.lora_r
     config.lora_alpha = model_args.lora_alpha
     config.lora_target_modules = model_args.lora_target_modules
+    config.use_kg_decoder = model_args.use_kg_decoder
+    config.max_nodes = model_args.max_nodes
+    config.num_edge_types = model_args.num_edge_types
+    config.reconstruction_weight = model_args.reconstruction_weight
+    config.structure_weight = model_args.structure_weight
     
     return config
 
@@ -170,6 +191,38 @@ class KG_LFMMetaModel(ABC):
             std_tokens=self.llm.get_input_embeddings().weight.std().item(),
             dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5
         )
+
+        # Initialize the KGDecoder if configured
+        self.kg_decoder = None
+        if hasattr(config, "use_kg_decoder") and config.use_kg_decoder:
+            logging.info("Initializing KG Decoder.")
+            self.kg_decoder = KGDecoder(
+                node_embedding_dim=config.node_embedding_dim,
+                edge_embedding_dim=config.edge_embedding_dim,
+                final_embedding_dim=self.llm_embedding_dim,
+                dropout=config.dropout,
+                num_heads=config.num_heads,
+                gat_layers=config.gat_layers if hasattr(config, "gat_layers") else 1,
+                num_quantizers=config.num_quantizers,
+                codebook_size=config.codebook_size,
+                codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
+                shared_codebook=config.shared_codebook,
+                graph_pooling=config.graph_pooling,
+                max_nodes=config.max_nodes if hasattr(config, "max_nodes") else 50,
+                num_edge_types=config.num_edge_types if hasattr(config, "num_edge_types") else 1000,
+                reconstruction_weight=config.reconstruction_weight if hasattr(config, "reconstruction_weight") else 1.0,
+                structure_weight=config.structure_weight if hasattr(config, "structure_weight") else 0.1
+            )
+            
+            # Share the vector quantizer from encoder to decoder for proper reconstruction
+            if hasattr(self.kg_encoder, 'dir_vq'):
+                self.kg_decoder.set_encoder_vq(self.kg_encoder.dir_vq)
+            
+            # Freeze decoder if configured
+            if not getattr(config, "tune_kg_decoder", False):
+                logging.info("Freezing KG Decoder parameters.")
+                for param in self.kg_decoder.parameters():
+                    param.requires_grad = False
 
         assert (
             self.llm is not None and self.kg_encoder is not None
@@ -233,6 +286,18 @@ class KG_LFMMetaModel(ABC):
                 "The model will use a randomly initialized KG Encoder."
             )
 
+        # Load the state dictionary for the KG Decoder if it exists
+        kg_decoder_path = osp.join(model_path_or_config, "kg_decoder.pth")
+        if osp.exists(kg_decoder_path) and hasattr(model, 'kg_decoder') and model.kg_decoder is not None:
+            logging.info(f"Loading pretrained KG Decoder from {kg_decoder_path}")
+            kg_decoder_state_dict = torch.load(kg_decoder_path, map_location='cpu')
+            model.kg_decoder.load_state_dict(kg_decoder_state_dict)
+        elif hasattr(model, 'kg_decoder') and model.kg_decoder is not None:
+            warnings.warn(
+                f"KG Decoder weights not found at {kg_decoder_path}. "
+                "The model will use a randomly initialized KG Decoder."
+            )
+
         model.is_loaded = True
         return model
 
@@ -247,6 +312,7 @@ class KG_LFMMetaModel(ABC):
         # Define specific paths for components
         llm_dir = osp.join(output_dir, "llm")
         kg_encoder_path = osp.join(output_dir, "kg_encoder.pth")
+        kg_decoder_path = osp.join(output_dir, "kg_decoder.pth")
         
         # Save tokenizer and llm config/weights
         if self.get_llm():
@@ -266,6 +332,14 @@ class KG_LFMMetaModel(ABC):
             )
             torch.save(kg_encoder_state_dict, kg_encoder_path)
 
+        # Save KG decoder weights
+        if self.get_kg_decoder():
+            logging.info(f"Saving KG Decoder to {kg_decoder_path}")
+            kg_decoder_state_dict = OrderedDict(
+                {k.split("kg_decoder.")[-1]: v for k, v in state_dict.items() if "kg_decoder." in k}
+            )
+            torch.save(kg_decoder_state_dict, kg_decoder_path)
+
         # Save the main model config
         self.config._name_or_path = output_dir
         self.config.architectures = [self.__class__.__name__]
@@ -283,6 +357,10 @@ class KG_LFMMetaModel(ABC):
         kg_encoder = getattr(self, "kg_encoder", None)
         return kg_encoder
 
+    def get_kg_decoder(self):
+        kg_decoder = getattr(self, "kg_decoder", None)
+        return kg_decoder
+
     def correct_train(self):
         '''
         To ensure the expected behaviors for modules like dropout, batchnorm, etc., we need to call model.eval() for the freezed modules.
@@ -295,11 +373,40 @@ class KG_LFMMetaModel(ABC):
         if self.get_kg_encoder() and not getattr(self.config, "tune_kg_encoder", False):
             self.get_kg_encoder().eval()
             logging.debug("Freezed kg_encoder model to eval mode.")
+        if self.get_kg_decoder() and not getattr(self.config, "tune_kg_decoder", False):
+            self.get_kg_decoder().eval()
+            logging.debug("Freezed kg_decoder model to eval mode.")
     
     def encode_graphs(self, graphs):
         kg_encoder = self.get_kg_encoder()
         graph_features, indexes, RVQ_loss = kg_encoder(graphs)
         return graph_features, indexes, RVQ_loss
+    
+    def decode_graphs(self, quantized_tokens, quantized_indices, original_graphs=None, target_node_features=None, target_edge_features=None):
+        """
+        Decode quantized representations back to graph data using the KG decoder.
+        
+        Args:
+            quantized_tokens: Quantized token representations from encoder
+            quantized_indices: Quantized indices from encoder
+            original_graphs: Original graph batch for structure reference (optional)
+            target_node_features: Target node features for loss calculation (optional)
+            target_edge_features: Target edge features for loss calculation (optional)
+            
+        Returns:
+            Decoder output dict or None if decoder not available
+        """
+        kg_decoder = self.get_kg_decoder()
+        if kg_decoder is None:
+            return None
+            
+        return kg_decoder(
+            quantized_tokens=quantized_tokens,
+            quantized_indices=quantized_indices,
+            original_graphs=original_graphs,
+            target_node_features=target_node_features,
+            target_edge_features=target_edge_features
+        )
     
     def _temporary_reorder_cache(self, past_key_values, sorted_idx):
         return self.get_llm()._temporary_reorder_cache(past_key_values, sorted_idx)
@@ -344,13 +451,19 @@ class KG_LFMMetaForCausalLM(ABC):
                 None, # Return standard embeddings
                 labels,
                 RVQ_loss,
-                None  # No indices for graph embeddings
+                None,  # No indices for graph embeddings
+                None,  # No quantized tokens
+                None   # No quantized indices
             )
 
         logging.debug(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
         # Encode the knowledge graphs into embeddings that will replace KG tokens
         graph_features, indices, RVQ_loss = self.encode_graphs(graphs)
         graph_features = graph_features.to(self.llm.dtype)
+
+        # Store quantized tokens and indices to return them for decoder use
+        quantized_tokens = graph_features
+        quantized_indices = indices
 
         processed_graph = 0
         
@@ -545,7 +658,9 @@ class KG_LFMMetaForCausalLM(ABC):
             new_input_embeds_padded,  # The main output: text + graph embeddings
             new_labels,
             RVQ_loss,  # Return the RVQ loss for training purposes
-            indices
+            indices,
+            quantized_tokens,  # Return quantized tokens for decoder
+            quantized_indices  # Return quantized indices for decoder
         )
     
     @torch.inference_mode()
@@ -577,7 +692,9 @@ class KG_LFMMetaForCausalLM(ABC):
             inputs_embeds,
             _,
             _,
-            _
+            _,
+            _,  # quantized_tokens (not needed for generation)
+            _   # quantized_indices (not needed for generation)
         ) = self.prepare_inputs_labels_for_multimodal(
             input_ids, None, attention_mask, None, None, graphs
         )
@@ -699,6 +816,8 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         """
         
         RVQ_loss = None
+        quantized_tokens = None
+        quantized_indices = None
         if inputs_embeds is None:
             logging.debug("Preparing inputs and labels for multimodal processing...")
             (
@@ -709,7 +828,9 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
                 inputs_embeds,
                 labels,
                 RVQ_loss,
-                indices
+                indices,
+                quantized_tokens,
+                quantized_indices
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -738,12 +859,110 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         
         logging.debug(f"Output from LLM: {out.keys()}")
         
+        # Add decoder reconstruction loss if decoder is enabled and we have quantized tokens
+        decoder_loss = None
+        if (self.get_kg_decoder() is not None and 
+            RVQ_loss is not None and 
+            'quantized_tokens' in locals() and quantized_tokens is not None and
+            'quantized_indices' in locals() and quantized_indices is not None and
+            graphs is not None):
+            
+            # Use the quantized tokens and indices returned from prepare function
+            
+            # Extract original graph features for reconstruction targets
+            # Create targets by gathering node and edge features per graph
+            target_node_features = []
+            target_edge_features = []
+            
+            batch_ptr = graphs.ptr if hasattr(graphs, 'ptr') else None
+            if batch_ptr is not None:
+                # Use batch pointers to split features per graph
+                for i in range(len(batch_ptr) - 1):
+                    start_idx = batch_ptr[i]
+                    end_idx = batch_ptr[i + 1]
+                    graph_nodes = graphs.x[start_idx:end_idx]
+                    target_node_features.append(graph_nodes)
+                
+                # For edges, we need to be more careful as edge indices might be different
+                for i in range(len(batch_ptr) - 1):
+                    # Count edges for this graph
+                    node_start = batch_ptr[i]
+                    node_end = batch_ptr[i + 1]
+                    
+                    # Find edges that belong to this graph
+                    edge_mask = (graphs.edge_index[0] >= node_start) & (graphs.edge_index[0] < node_end)
+                    graph_edges = graphs.edge_attr[edge_mask] if hasattr(graphs, 'edge_attr') else None
+                    if graph_edges is not None:
+                        target_edge_features.append(graph_edges)
+            else:
+                # Fallback: use batch attribute to split
+                unique_batches = torch.unique(graphs.batch)
+                for batch_id in unique_batches:
+                    node_mask = graphs.batch == batch_id
+                    graph_nodes = graphs.x[node_mask]
+                    target_node_features.append(graph_nodes)
+                    
+                    # For edges, find those connecting nodes in this graph
+                    edge_mask = torch.isin(graphs.edge_index[0], torch.where(node_mask)[0])
+                    if hasattr(graphs, 'edge_attr'):
+                        graph_edges = graphs.edge_attr[edge_mask]
+                        target_edge_features.append(graph_edges)
+            
+            # Pad target features to same length for batching
+            if target_node_features:
+                max_nodes = max(feat.shape[0] for feat in target_node_features)
+                padded_node_features = []
+                for feat in target_node_features:
+                    if feat.shape[0] < max_nodes:
+                        padding = torch.zeros(max_nodes - feat.shape[0], feat.shape[1], 
+                                            device=feat.device, dtype=feat.dtype)
+                        feat = torch.cat([feat, padding], dim=0)
+                    padded_node_features.append(feat)
+                target_node_features = torch.stack(padded_node_features)
+            else:
+                target_node_features = None
+                
+            if target_edge_features:
+                max_edges = max(feat.shape[0] for feat in target_edge_features)
+                padded_edge_features = []
+                for feat in target_edge_features:
+                    if feat.shape[0] < max_edges:
+                        padding = torch.zeros(max_edges - feat.shape[0], feat.shape[1], 
+                                            device=feat.device, dtype=feat.dtype)
+                        feat = torch.cat([feat, padding], dim=0)
+                    padded_edge_features.append(feat)
+                target_edge_features = torch.stack(padded_edge_features)
+            else:
+                target_edge_features = None
+            
+            decoder_output = self.decode_graphs(
+                quantized_tokens=quantized_tokens,
+                quantized_indices=quantized_indices,
+                original_graphs=graphs,
+                target_node_features=target_node_features,
+                target_edge_features=target_edge_features
+            )
+            
+            if decoder_output is not None:
+                decoder_loss = decoder_output['reconstruction_loss']
+                logging.debug(f"Decoder reconstruction loss: {decoder_loss}")
+        
         # If RVQ_loss is not None, add it to the model's loss for training
         if return_dict:
             out["RVQ_loss"] = RVQ_loss
             out["RVQ_indices"] = indices
+            out["decoder_loss"] = decoder_loss
+            
+            # Add decoder loss to the main loss if both exist
+            if out.loss is not None and decoder_loss is not None:
+                out.loss = out.loss + decoder_loss
+            elif decoder_loss is not None:
+                out.loss = decoder_loss
         else:
-            out = (out[0] + RVQ_loss,) + out[1:]
+            total_loss = out[0] if RVQ_loss is None else out[0] + RVQ_loss
+            if decoder_loss is not None:
+                total_loss = total_loss + decoder_loss if total_loss is not None else decoder_loss
+            out = (total_loss,) + out[1:]
             
         return out
         
