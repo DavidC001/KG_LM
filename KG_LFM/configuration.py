@@ -156,6 +156,9 @@ class TrainConfig:
     scheduler_metric: str = "validation_loss"
     """Metric to monitor for the learning rate scheduler. Defaults to 'validation_loss'."""
     
+    scheduler_mode: str = "min"
+    """Mode for the learning rate scheduler. Defaults to 'min'."""
+
     KG_learning_rate: float = 1e-4
     """Learning rate for the KG optimizer. Defaults to 1e-4."""
     
@@ -191,8 +194,7 @@ class TrainConfig:
         self.KG_learning_rate = float(self.KG_learning_rate)
         self.LLM_learning_rate = float(self.LLM_learning_rate)
         self.weight_decay = float(self.weight_decay)
-
-
+        
 @dataclass
 class ProjectConfig:
     seed: int = 42

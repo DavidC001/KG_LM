@@ -13,6 +13,7 @@ from collections import defaultdict
 import gc
 from copy import deepcopy
 import psutil
+import uuid
 
 import torch
 import torch.nn as nn
@@ -134,11 +135,13 @@ class KG_LFM_Trainer:
         self.test_dataloader: DataLoader = None
         self.dataloader_factory = None  # Store factory for epoch setting
         
+        # Generate unique wandb run ID to prevent collisions in simultaneous runs
+        # Since run names are guaranteed to be unique, we'll use the run name as the wandb ID
         self.wandb_run_id = None
 
         self.global_step = 0
         self.start_epoch = 0
-        self.best_val_loss = float('inf')
+        self.best_val_metric = float('inf') if self.config.train_conf.scheduler_mode == "min" else float('-inf')
         self.epochs_without_improvement = 0
         self.last_best_model_save_step = -1  # Track when we last saved a best model
         
@@ -176,20 +179,34 @@ class KG_LFM_Trainer:
             # if already initialized, just resume
             if wandb.run is not None:
                 self.logger.info(f"Resuming existing wandb run: {wandb.run.id}")
+                return
             
             wandb_config = deepcopy(self.config).to_dict() # Assuming a method to convert config to dict
             
-            run_id = self.wandb_run_id
+            # For resuming: use stored wandb_run_id, for new runs: generate unique prefix
+            if self.wandb_run_id:
+                # Resuming from checkpoint - use exact same ID
+                run_id = self.wandb_run_id
+                resume_mode = "must"  # Must resume this exact run
+                self.logger.info(f"Resuming wandb run with ID: {run_id}")
+            else:
+                # New run - generate unique prefix to prevent ID collisions
+                unique_prefix = f"{self.run_name}_{uuid.uuid4().hex[:8]}"
+                run_id = unique_prefix
+                resume_mode = "never"  # Never resume, always create new
+                self.wandb_run_id = run_id  # Store for checkpointing
+                self.logger.info(f"Creating new wandb run with unique ID: {run_id}")
             
             self.accelerator.init_trackers(
                 project_name="kg-lfm-pretraining",
                 config=wandb_config,
                 init_kwargs={"wandb": {
                     "name": self.run_name,
-                    "resume": "auto", 
+                    "resume": resume_mode,
                     "id": run_id
                     }}
             )
+            
             self.logger.info("Wandb initialized successfully")
         
         # For non-main processes, just wait
@@ -279,7 +296,7 @@ class KG_LFM_Trainer:
 
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
-            mode="min",
+            mode=self.config.train_conf.scheduler_mode,
             factor=0.5,
             patience=self.config.train_conf.scheduler_patience,
             verbose=True
@@ -447,8 +464,9 @@ class KG_LFM_Trainer:
             total=self.steps_train
         )
 
-        total_RVQ_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-        total_CE_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+        # Initialize accumulation variables properly
+        total_RVQ_loss = 0.0
+        total_CE_loss = 0.0
 
         step = 0
         while step < self.steps_train:
@@ -495,16 +513,24 @@ class KG_LFM_Trainer:
                 if not is_valid_loss:
                     self.logger.warning(f"NaN or Inf detected at step {step + 1}, skipping backward. Language Loss: {language_loss.item()}, RVQ Loss: {RVQ_loss.item()}")
                 else:
-                    total_RVQ_loss += RVQ_loss / self.grad_accumulation_steps
-                    total_CE_loss += language_loss / self.grad_accumulation_steps
+                    # Accumulate losses correctly - just add the raw values
+                    total_RVQ_loss += RVQ_loss.item()
+                    total_CE_loss += language_loss.item()
                     self.accelerator.backward(loss)
                 
-                if self.accelerator.sync_gradients: # TRUE when accumulating gradients
+                if self.accelerator.sync_gradients: # TRUE when gradient accumulation is complete
 
                     if self.clip_grad_norm > 0:
                         norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
 
-                    metrics = self.compute_train_metrics(total_RVQ_loss, total_CE_loss)
+                    # Compute average losses over accumulation steps
+                    avg_RVQ_loss = total_RVQ_loss / self.grad_accumulation_steps
+                    avg_CE_loss = total_CE_loss / self.grad_accumulation_steps
+
+                    metrics = self.compute_train_metrics(
+                        torch.tensor(avg_RVQ_loss, device=self.device), 
+                        torch.tensor(avg_CE_loss, device=self.device)
+                    )
                     self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
                     
                     log_metrics = {
@@ -513,8 +539,9 @@ class KG_LFM_Trainer:
                     log_metrics["train/clip_grad_norm"] = norm if self.clip_grad_norm > 0 else 0.0
                     self.accelerator.log(log_metrics, step=self.global_step)
                     
-                    total_CE_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-                    total_RVQ_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                    # Reset accumulation variables
+                    total_CE_loss = 0.0
+                    total_RVQ_loss = 0.0
                     
                 # does NOTHING when using deepspeed
                 self.optimizer.step() 
@@ -584,7 +611,7 @@ class KG_LFM_Trainer:
             other_state = {
                 'epoch': epoch + 1,
                 'global_step': self.global_step,
-                'best_val_loss': self.best_val_loss,
+                'best_val_metric': self.best_val_metric,
                 'epochs_without_improvement': self.epochs_without_improvement,
                 'last_best_model_save_step': self.last_best_model_save_step,
                 'wandb_run_id': wandb.run.id if wandb.run else None,
@@ -630,11 +657,16 @@ class KG_LFM_Trainer:
             
             self.start_epoch = state.get('epoch', 0)
             self.global_step = state.get('global_step', 0)
-            self.best_val_loss = state.get('best_val_loss', float('inf'))
+            self.best_val_metric = state.get('best_val_metric', float('inf') if self.config.train_conf.scheduler_mode == "min" else float('-inf'))
             self.epochs_without_improvement = state.get('epochs_without_improvement', 0)
             self.last_best_model_save_step = state.get('last_best_model_save_step', -1)
             self.logger.info(f"Resuming from epoch {self.start_epoch + 1}, global step {self.global_step}")
-            self.wandb_run_id = state.get('wandb_run_id', None)
+            
+            # Restore wandb run ID from checkpoint to maintain consistency
+            restored_wandb_id = state.get('wandb_run_id', None)
+            if restored_wandb_id:
+                self.wandb_run_id = restored_wandb_id
+                self.logger.info(f"Restored wandb run ID from checkpoint: {restored_wandb_id}")
             
             # skip to the correct batch in the dataloader
             batches_seen_in_ep = self.global_step % len(self.train_dataloader)
@@ -707,11 +739,21 @@ class KG_LFM_Trainer:
                 self.logger.debug(f"Training step {step_idx + 1}/{total_training_steps} (Epoch {current_epoch + 1}/{num_epochs}, Step {step_in_epoch + 1}/{steps_per_epoch}) - Train Metrics: {train_metrics} - Val Metrics: {val_metrics}")
                 time.sleep(60)
 
-            is_best = val_metrics['language_loss'] < self.best_val_loss
+            is_best = (
+                (
+                    val_metrics[self.config.train_conf.scheduler_metric] < self.best_val_metric 
+                    and self.config.train_conf.scheduler_mode == "min" 
+                ) 
+                or
+                (
+                    val_metrics[self.config.train_conf.scheduler_metric] > self.best_val_metric 
+                    and self.config.train_conf.scheduler_mode == "max" 
+                )
+            )
             if is_best:
-                self.best_val_loss = val_metrics['language_loss']
+                self.best_val_metric = val_metrics[self.config.train_conf.scheduler_metric]
                 self.epochs_without_improvement = 0
-                self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}")
+                self.logger.info(f"New best validation loss: {self.best_val_metric:.4f}")
             else:
                 self.epochs_without_improvement += 1
 
