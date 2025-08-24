@@ -1,27 +1,27 @@
 seed: 42
 
 dataset:
-  name: "trirex"
+  name: "simple-questions"
   lite: False
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM/graph_embs"
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "tri-KG-LFM-10-256"
+  run_name: "KG-LFM-QA"
     
   epochs: 10
   early_stopping_patience: 2
   scheduler_patience: 1
   scheduler_metric: "Hit@10"
   scheduler_mode: "max"
-  steps_train: 8192
-  eval_perc: 0.25
+  steps_train: 1
+  eval_perc: 1
 
   gradient_accumulation_steps: 2 # more randomness
   clip_grad_norm: 1.0
 
-  KG_learning_rate: 5e-4
+  KG_learning_rate: 1e-5
   LLM_learning_rate: 1e-5
   weight_decay: 0.01
 
@@ -31,6 +31,7 @@ train_conf:
   checkpoint_frequency: 5
   
   resume : True
+  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/tri-KG-LFM-10-256/best_model"
 
   dataloader:
     batch_size: 8
