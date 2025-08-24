@@ -28,3 +28,9 @@ gradio
 spacy
 fuzzywuzzy
 python-Levenshtein
+
+matplotlib>=3.6.0
+seaborn>=0.12.0
+pandas>=1.5.0
+numpy>=1.21.0
+tabulate

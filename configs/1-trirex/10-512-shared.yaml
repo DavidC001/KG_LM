@@ -11,9 +11,10 @@ train_conf:
   run_name: "tri-KG-LFM-10-512-shared"
 
   epochs: 10
-  early_stopping_patience: 1
-  scheduler_patience: 0
+  early_stopping_patience: 2
+  scheduler_patience: 1
   scheduler_metric: "Hit@10"
+  scheduler_mode: "max"
   steps_train: 8192
   eval_perc: 0.25
 
@@ -55,6 +56,8 @@ model:
   codebook_size: 512
   codebook_dim: 0
   shared_codebook: True
+  dead_codebook_threshold: 0.03125
+  # {total batch_size}/{codebook_size}/2
   
   # Training Configuration
   tune_language_model: False

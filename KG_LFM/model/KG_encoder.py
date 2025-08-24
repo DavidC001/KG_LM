@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import TransformerConv, GraphNorm
 import logging
 
-from vector_quantize_pytorch import ResidualVQ
+from vector_quantize_pytorch import VectorQuantize
 
 # graph pooling
 from torch_geometric.nn import global_mean_pool
@@ -21,6 +21,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class DirectionalVQ(nn.Module):
+    """
+    Multi-step 'directional' VQ built from base VectorQuantize:
+    - use_cosine_sim=True => codes + inputs are L2-normalized internally
+    - per step: pick code, STE token, subtract PROJECTION only (OMP-like)
+    - returns tokens [B, Q, D], indices [B, Q], and total loss
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_quantizers: int = 3,
+        codebook_size: int = 512,
+        *,
+        shared_codebook: bool = True,
+        beta_commit: float = 0.25,
+        dead_codebook_threshold: float = 0.5,
+        vq_kwargs: dict | None = None
+    ):
+        super().__init__()
+        self.num_quantizers = num_quantizers
+        self.beta_commit = beta_commit
+
+        vq_kwargs = dict(vq_kwargs or {})
+        # we use our own commit; disable internal one
+        vq_kwargs.setdefault("commitment_weight", 0.0)
+        vq_kwargs.setdefault("use_cosine_sim", True)
+        vq_kwargs.setdefault("threshold_ema_dead_code", dead_codebook_threshold)
+        vq_kwargs.setdefault("dim", dim)
+        vq_kwargs.setdefault("codebook_size", codebook_size)
+
+        if shared_codebook:
+            self.vq = VectorQuantize(**vq_kwargs)
+            self.vqs = None
+        else:
+            self.vq = None
+            self.vqs = nn.ModuleList([
+                VectorQuantize(**vq_kwargs)
+                for _ in range(num_quantizers)
+            ])
+
+    def _get_vq(self, i: int) -> VectorQuantize:
+        return self.vq if self.vq is not None else self.vqs[i]
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, D]
+        returns:
+          tokens:  [B, Q, D]  (STE outputs at each depth)
+          indices: [B, Q]     (code indices per depth)
+          loss:    scalar     (cosine commit + residual leftover)
+        """
+        assert x.ndim == 2, "expecting [B, D] after graph pooling"
+
+        # quantizer expects float32 internally
+        residual = x.float()
+
+        tokens = []
+        indices = []
+        total_loss = residual.new_tensor(0.)
+
+        for i in range(self.num_quantizers):
+            vq = self._get_vq(i)
+            vq.float()
+
+            # quantize the current residual (VectorQuantize normalizes internally for cosine)
+            quantized, embed_ind, _ = vq(residual)   # quantized ~ unit-norm (cosine codebook)
+            indices.append(embed_ind)                # [B,]
+
+            # cosine-based commitment (directional), numerically safe
+            norm_res = F.normalize(residual, dim=-1)
+            norm_code = F.normalize(quantized.detach(), dim=-1)
+            cos_sim = (norm_res * norm_code).sum(-1).clamp(-1.0, 1.0)     # [B]
+            commit_loss = (1.0 - cos_sim).mean()
+            total_loss = total_loss + self.beta_commit * commit_loss
+
+            # STE token to feed downstream (gradient to encoder through residual)
+            token = residual + (quantized - residual).detach()
+            tokens.append(token)  # [B, D]
+
+            # OMP-style residual update: subtract only the projection onto the chosen code direction
+            alpha = (residual * norm_code).sum(-1, keepdim=True)          # [B, 1]
+            residual = residual - alpha * norm_code                       # stays orthogonal to code
+
+        # penalize any leftover residual energy
+        total_loss = total_loss + residual.pow(2).mean()
+
+        tokens = torch.stack(tokens, dim=1)            # [B, Q, D]
+        indices = torch.stack(indices, dim=1)          # [B, Q]
+        return tokens, indices, total_loss
+
 
 class KGEncoder(nn.Module):
     def __init__(
@@ -28,7 +118,7 @@ class KGEncoder(nn.Module):
         node_embedding_dim, edge_embedding_dim, final_embedding_dim, std_tokens,
         dropout=0.2, num_heads=1, gat_layers=3, graph_pooling=True, 
         num_quantizers=3, codebook_size=512, codebook_dim=0, shared_codebook=False,
-        beta_commit=0.25,
+        beta_commit=0.25, dead_codebook_threshold=0.5
     ):
         """
         Initializes the KGEncoder model.
@@ -70,23 +160,30 @@ class KGEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.num_quantizers = num_quantizers
 
+        self.codebook_dim = codebook_dim
         if codebook_dim > 0:
             self.downsample = nn.Linear(node_embedding_dim, codebook_dim)
             self.downsample_norm = nn.LayerNorm(codebook_dim)
-            self.upsample = nn.Linear(codebook_dim, node_embedding_dim)
+            self.upsample   = nn.Linear(codebook_dim, node_embedding_dim)
             self.upsample_norm = nn.LayerNorm(node_embedding_dim)
-        
-        self.codebook_dim = codebook_dim
 
-        self.vq = ResidualVQ(
-            dim=node_embedding_dim if codebook_dim == 0 else codebook_dim,
+        vq_dim = node_embedding_dim if codebook_dim == 0 else codebook_dim
+        self.dir_vq = DirectionalVQ(
+            dim=vq_dim,
             num_quantizers=num_quantizers,
             codebook_size=codebook_size,
             shared_codebook=shared_codebook,
-            use_cosine_sim = True,
-            threshold_ema_dead_code = 2,
+            beta_commit=beta_commit,
+            dead_codebook_threshold=dead_codebook_threshold,
+            vq_kwargs=dict(
+                # optional arguments:
+                # orthogonal_reg_weight=1e-4,
+                # codebook_diversity_loss_weight=1e-4,
+                # kmeans_init=True,
+                # ...
+            )
         )
-        self.beta_commit = beta_commit
+        
         self.kg_bias = nn.Parameter(torch.zeros(final_embedding_dim))
         self.text_embs_std = std_tokens
 
@@ -146,35 +243,17 @@ class KGEncoder(nn.Module):
         if self.codebook_dim > 0:
             x = self.downsample(x)
             x = self.downsample_norm(x)
-
-        # ugly solution to problem of vector quantization not working with half precision
-        x = x.float()
-        self.vq.float()
         
-        quantized, indices, commit_loss, all_codes = self.vq(x, return_all_codes=True)
-        residual_loss = F.mse_loss(x, quantized)
-        commit_loss = commit_loss.flatten().mean()
-        loss = commit_loss * self.beta_commit + residual_loss
+        # quantize directionally
+        tokens, indices, loss = self.dir_vq(x)     # tokens: [B, Q, vq_dim]
 
         dtype = self.kg_bias.dtype
-        all_codes = all_codes.to(dtype=dtype)
-
-        # apply the STE trick to get gradients to the encoder
-        residual = x.to(dtype=dtype)
-        tokens = []
-        for i in range(self.num_quantizers):
-            tokens.append( residual + (all_codes[i] - residual).detach())
-            residual = residual - all_codes[i].detach()
-
-        tokens = torch.stack(tokens) # (num_quantizers, B, dim)
-        tokens = tokens.permute(1, 0, 2)  # (B, num_quantizers, dim)
-        tokens = tokens.to(dtype=dtype)  # Ensure tokens have the correct dtype
+        tokens = tokens.to(dtype=dtype)
         
         if self.codebook_dim > 0:
             tokens = self.upsample(tokens)
             tokens = self.upsample_norm(tokens)
         
-        # in forward, after (optional) upsample:
         tokens = self.dropout(tokens)                             # [B, Q, node_D]
         proj = self.output_projection(tokens)                     # [B, Q, final_D]
         skip = self.skip_to_final(tokens)                         # [B, Q, final_D]
@@ -189,7 +268,6 @@ class KGEncoder(nn.Module):
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(f"Output shape after adapter and normalization: {x.shape}")
-            logging.debug(f"Quantized output shape: {all_codes.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
             logging.debug(f"Quantized output shape: {tokens.shape}, Indices shape: {indices.shape}, Loss: {loss.item()}")
         
         # Return the quantized representations

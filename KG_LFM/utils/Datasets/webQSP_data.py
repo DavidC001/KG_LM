@@ -96,7 +96,7 @@ class WebQSPDataset(Dataset):
             },
             {
                 'role': 'assistant',
-                'content': sample['answer']
+                'content': "the answer is: " + sample['answer']
             }
         ]
         # if tokenizer has chat template, use it

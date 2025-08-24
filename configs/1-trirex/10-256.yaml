@@ -11,9 +11,10 @@ train_conf:
   run_name: "tri-KG-LFM-10-256"
     
   epochs: 10
-  early_stopping_patience: 1
-  scheduler_patience: 0
+  early_stopping_patience: 2
+  scheduler_patience: 1
   scheduler_metric: "Hit@10"
+  scheduler_mode: "max"
   steps_train: 8192
   eval_perc: 0.25
 
@@ -55,6 +56,9 @@ model:
   codebook_size: 256
   codebook_dim: 0
   shared_codebook: False
+  dead_codebook_threshold: 0.0625 
+  # {total batch_size}/{codebook_size}/2 
+  # meaning that the code need to be used around once every {codebook_size}*2 samples
   
   # Training Configuration
   tune_language_model: False

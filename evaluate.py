@@ -25,6 +25,8 @@ def main():
                        help="Disable baseline model evaluation")
     parser.add_argument("--no_text", action="store_true",
                        help="Disable textualization evaluation")
+    parser.add_argument("--only_baselines", action="store_true",
+                       help="Only evaluate baseline models")
 
     args = parser.parse_args()
     
@@ -42,7 +44,8 @@ def main():
         batch_size=args.batch_size,
         max_samples=args.max_samples,
         no_baseline=args.no_baseline,
-        no_text=args.no_text
+        no_text=args.no_text,
+        only_baselines=args.only_baselines
     )
     
     # Run evaluation

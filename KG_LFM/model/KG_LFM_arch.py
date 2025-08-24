@@ -66,6 +66,8 @@ class KG_LFMConfig(AutoConfig):
     "Dimension of the downsampled codebook. If 0, no downsampling is applied."
     shared_codebook: bool = False  
     "Whether to use a shared codebook across quantizers"
+    dead_codebook_threshold: float = 0.5
+    "Threshold for dead codebook entries"
 
     tune_language_model: bool = False  
     "Whether to tune the language model"
@@ -113,6 +115,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.codebook_size = model_args.codebook_size
     config.codebook_dim = model_args.codebook_dim
     config.shared_codebook = model_args.shared_codebook
+    config.dead_codebook_threshold = model_args.dead_codebook_threshold
     config.tune_language_model = model_args.tune_language_model
     config.tune_kg_encoder = model_args.tune_kg_encoder
     config.use_lora = model_args.use_lora
@@ -164,7 +167,8 @@ class KG_LFMMetaModel(ABC):
             shared_codebook=config.shared_codebook,
             graph_pooling=config.graph_pooling,
             beta_commit=0.25,
-            std_tokens=self.llm.get_input_embeddings().weight.std().item()
+            std_tokens=self.llm.get_input_embeddings().weight.std().item(),
+            dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5
         )
 
         assert (
