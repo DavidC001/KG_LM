@@ -17,14 +17,14 @@ source ./prepare_env.sh
 
 # if no argument is provided, use default config
 if [ -z "$1" ]; then
-    echo "No config file provided, using default config."
-    export CONFIG_FILE="configs/base_config.yaml"
+    echo "Please provide a config file."
+    exit 1
 else
-    export CONFIG_FILE=$1
+    CONFIG_FILE=$1
 fi
 
 OUTPUT_FILE="${2:-eval/eval-$JOB_ID.json}"
-BATCH_SIZE="${3:-16}"
+BATCH_SIZE="${3:-1}"
 MAX_SAMPLES="${4:-None}"
 
-accelerate launch --config-file configs/accelerate_evalconfig.yaml evaluate.py --config $CONFIG_FILE --output_file $OUTPUT_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES --no_baseline
+accelerate launch --config-file configs/accelerate_evalconfig.yaml evaluate.py --config $CONFIG_FILE --output_file $OUTPUT_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES --only_baselines
