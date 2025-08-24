@@ -37,8 +37,6 @@ The script will use the base path of the search for the following dataset files:
 - [train](https://github.com/askplatypus/wikidata-simplequestions/raw/master/annotated_wd_data_train_answerable.txt), [val](https://github.com/askplatypus/wikidata-simplequestions/raw/master/annotated_wd_data_valid_answerable.txt) and [test](https://github.com/askplatypus/wikidata-simplequestions/raw/master/annotated_wd_data_test_answerable.txt) splits of the simple questions dataset mapped to WD.
 These files need to be downloaded and placed in the base path provided.
 
-mapping file from freebase to WD is from this [repo](https://github.com/askplatypus/wikidata-simplequestions/tree/master)
-
 NOTE: some of the steps require internet access, if your compute nodes do not have it you can try to run the scipt for the lite version of the data, then you should be able to run the full version without internet access.
 
 ## 🔧 Configuration

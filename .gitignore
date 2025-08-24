@@ -173,5 +173,8 @@ out/
 vila-u/
 wandb/
 eval/
+generated_eval_jobs/
+generated_eval_configs/
+plots/
 .vscode/
 .deepspeed_env

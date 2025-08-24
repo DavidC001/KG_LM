@@ -34,7 +34,7 @@ class KGLFM_Collator:
     ):
         self.tokenizer = tokenizer
         self.padding = padding
-        self.max_length = max_length if max_length is not None else tokenizer.model_max_length
+        self.max_length = max_length
         self.pad_to_multiple_of = pad_to_multiple_of
         self.return_tensors = return_tensors
         
