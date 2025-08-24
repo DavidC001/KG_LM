@@ -15,8 +15,8 @@ train_conf:
   scheduler_patience: 1
   scheduler_metric: "Hit@10"
   scheduler_mode: "max"
-  steps_train: 1
-  eval_perc: 1
+  steps_train: 1.0
+  eval_perc: 1.0
 
   gradient_accumulation_steps: 2 # more randomness
   clip_grad_norm: 1.0
