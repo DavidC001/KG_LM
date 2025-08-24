@@ -26,8 +26,8 @@ import torch
 from tqdm.auto import tqdm
 
 # Project imports
-from KG_LFM.configuration import load_yaml_config, ProjectConfig, IGNORE_INDEX
-from KG_LFM.model.KG_LFM_arch import KG_LFM
+from KG_LFM.configuration import load_yaml_config, ProjectConfig, IGNORE_INDEX, SPECIAL_KG_TOKEN
+from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig
 from KG_LFM.utils.Dataloader import create_dataloader
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -146,13 +146,17 @@ class KGLFMEvaluator:
         batch_size: int = 8,
         max_samples: Optional[int] = None,
         no_baseline: bool = False,
-        no_text: bool = False
+        no_text: bool = False,
+        only_baselines: bool = False
     ):
         self.config_path = config_path
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.no_baseline = no_baseline
         self.no_text = no_text
+        self.only_baselines = only_baselines
+
+        assert not (self.no_baseline and self.only_baselines), "Conflicting options: --no_baseline and --only_baselines"
 
         # Initialize accelerator
         self.accelerator = Accelerator()
@@ -181,7 +185,7 @@ class KGLFMEvaluator:
             conversation = batch["conversations"][sample_idx]
             
             # remove the one with the special token
-            kg_string = self.tokenizer.decode(self.model.special_kg_token)
+            kg_string = SPECIAL_KG_TOKEN
             conversation = [turn for turn in conversation if kg_string not in turn['content']]
 
             # If tokenizer has a apply_chat_template method, use it
@@ -254,7 +258,7 @@ class KGLFMEvaluator:
             graph_text += "\n"
 
             # in the turn with SPECIAL_KG_TOKEN substitute it with <SPECIAL_KG_TOKEN>
-            special_tok = self.tokenizer.decode(self.model.special_kg_token)
+            special_tok = SPECIAL_KG_TOKEN
             num_turns = len(batch["conversations"][sample_idx])
             batch["conversations"][sample_idx] = [{
                 "role": batch["conversations"][sample_idx][i]["role"],
@@ -278,23 +282,34 @@ class KGLFMEvaluator:
         self.tests = {}
         
         try:
-            self.model = KG_LFM.from_pretrained(self.model_path)
-            self.model.eval()
-            self.tokenizer = self.model.tokenizer
+            self.model_config : KG_LFMConfig = KG_LFMConfig.from_pretrained(self.model_path)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path / "llm")
             
+            self.special_kg_token_id = self.tokenizer.convert_tokens_to_ids(SPECIAL_KG_TOKEN)
+            
+            if not self.only_baselines:
+                self.model = KG_LFM.from_pretrained(self.model_path)
+                self.model.eval()
+                
+                self.tests.update({
+                    "KG_LFM": (lambda x: x, self.model),  # No preprocessing needed for KG_LFM
+                })
+
             # if the config requires to tune the model also load clean model
             if  not self.no_baseline:
-                if self.model.config.tune_language_model:
+                if self.only_baselines or self.model_config.tune_language_model:
                     self.clean_model = AutoModelForCausalLM.from_pretrained(
-                        self.model.config.llm_model_name,
+                        self.model_config.llm_model_name,
                     )
                     self.clean_tokenizer = AutoTokenizer.from_pretrained(
-                        self.model.config.llm_model_name,
+                        self.model_config.llm_model_name,
                     )
                     self.clean_model.eval()
-                elif self.model.config.use_lora:
+
+                elif self.model_config.use_lora:
                     self.clean_model = self.llm_no_lora
                     self.clean_tokenizer = self.tokenizer
+                    
                 else:
                     self.clean_model = self.model
                     self.clean_tokenizer = self.tokenizer
@@ -315,10 +330,6 @@ class KGLFMEvaluator:
             if self.accelerator.is_main_process:
                 self.logger.error(f"Error loading model: {e}")
             raise
-        
-        self.tests.update({
-            "KG_LFM": (lambda x: x, self.model),  # No preprocessing needed for KG_LFM
-        })
     
     def setup_data(self, split: str = "test"):
         """Setup data loaders for evaluation."""
@@ -344,7 +355,11 @@ class KGLFMEvaluator:
             self.logger.info("Preparing accelerator...")
         
         # Prepare model and dataloader
-        if self.model.config.tune_language_model:
+        if self.only_baselines:
+            self.clean_model, self.dataloader = self.accelerator.prepare(
+                self.clean_model, self.dataloader
+            )
+        if self.model_config.tune_language_model:
             self.model, self.clean_model, self.dataloader = self.accelerator.prepare(
                 self.model, self.clean_model, self.dataloader
             )
@@ -404,9 +419,9 @@ class KGLFMEvaluator:
 
                     hit_k_correct_batch, batch_avg_num_tokens, new_objects = compute_hit_k(
                         logits, input_ids, k_values,
-                        object_boundaries, self.model.config.num_quantizers,
+                        object_boundaries, self.model_config.num_quantizers,
                         batch['attention_mask'],
-                        special_token=self.model.special_kg_token, tokenizer=self.tokenizer
+                        special_token=self.special_kg_token_id, tokenizer=self.tokenizer
                     )
 
                     average_num_tokens += batch_avg_num_tokens
