@@ -11,6 +11,7 @@ import spacy
 from spacy.matcher import Matcher
 import json
 import re
+from copy import deepcopy
 
 # Prefer rapidfuzz if available (faster than fuzzywuzzy)
 try:  # pragma: no cover
@@ -37,8 +38,9 @@ KG_QUERY_TOOL = {
         "description": (
             "Query the knowledge graph for information about an entity. ALWAYS use this when you need "
             "factual information about people, places, organizations, or other entities. "
+            "It returns concept vectors (not real words) representing the factual information coming from the knowledge graph."
+            "Reason about it but do not repeat all of it"
             "For complex questions, you may need to use this tool multiple times to chain together facts. "
-            "It returns inside <concepts> tags the factual vectors coming from the knowledge graph."
         ),
         "parameters": {
             "type": "object",
@@ -151,15 +153,17 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
         self.logger.info("Initialized KGLFMThinkingEvaluator.")
 
         # From KGChatBot
-        self.max_new_tokens = 256  # Default, can be configured
+        self.max_new_tokens = 512  # Default, can be configured
         self.temperature = 0.7     # Default, can be configured
         self.top_p = 0.9           # Default, can be configured
 
     def load_model(self):
         super().load_model()
         self.logger.info("Loading knowledge graphs for thinking evaluator...")
-        self.entity_graphs = trex_star_graphs_factory(self.config.dataset)
-        self.graph_aligner = BigGraphAligner(graphs=self.entity_graphs, config=self.config.dataset)
+        dataset_conf = deepcopy(self.config.dataset)
+        dataset_conf.name = "trirex"
+        self.entity_graphs = trex_star_graphs_factory(dataset_conf)
+        self.graph_aligner = BigGraphAligner(graphs=self.entity_graphs, config=dataset_conf)
         self.entity_recognizer = EntityRecognizer(self.entity_graphs)
         self._graph_cache: OrderedDict[str, Data] = OrderedDict()
 
@@ -200,24 +204,6 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
             self.logger.warning(f"Graph conversion failed for {central}: {e}")
             return None
 
-    def _get_dummy_graph_data(self) -> Data:
-        """Create a dummy graph data with correct embedding dimensions."""
-        try:
-            if self.entity_graphs:
-                sample_eid = next(iter(self.entity_graphs.keys()))
-                emb_dim = int(self.graph_aligner.node_embedding(sample_eid).shape[-1])
-            else:
-                emb_dim = 768  # fallback
-        except Exception:
-            emb_dim = 768  # fallback
-        dummy_emb = torch.zeros(1, emb_dim)
-        return Data(
-            x=dummy_emb,
-            edge_index=torch.empty((2, 0), dtype=torch.long),
-            edge_attr=torch.empty((0, emb_dim)),
-            num_nodes=1,
-        )
-
     def _get_graph_batch(self, entity_ids: Sequence[str]) -> Optional[Batch]:
         if not entity_ids:
             return None
@@ -225,18 +211,14 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
         for eid in entity_ids:
             g = self.entity_graphs.get(eid)
             if g is None:
-                self.logger.warning(f"Graph not found for entity {eid}, using dummy embedding")
-                datas.append(self._get_dummy_graph_data())
-                continue
+                raise ValueError(f"Entity ID {eid} not found in graphs")
             if eid in self._graph_cache:
                 datas.append(self._graph_cache[eid])
                 self._graph_cache.move_to_end(eid)
                 continue
             d = self._networkx_to_pyg(g, eid)
             if d is None:
-                self.logger.warning(f"Graph conversion failed for entity {eid}, using dummy embedding")
-                datas.append(self._get_dummy_graph_data())
-                continue
+                raise ValueError(f"Entity ID {eid} has no graph data")
             self._graph_cache[eid] = d
             self._graph_cache.move_to_end(eid)
             datas.append(d)
@@ -245,14 +227,14 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
         return Batch.from_data_list(datas) if datas else None
 
     # ---------- Prompt construction (from KGChatBot) ----------
-    def _apply_chat_template(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    def _apply_chat_template(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None, add_generation_prompt: bool = True) -> str:
         tok = self.tokenizer
         try:
             # Ensure `add_generation_prompt` is True for inference
             return tok.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 tools=tools if tools else None,
             )
         except Exception:
@@ -301,120 +283,177 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
                 continue
             args = call.get("arguments", {})
             entity_name = (args or {}).get("entity_name", "")
+            
             if not entity_name:
                 fn_text_lines.append("missing entity_name")
                 continue
+            
             result = self.query_knowledge_graph(entity_name)
             if not result.get("ok"):
                 fn_text_lines.append(f"{entity_name} not found")
                 continue
+            
             eid = result["entity_id"]
+            
             entity_ids.append(eid)
             fn_text_lines.append(f"{entity_name}{SPECIAL_KG_TOKEN}")
         return "\n".join(fn_text_lines) + ("\n" if fn_text_lines else ""), entity_ids
 
-    def _generate_with_thinking(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int]]]:
+    def _find_token_span_from_char_offsets(self, offsets, char_start: int, char_end: int) -> tuple[int, int] | None:
         """
-        Perform the multi-step thinking process for a batch and return final logits,
-        input_ids, and object boundaries, using the ground truth for the final answer.
+        Map a character span [char_start, char_end) to token indices using a HF fast tokenizer's
+        offset_mapping for one sequence. Returns (tok_start, tok_end) inclusive, or None if not found.
         """
-        batch_size = len(batch['sentences'])
-        final_logits = []
-        final_input_ids = []
-        final_object_boundaries = []
+        tok_start = tok_end = None
+        for i, (s, e) in enumerate(offsets):
+            if s <= char_start < e:
+                tok_start = i
+                break
+        if tok_start is None:
+            return None
+        # char_end is exclusive; align to last token whose end >= char_end
+        for j in range(tok_start, len(offsets)):
+            s, e = offsets[j]
+            if char_end <= e:
+                tok_end = j
+                break
+        if tok_end is None:
+            return None
+        return tok_start, tok_end
 
-        for i in range(batch_size):
-            full_conversation = batch['conversations'][i]
-            # The user query is the first message
-            user_query = full_conversation[0]
-            # The ground truth answer is the last message
-            ground_truth_answer = full_conversation[-1]
+    def _generate_with_thinking_batched(
+        self, batch: Dict[str, Any]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, list[tuple[int, int]] | None]:
+        device = self.accelerator.device
+        n = len(batch["sentences"])
 
-            # Start the conversation with the system prompt and the user query
-            conversation = [self.SYSTEM_PROMPT, user_query]
-            all_entity_ids = []
+        conversations: list[list[Dict[str, str]]] = []
+        all_entity_ids_per_sample: list[list[str]] = []
+        
+        for i in range(n):
+            conversations.append([self.SYSTEM_PROMPT, batch["conversations"][i][0], batch["conversations"][i][1]])
+            all_entity_ids_per_sample.append([batch["objects"][i]["id"]])
+
+        active_idx: list[int] = list(range(n))
+        max_depth = 5
+
+        for _step in range(max_depth):
+            if not active_idx:
+                break
             
-            max_depth = 5
-            for _ in range(max_depth):
-                prompt = self._apply_chat_template(conversation, tools=[KG_QUERY_TOOL])
-                inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True).to(self.accelerator.device)
-
-                model_on_device = self.accelerator.unwrap_model(self.model)
-                generated_outputs = model_on_device.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    pad_token_id=self.tokenizer.pad_token_id
-                )
-                generated_text = self.tokenizer.batch_decode(generated_outputs, skip_special_tokens=True)[0]
-                
-                tool_calls = self._parse_tool_calls(generated_text)
-                if not tool_calls:
-                    # Model has finished thinking, break the loop
-                    break
-
-                fn_text, new_entity_ids = self._handle_tool_calls(tool_calls)
-                all_entity_ids.extend(new_entity_ids)
-                
-                # Add the assistant's thinking and the tool's response to the conversation
-                conversation.append({"role": "assistant", "content": generated_text})
-                conversation.append({"role": "tool", "content": fn_text})
-
-            # Now, append the ground truth answer to the conversation
-            conversation.append(ground_truth_answer)
+            self.logger.debug(f"Thinking step {_step+1} with {len(active_idx)} active samples")
             
-            # Create the final prompt with the full thinking process and ground truth answer
-            final_prompt = self._apply_chat_template(conversation, add_generation_prompt=False)
+            # build prompts only for active samples
+            prompts = [self._apply_chat_template(conversations[i], tools=[KG_QUERY_TOOL]) for i in active_idx]
+            enc = self.tokenizer(
+                prompts, 
+                return_tensors="pt", padding=True, truncation=True,
+                padding_side="left",
+            ).to(self.accelerator.device)
+
+            # graphs only for active samples, flattened in active sample order
+            flat_entity_ids: list[str] = []
+            for i in active_idx:
+                flat_entity_ids.extend(all_entity_ids_per_sample[i])
+            graphs = self._get_graph_batch(flat_entity_ids)
             
-            # Find the object boundaries in the ground truth answer part of the final prompt
-            obj_str = batch["sentences"][i][batch["objects"][i]["boundaries"][0]:batch["objects"][i]["boundaries"][1]]
-            new_obj_start_char = final_prompt.rfind(obj_str)
+            gen = self.model.generate(
+                **enc,
+                graphs=graphs,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+            )
+            texts = self.tokenizer.batch_decode(gen, skip_special_tokens=True)
+            self.logger.debug(f"Model outputs at step {_step+1}: {texts}")
             
-            if new_obj_start_char == -1:
-                self.logger.warning(f"Object string not found in the final prompt for sample {i}. Skipping.")
+            progressed_any = False
+            new_active_idx: list[int] = []
+
+            # write back per active sample; stop samples that emitted no tool calls
+            for j, i in enumerate(active_idx):
+                calls = self._parse_tool_calls(texts[j])
+                fn_text, new_entity_ids = self._handle_tool_calls(calls)
+
+                conversations[i].append({"role": "assistant", "content": texts[j]})
+                if fn_text:
+                    conversations[i].append({"role": "tool", "content": fn_text})
+                    all_entity_ids_per_sample[i].extend(new_entity_ids)
+
+                if calls:
+                    progressed_any = True
+                    new_active_idx.append(i)
+
+            if not progressed_any:
+                break
+            active_idx = new_active_idx
+
+        # append ground-truth answers for all samples exactly once
+        for i in range(n):
+            conversations[i].append(batch["conversations"][i][-1])
+
+        # final prompts without generation prompt
+        final_prompts = [
+            self._apply_chat_template(conv, tools=[KG_QUERY_TOOL], add_generation_prompt=False)
+            for conv in conversations
+        ]
+
+        # locate object spans
+        obj_char_spans: list[tuple[int, int] | None] = []
+        for i in range(n):
+            s0, e0 = batch["objects"][i]["boundaries"]
+            obj = batch["sentences"][i][s0:e0]
+            s = final_prompts[i].rfind(obj)
+            obj_char_spans.append(None if s == -1 else (s, s + len(obj)))
+
+        final_tok = self.tokenizer(
+            final_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            return_offsets_mapping=True,
+        ).to(device)
+        offsets_batch = final_tok.pop("offset_mapping")
+
+        token_spans: list[tuple[int, int]] = []
+        keep_idx: list[int] = []
+        for i in range(n):
+            if obj_char_spans[i] is None:
                 continue
-
-            new_obj_end_char = new_obj_start_char + len(obj_str)
-            final_tokenized = self.tokenizer(final_prompt, return_tensors='pt').to(self.accelerator.device)
-            new_tok_start = final_tokenized.char_to_token(0, new_obj_start_char)
-            new_tok_end = final_tokenized.char_to_token(0, new_obj_end_char)
-
-            if new_tok_start is None or new_tok_end is None:
-                self.logger.warning(f"Could not find token boundaries for object in sample {i}. Skipping.")
+            ts = self._find_token_span_from_char_offsets(
+                offsets_batch[i].tolist(), obj_char_spans[i][0], obj_char_spans[i][1]
+            )
+            if ts is None:
                 continue
+            token_spans.append(ts)
+            keep_idx.append(i)
 
-            graphs = self._get_graph_batch(all_entity_ids)
-            
-            model_input = {
-                'input_ids': final_tokenized['input_ids'],
-                'attention_mask': final_tokenized['attention_mask'],
-                'graphs': graphs.to(self.accelerator.device) if graphs else None
-            }
-            
-            model_output = model_on_device(**model_input)
-            
-            final_logits.append(model_output.logits)
-            final_input_ids.append(final_tokenized['input_ids'])
-            final_object_boundaries.append((new_tok_start, new_tok_end))
-
-        if not final_logits:
+        if not keep_idx:
             return None, None, None
 
-        max_len_logits = max(l.size(1) for l in final_logits)
-        max_len_inputs = max(i.size(1) for i in final_input_ids)
-        
-        padded_logits = []
-        padded_input_ids = []
+        input_ids = final_tok["input_ids"][keep_idx]
+        attention_mask = final_tok.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask[keep_idx]
 
-        for i in range(len(final_logits)):
-            logit_pad_len = max_len_logits - final_logits[i].size(1)
-            padded_l = torch.nn.functional.pad(final_logits[i], (0, 0, 0, logit_pad_len), 'constant', 0)
-            padded_logits.append(padded_l)
+        # graphs only for kept samples, flattened in kept order
+        flat_entity_ids_final: list[str] = []
+        for i in keep_idx:
+            flat_entity_ids_final.extend(all_entity_ids_per_sample[i])
+        graphs_final = self._get_graph_batch(flat_entity_ids_final)
 
-            input_pad_len = max_len_inputs - final_input_ids[i].size(1)
-            padded_i = torch.nn.functional.pad(final_input_ids[i], (0, input_pad_len), 'constant', self.tokenizer.pad_token_id)
-            padded_input_ids.append(padded_i)
+        model_out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask if attention_mask is not None else None,
+            graphs=graphs_final,
+            labels=None,
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = model_out.logits
+        return logits, input_ids, token_spans
 
-        return torch.cat(padded_logits, dim=0), torch.cat(padded_input_ids, dim=0), final_object_boundaries
+
 
 
     def compute_hit_k_metrics(self, k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, float]:
@@ -438,7 +477,7 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
                     if self.max_samples and (batch_idx * self.batch_size * self.accelerator.num_processes) >= self.max_samples:
                         break
                     
-                    logits, input_ids, object_boundaries = self._generate_with_thinking(batch)
+                    logits, input_ids, object_boundaries = self._generate_with_thinking_batched(batch)
 
                     if logits is None:
                         continue
@@ -458,6 +497,8 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
 
                     for k in k_values:
                         hit_k_correct[k] += hit_k_correct_batch[k]
+                        # print current hit
+                        self.logger.debug(f"Batch {batch_idx}, Hit@{k}: {hit_k_correct[k]}/{total_objects} ({hit_k_correct[k]/total_objects:.4f})")
 
             # Gather results
             hit_k_tensors = {}
