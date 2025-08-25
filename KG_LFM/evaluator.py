@@ -36,28 +36,54 @@ from accelerate.utils import set_seed, broadcast_object_list
 
 from copy import deepcopy
 
-def align_logits_with_labels(logits: torch.Tensor, labels: torch.Tensor, num_quantizers: int, special_kg_token: int) -> torch.Tensor:
-    """Align logits with labels by removing KG tokens from the GNN."""
-    
-    # if size already matches, return logits
+def align_logits_with_labels(
+    logits: torch.Tensor, labels: torch.Tensor, num_quantizers: int, special_kg_token: int
+) -> torch.Tensor:
+    """
+    Make logits length match labels length by *compressing* each KG block
+    of size `num_quantizers` in logits down to a single row aligned with
+    the single SPECIAL_KG_TOKEN in labels.
+
+    Handles multiple KG tokens per sequence and ragged tails safely.
+    """
+    # Already aligned
     if logits.size(1) == labels.size(1):
         return logits
-    
-    pos_kg_token = torch.where(labels == special_kg_token)
-    new_logits = torch.ones((labels.size(0), labels.size(1), logits.size(2)), dtype=logits.dtype, device=logits.device)
-    
-    # Remove special tokens from GNN
-    for i in range(pos_kg_token[0].size(0)):
-        batch_pos = pos_kg_token[0][i]
-        new_logits[batch_pos] = torch.concat(
-            [
-                logits[batch_pos, :pos_kg_token[1][i]+1, :], 
-                logits[batch_pos, pos_kg_token[1][i] + num_quantizers:, :],
-            ], 
-            dim=0
-        )
-        
-    return new_logits
+
+    B, Llab = labels.shape
+    _, Llog, V = logits.shape
+    out = logits.new_empty(B, Llab, V)
+
+    for b in range(B):
+        lab = labels[b]
+        log = logits[b]
+        write = 0  # index in labels / out
+        read = 0   # index in logits
+
+        while write < Llab and read < Llog:
+            if lab[write].item() == special_kg_token:
+                # compress the KG block [read : read + num_quantizers)
+                block_end = min(read + num_quantizers, Llog)
+                if block_end > read:
+                    out[b, write] = log[read:block_end].mean(dim=0)
+                    read = block_end
+                else:
+                    # degenerate case: no room left; repeat last valid row
+                    last = max(read - 1, 0)
+                    out[b, write] = log[last]
+                write += 1
+            else:
+                out[b, write] = log[read]
+                read += 1
+                write += 1
+
+        # If labels still have tail (e.g., logits shorter), pad with last valid row to keep shape
+        if write < Llab:
+            last_row = out[b, max(write - 1, 0)]
+            out[b, write:] = last_row.expand(Llab - write, V)
+
+    return out
+
 
 def compute_hit_k(
     logits: torch.Tensor,

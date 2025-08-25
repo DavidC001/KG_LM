@@ -58,7 +58,8 @@ KG_QUERY_TOOL = {
         "description": (
             "Query the knowledge graph for information about an entity. ALWAYS use this when you need "
             "factual information about people, places, organizations, or other entities. "
-            "It returns inside <concepts> tags the factual vectors coming from the knowledge graph."
+            "It returns concept vectors (not real words) representing the factual information coming from the knowledge graph."
+            "Reason about it but do not repeat all of it"
         ),
         "parameters": {
             "type": "object",
@@ -224,6 +225,7 @@ class KGChatBot:
         self.tokenizer = _ensure_tokenizer_on(self.model, model_path)
 
         logger.info("Loading knowledge graphs…")
+        dataset_config.name = "trirex"
         self.entity_graphs = trex_star_graphs_factory(dataset_config)
         self.graph_aligner = BigGraphAligner(graphs=self.entity_graphs, config=dataset_config)
         self.entity_recognizer = EntityRecognizer(self.entity_graphs)
@@ -267,25 +269,7 @@ class KGChatBot:
         except Exception as e:  # pragma: no cover
             logger.warning(f"Graph conversion failed for {central}: {e}")
             return None
-
-    def _get_dummy_graph_data(self) -> Data:
-        """Create a dummy graph data with correct embedding dimensions."""
-        try:
-            if self.entity_graphs:
-                sample_eid = next(iter(self.entity_graphs.keys()))
-                emb_dim = int(self.graph_aligner.node_embedding(sample_eid).shape[-1])
-            else:
-                emb_dim = 768  # fallback
-        except Exception:
-            emb_dim = 768  # fallback
-        dummy_emb = torch.zeros(1, emb_dim)
-        return Data(
-            x=dummy_emb,
-            edge_index=torch.empty((2, 0), dtype=torch.long),
-            edge_attr=torch.empty((0, emb_dim)),
-            num_nodes=1,
-        )
-
+        
     def _get_graph_batch(self, entity_ids: Sequence[str]) -> Optional[Batch]:
         if not entity_ids:
             return None
@@ -293,18 +277,14 @@ class KGChatBot:
         for eid in entity_ids:
             g = self.entity_graphs.get(eid)
             if g is None:
-                logger.warning(f"Graph not found for entity {eid}, using dummy embedding")
-                datas.append(self._get_dummy_graph_data())
-                continue
+                raise ValueError(f"Entity ID {eid} not found in graphs")
             if eid in self._graph_cache:
                 datas.append(self._graph_cache[eid])
                 self._graph_cache.move_to_end(eid)
                 continue
             d = self._networkx_to_pyg(g, eid)
             if d is None:
-                logger.warning(f"Graph conversion failed for entity {eid}, using dummy embedding")
-                datas.append(self._get_dummy_graph_data())
-                continue
+                raise ValueError(f"Entity ID {eid} has no graph data")
             self._graph_cache[eid] = d
             self._graph_cache.move_to_end(eid)
             datas.append(d)
