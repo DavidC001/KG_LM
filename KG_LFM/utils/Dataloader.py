@@ -10,7 +10,7 @@ from KG_LFM.utils.Datasets.factories.factory import (
     simplequestions_factory
 )
 from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
-from KG_LFM.utils.Datasets.webQSP_data import WebQSPDataset
+from KG_LFM.utils.Datasets.QA_data import QADataset
 
 from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
 
@@ -139,9 +139,9 @@ class KGLFM_DataLoader:
         self.dataset_class = {
             "trirex": TriRexStarDataset,
             "trirex-bite": TriRexStarDataset,
-            "web-qsp": WebQSPDataset,
-            "grailqa": WebQSPDataset, 
-            "simple-questions": WebQSPDataset
+            "web-qsp": QADataset,
+            "grailqa": QADataset, 
+            "simple-questions": QADataset
         }
         
 

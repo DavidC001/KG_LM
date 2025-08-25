@@ -13,7 +13,7 @@ from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN, IGNORE_INDEX
 
 from torch_geometric.data import Data
 
-class WebQSPDataset(Dataset):
+class QADataset(Dataset):
     """
     Combined dataset for TriREx sentences and TRExStar graphs.
     
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     )
     
     # Create the combined dataset
-    combined_dataset = WebQSPDataset(
+    combined_dataset = QADataset(
         webqsp_dataset=webqsp_dataset,
         star_graphs=graphs,
         tokenizer=tokenizer,
