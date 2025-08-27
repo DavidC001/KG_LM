@@ -552,23 +552,45 @@ class KG_LFMMetaForCausalLM(ABC):
     def generate(
         self,
         input_ids: torch.Tensor,
-        graphs: Batch,
+        graphs: Optional[Batch] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **generation_kwargs
     ) -> torch.Tensor:
         """
-        Generate text based on the input IDs and graphs.
-        
+        Generate text based on the input IDs and (optionally) graphs.
+
         Args:
             input_ids (torch.Tensor): Input token IDs for the language model.
-            graphs (Batch): A batch of graphs from PyTorch Geometric.
+            graphs (Optional[Batch]): A batch of graphs from PyTorch Geometric. If None, falls back to pure text generation.
             attention_mask (Optional[torch.Tensor]): Attention mask for the input tokens.
             **generation_kwargs: Additional keyword arguments for generation.
-        
+
         Returns:
-            torch.Tensor: Generated token IDs.
+            torch.Tensor: Generated token IDs (only the newly generated tokens, not including input).
         """
-        # Prepare the initial embeddings by combining text and graph data
+        
+        gen_config = self.default_generation_config
+        forward_only_kwargs = {}
+        for key, value in list(generation_kwargs.items()):
+            if hasattr(gen_config, key):
+                setattr(gen_config, key, value)
+            else:
+                forward_only_kwargs[key] = value
+        # Store original input length for consistent behavior
+        original_input_length = input_ids.shape[1]
+        
+        # If no graphs provided, delegate directly to underlying LLM (pure text path)
+        if graphs is None:
+            full_outputs = self.llm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=gen_config,
+                **forward_only_kwargs
+            )
+            # Return only the newly generated tokens
+            return full_outputs[:, original_input_length:]
+
+        # Multimodal path: prepare combined embeddings
         (
             _,
             position_ids,
@@ -581,21 +603,26 @@ class KG_LFMMetaForCausalLM(ABC):
         ) = self.prepare_inputs_labels_for_multimodal(
             input_ids, None, attention_mask, None, None, graphs
         )
-        
+
         inputs_embeds = inputs_embeds.to(self.llm.dtype)
+        
+        #decode back input_embeds for inspection
+        # emb_mat = self.llm.get_input_embeddings().weight
+        # logits = inputs_embeds[0] @ emb_mat.T
+        # decoded = logits.argmax(dim=-1)
+        # decoded_text = self.tokenizer.batch_decode(decoded, skip_special_tokens=True)
+        # print(decoded_text)
 
-        # Set default generation config if not provided
-        gen_config = self.default_generation_config
-        for key, value in generation_kwargs.items():
-            setattr(gen_config, key, value)
-
-        outputs = self.llm.generate(
-            inputs_embeds=inputs_embeds, 
-            attention_mask=attention_mask, 
-            generation_config=gen_config
+        # Call underlying LLM generate
+        full_outputs = self.llm.generate(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            generation_config=gen_config,
+            **forward_only_kwargs
         )
 
-        return outputs
+        return full_outputs
      
     @torch.inference_mode()
     def generate_graphs(
