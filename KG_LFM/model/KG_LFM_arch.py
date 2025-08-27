@@ -143,6 +143,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.num_edge_types = model_args.num_edge_types
     config.reconstruction_weight = model_args.reconstruction_weight
     config.structure_weight = model_args.structure_weight
+    config.decoder_layers = model_args.decoder_layers
     
     return config
 
@@ -202,16 +203,12 @@ class KG_LFMMetaModel(ABC):
                 final_embedding_dim=self.llm_embedding_dim,
                 dropout=config.dropout,
                 num_heads=config.num_heads,
-                gat_layers=config.gat_layers if hasattr(config, "gat_layers") else 1,
+                decoder_layers=getattr(config, "decoder_layers", 2),
+                max_nodes=getattr(config, "max_nodes", 50),
+                num_edge_types=getattr(config, "num_edge_types", 1000),
+                reconstruction_weight=getattr(config, "reconstruction_weight", 1.0),
+                structure_weight=getattr(config, "structure_weight", 0.1),
                 num_quantizers=config.num_quantizers,
-                codebook_size=config.codebook_size,
-                codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
-                shared_codebook=config.shared_codebook,
-                graph_pooling=config.graph_pooling,
-                max_nodes=config.max_nodes if hasattr(config, "max_nodes") else 50,
-                num_edge_types=config.num_edge_types if hasattr(config, "num_edge_types") else 1000,
-                reconstruction_weight=config.reconstruction_weight if hasattr(config, "reconstruction_weight") else 1.0,
-                structure_weight=config.structure_weight if hasattr(config, "structure_weight") else 0.1
             )
             
             # Share the vector quantizer from encoder to decoder for proper reconstruction
@@ -382,16 +379,15 @@ class KG_LFMMetaModel(ABC):
         graph_features, indexes, RVQ_loss = kg_encoder(graphs)
         return graph_features, indexes, RVQ_loss
     
-    def decode_graphs(self, quantized_tokens, quantized_indices, original_graphs=None, target_node_features=None, target_edge_features=None):
+    def decode_graphs(self, quantized_tokens, quantized_indices=None, original_graphs=None, reconstruct_structure=True):
         """
         Decode quantized representations back to graph data using the KG decoder.
         
         Args:
-            quantized_tokens: Quantized token representations from encoder
-            quantized_indices: Quantized indices from encoder
+            quantized_tokens: Quantized token representations from encoder [B, Q, D]
+            quantized_indices: Quantized indices from encoder (optional, not used in current implementation)
             original_graphs: Original graph batch for structure reference (optional)
-            target_node_features: Target node features for loss calculation (optional)
-            target_edge_features: Target edge features for loss calculation (optional)
+            reconstruct_structure: Whether to predict graph structure (default: True)
             
         Returns:
             Decoder output dict or None if decoder not available
@@ -402,10 +398,8 @@ class KG_LFMMetaModel(ABC):
             
         return kg_decoder(
             quantized_tokens=quantized_tokens,
-            quantized_indices=quantized_indices,
             original_graphs=original_graphs,
-            target_node_features=target_node_features,
-            target_edge_features=target_edge_features
+            reconstruct_structure=reconstruct_structure
         )
     
     def _temporary_reorder_cache(self, past_key_values, sorted_idx):
