@@ -353,7 +353,7 @@ class KG_LFM_Trainer:
         
         hit_k_correct, average_num_tokens, total_objects = compute_hit_k(
             logits, input_ids, [1,3,5,10],
-            object_boundaries, self.config.model.num_quantizers,
+            object_boundaries, self.config.model.num_quantizers + (2 if self.config.model.bounding_tokens else 0),
             attention_mask, special_token=self.model.special_kg_token, 
             tokenizer=self.model.tokenizer
         )
