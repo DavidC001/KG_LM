@@ -445,7 +445,7 @@ class KGLFMEvaluator:
 
                     hit_k_correct_batch, batch_avg_num_tokens, new_objects = compute_hit_k(
                         logits, input_ids, k_values,
-                        object_boundaries, self.model_config.num_quantizers,
+                        object_boundaries, self.model_config.num_quantizers + (2 if hasattr(self.model_config, 'bounding_tokens') and self.model_config.bounding_tokens else 0),
                         batch['attention_mask'],
                         special_token=self.special_kg_token_id, tokenizer=self.tokenizer
                     )

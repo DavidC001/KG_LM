@@ -118,7 +118,7 @@ class KGEncoder(nn.Module):
         node_embedding_dim, edge_embedding_dim, final_embedding_dim, std_tokens,
         dropout=0.2, num_heads=1, gat_layers=3, graph_pooling=True, 
         num_quantizers=3, codebook_size=512, codebook_dim=0, shared_codebook=False,
-        beta_commit=0.25, dead_codebook_threshold=0.5
+        beta_commit=0.25, dead_codebook_threshold=0.5, bounding_tokens=False
     ):
         """
         Initializes the KGEncoder model.
@@ -137,6 +137,8 @@ class KGEncoder(nn.Module):
             codebook_dim (int): Dimension of the downsampled codebook. If 0, no downsampling is applied.
             shared_codebook (bool): Whether to use a shared codebook across quantizers.
             beta_commit (float): Commitment loss weight for the vector quantization.
+            dead_codebook_threshold (float): Threshold for dead codebook entries.
+            bounding_tokens (bool): Whether to use special bounding tokens around the KG embeddings in the input sequence.
         """
         super(KGEncoder, self).__init__()
         self.node_embedding_dim = node_embedding_dim
@@ -197,6 +199,14 @@ class KGEncoder(nn.Module):
         self.output_norm = nn.LayerNorm(final_embedding_dim)
         
         self.graph_pooling = graph_pooling
+        
+        self.bounding_tokens = bounding_tokens
+        if self.bounding_tokens:
+            logging.info("KGEncoder: using bounding tokens around KG embeddings")
+            self.start_token = nn.Parameter(torch.randn(1, 1, final_embedding_dim) * self.text_embs_std)
+            self.end_token = nn.Parameter(torch.randn(1, 1, final_embedding_dim) * self.text_embs_std)
+        else:
+            logging.info("KGEncoder: NOT using bounding tokens around KG embeddings")
         
     def forward(self, graphs: Batch):
         """
@@ -265,6 +275,13 @@ class KGEncoder(nn.Module):
         tokens = (tokens - g_mu) / g_std
         # match text emb std
         tokens = tokens * self.text_embs_std + self.kg_bias
+        
+        # add bounding tokens if needed
+        if self.bounding_tokens:
+            B, Q, D = tokens.shape
+            start_tokens = self.start_token.expand(B, -1, -1)  # [B, 1, D]
+            end_tokens = self.end_token.expand(B, -1, -1)      # [B, 1, D]
+            tokens = torch.cat([start_tokens, tokens, end_tokens], dim=1)  # [B, Q+2, D]
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(f"Output shape after adapter and normalization: {x.shape}")

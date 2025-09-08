@@ -73,6 +73,9 @@ class KG_LFMConfig(AutoConfig):
     "Whether to tune the language model"
     tune_kg_encoder: bool = False  
     "Whether to tune the knowledge graph encoder"
+    
+    bounding_tokens: bool = False
+    "Whether to use special bounding tokens around the KG embeddings in the input sequence"
 
     use_lora: bool = True  
     "Whether to use LoRA for training"
@@ -122,6 +125,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.lora_r = model_args.lora_r
     config.lora_alpha = model_args.lora_alpha
     config.lora_target_modules = model_args.lora_target_modules
+    config.bounding_tokens = model_args.bounding_tokens
     
     return config
 
@@ -168,7 +172,8 @@ class KG_LFMMetaModel(ABC):
             graph_pooling=config.graph_pooling,
             beta_commit=0.25,
             std_tokens=self.llm.get_input_embeddings().weight.std().item(),
-            dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5
+            dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5,
+            bounding_tokens=config.bounding_tokens if hasattr(config, "bounding_tokens") else False
         )
 
         assert (

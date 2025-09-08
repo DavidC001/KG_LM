@@ -7,7 +7,6 @@ import logging
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -120,12 +119,13 @@ class EntityMatch:
     mention: str
     entity_id: str
     confidence: float  # 0..1
+    entity_name: str
 
 
 class EntityRecognizer:
     """NER + fuzzy linking against entities present in our graphs."""
 
-    def __init__(self, entity_graphs: Dict[str, nx.DiGraph], fuzzy_threshold: int = 80) -> None:
+    def __init__(self, entity_graphs: Dict[str, nx.DiGraph], fuzzy_threshold: int = 90) -> None:
         self.entity_graphs = entity_graphs
         self.fuzzy_threshold = fuzzy_threshold
         try:
@@ -141,11 +141,11 @@ class EntityRecognizer:
         self.entity_to_id: Dict[str, str] = {}
         self.entity_labels: List[str] = []
         for eid, g in self.entity_graphs.items():
-            self._add_label(eid, eid)
-            for _, data in g.nodes(data=True):
+            for entid, data in g.nodes(data=True):
                 lab = (data.get("label") or "").strip().lower()
                 if lab:
-                    self._add_label(lab, eid)
+                    self._add_label(lab, entid)
+                    break  # only first node per graph
         logger.info(f"Indexed {len(self.entity_to_id)} labels for entity linking")
 
     def _add_label(self, label: str, eid: str) -> None:
@@ -169,25 +169,32 @@ class EntityRecognizer:
         if not cands:  # very light fallback
             cands = [t.text.lower() for t in doc if t.is_alpha and len(t) > 2]
 
+        logger.info(f"Entity candidates from text '{text}': {cands}")
+
         matches: List[EntityMatch] = []
         for c in cands:
             if not c:
                 continue
             eid = self.entity_to_id.get(c)
             if eid:
-                matches.append(EntityMatch(c, eid, 1.0))
+                logger.info(f"Exact match: '{c}' -> '{eid}'")
+                matches.append(EntityMatch(c, eid, 1.0, c))
                 continue
-            for m_text, score, *_ in _fuzzy_topk(c, self.entity_labels, limit=3):
+            fuzzy_results = _fuzzy_topk(c, self.entity_labels, limit=3)
+            logger.info(f"Fuzzy search for '{c}': {fuzzy_results}")
+            for m_text, score, *_ in fuzzy_results:
                 if score >= self.fuzzy_threshold:
-                    matches.append(EntityMatch(c, self.entity_to_id[m_text], score / 100.0))
+                    matched_eid = self.entity_to_id[m_text]
+                    logger.info(f"Fuzzy match: '{c}' -> '{m_text}' -> '{matched_eid}' (score: {score})")
+                    matches.append(EntityMatch(c, matched_eid, score / 100.0, m_text))
                     break
 
         # Deduplicate by (mention,eid) with max confidence
-        best: Dict[Tuple[str, str], float] = {}
+        best: Dict[Tuple[str, str, str], float] = {}
         for m in matches:
-            key = (m.mention, m.entity_id)
+            key = (m.mention, m.entity_id, m.entity_name)
             best[key] = max(best.get(key, 0.0), m.confidence)
-        out = [EntityMatch(k[0], k[1], c) for k, c in best.items()]
+        out = [EntityMatch(k[0], k[1], c, k[2]) for k, c in best.items()]
         out.sort(key=lambda x: x.confidence, reverse=True)
         return out[:limit]
 
@@ -295,8 +302,36 @@ class KGChatBot:
     def visualize_graph(self, entity_id: str, max_nodes: int = 40) -> Optional[str]:
         g = self.entity_graphs.get(entity_id)
         if g is None:
+            logger.warning(f"No graph found for entity_id: {entity_id}")
             return None
         try:
+            # Debug: log graph info
+            logger.info(f"Visualizing graph for entity_id: {entity_id}")
+            logger.info(f"Graph has {g.number_of_nodes()} nodes and {g.number_of_edges()} edges")
+            
+            # Log some node labels to see what's in this graph
+            node_labels = []
+            for node, data in list(g.nodes(data=True))[:5]:  # First 5 nodes
+                label = data.get("label", node)
+                node_labels.append(f"{node}: {label}")
+            logger.info(f"Sample nodes: {node_labels}")
+            
+            # Ensure entity_id is actually in the graph
+            if entity_id not in g.nodes:
+                logger.warning(f"Entity {entity_id} not found in its own graph nodes")
+                # Try to find a node with a matching label
+                found_node = None
+                for node, data in g.nodes(data=True):
+                    if data.get("label", "").lower() == entity_id.lower():
+                        found_node = node
+                        break
+                if found_node:
+                    logger.info(f"Found matching node by label: {found_node}")
+                    entity_id = found_node
+                else:
+                    logger.warning(f"Could not find any matching node for {entity_id}")
+                    return None
+                
             if g.number_of_nodes() > max_nodes:
                 keep = {entity_id}
                 for u, v in g.edges():
@@ -307,11 +342,25 @@ class KGChatBot:
                 sg = g.subgraph(keep).copy()
             else:
                 sg = g
+                
+            # Ensure entity_id is still in the subgraph
+            if entity_id not in sg.nodes:
+                logger.warning(f"Entity {entity_id} not in subgraph after filtering")
+                return None
+                
             plt.figure(figsize=(5, 5))
             try:
+                # Use spring layout but ensure central node is at center
                 pos = nx.spring_layout(sg, seed=42)
+                # Force the central entity to be at (0, 0)
+                if entity_id in pos:
+                    center_pos = pos[entity_id]
+                    # Shift all positions so central entity is at origin
+                    for node in pos:
+                        pos[node] = (pos[node][0] - center_pos[0], pos[node][1] - center_pos[1])
             except Exception:  # pragma: no cover
                 pos = nx.circular_layout(sg)
+                
             labels = {n: (d.get("label") or str(n))[:40] for n, d in sg.nodes(data=True)}
             node_colors = ["#ffcc00" if n == entity_id else "#1f78b4" for n in sg.nodes]
             node_sizes = [800 if n == entity_id else 400 for n in sg.nodes]
@@ -324,11 +373,23 @@ class KGChatBot:
             if e_labels:
                 nx.draw_networkx_edge_labels(sg, pos, edge_labels=e_labels, font_size=6, label_pos=0.5)
             plt.axis("off")
-            tmp = NamedTemporaryFile(delete=False, suffix=".png")
+            
+            # Create graphs directory if it doesn't exist
+            import os
+            graphs_dir = "graphs"
+            os.makedirs(graphs_dir, exist_ok=True)
+            
+            # Generate filename with entity_id and timestamp for uniqueness
+            import time
+            timestamp = int(time.time())
+            safe_entity_id = entity_id.replace("/", "_").replace(":", "_")
+            filename = f"graph_{safe_entity_id}_{timestamp}.png"
+            filepath = os.path.join(graphs_dir, filename)
+            
             plt.tight_layout()
-            plt.savefig(tmp.name, dpi=140)
+            plt.savefig(filepath, dpi=140)
             plt.close()
-            return tmp.name
+            return filepath
         except Exception as e:  # pragma: no cover
             logger.warning(f"Graph visualization failed for {entity_id}: {e}")
             return None
@@ -369,11 +430,21 @@ class KGChatBot:
         """Resolve an entity name to an entity_id present in the graphs.
         Returns a structured payload for the tool result.
         """
+        # First try the existing entity recognizer
         matches = self.entity_recognizer.extract(entity_name, limit=1)
+        
         if not matches:
             return {"ok": False, "error": f"Entity '{entity_name}' not found in knowledge graph"}
+        
         entity_id = matches[0].entity_id
-        # You can add more structured fields if your model benefits from them
+        entity_name = matches[0].entity_name
+        logger.info(f"Resolved '{entity_name}' -> '{entity_id}' (confidence: {matches[0].confidence:.2f})")
+        
+        # Double-check that this entity_id actually has a graph
+        if entity_id not in self.entity_graphs:
+            logger.warning(f"Entity ID '{entity_id}' resolved but no graph found!")
+            return {"ok": False, "error": f"Entity '{entity_name}' resolved to '{entity_id}' but no graph available"}
+            
         return {"ok": True, "entity_id": entity_id, "entity_name": entity_name}
 
     def _parse_tool_calls(self, response_text: str) -> List[Dict[str, Any]]:
@@ -412,7 +483,7 @@ class KGChatBot:
             eid = result["entity_id"]
             entity_ids.append(eid)
             # Expose a KG token so the model knows graphs will follow
-            fn_text_lines.append(f"{entity_name}{SPECIAL_KG_TOKEN}")
+            fn_text_lines.append(f"Found entity {result['entity_name']}{SPECIAL_KG_TOKEN}")
         return "\n".join(fn_text_lines) + ("\n" if fn_text_lines else ""), entity_ids
 
     # ---------- Generation ----------
