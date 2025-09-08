@@ -57,6 +57,12 @@ generate_and_submit_job() {
     local JOB_NAME="eval-${NAME_NO_EXT}"
     local JOB_SCRIPT="${GEN_DIR}/eval_${NAME_NO_EXT}.sh"
 
+    # if output json file already exists do not execute
+    if [ -f "${OUTPUT_FILE}${OUTPUT_JSON_SUFFIX}.json" ]; then
+        echo "Output JSON file already exists, skipping job submission: ${OUTPUT_FILE}${OUTPUT_JSON_SUFFIX}.json"
+        return
+    fi
+
     cat > "$JOB_SCRIPT" <<EOF
 #!/bin/bash
 #SBATCH --job-name=${JOB_NAME}

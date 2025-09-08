@@ -152,6 +152,9 @@ class ModelConfig:
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Defaults to 'Qwen/Qwen3-Embedding-0.6B'."""
     
+    bounding_tokens: bool = False
+    """Whether to use special bounding tokens around the KG embeddings in the input sequence. Defaults to False."""
+    
 @dataclass
 class TrainConfig:
     """

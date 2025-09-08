@@ -1,4 +1,5 @@
 import bz2
+import json
 import logging
 import time
 from pathlib import Path
@@ -14,12 +15,32 @@ from SPARQLWrapper import SPARQLWrapper, JSON
 # endpoint_url = "https://query.wikidata.org/sparql"  # modern endpoint path
 endpoint_url = "https://query.wikidata.org/bigdata/namespace/wdq/sparql"
 
-def mid_to_qid(mid: str) -> str | None:
+def mid_to_qid(mid: str, cache_file: Optional[Path] = None) -> str | None:
     """
     Returns the Wikidata Q-ID of an entity given its Freebase ID (P646)
-    :param freebase_id: Freebase ID
+    Uses a cache file to store mappings and avoid repeated queries.
+    
+    :param mid: Freebase ID
+    :param cache_file: Path to the cache file (defaults to 'mid_to_qid_cache.json' in current directory)
     :return: Wikidata Q-ID or None
     """
+    if cache_file is None:
+        cache_file = Path("mid_to_qid_cache.json")
+    
+    # Load existing cache
+    cache = {}
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logging.warning(f"Could not load cache file {cache_file}: {e}")
+            cache = {}
+    
+    # Check if mapping already exists in cache
+    if mid in cache:
+        return cache[mid]
+    
     freebase_id = f"/m/{mid[2:]}"
 
     query = f"""
@@ -48,17 +69,89 @@ def mid_to_qid(mid: str) -> str | None:
                 retry_after = int(e.headers.get("Retry-After", 30))
                 time.sleep(retry_after)
             else:
+                # Store None result in cache to avoid retrying failed queries
+                cache[mid] = None
+                _save_cache(cache, cache_file)
                 return None
         if results:
             break
 
     # Extract the Wikidata ID from the query results
+    qid = None
     if results["results"]["bindings"]:
         wikidata_id = results["results"]["bindings"][0]["entity"]["value"]
         # Extracting the Q-ID from the full URI
-        return wikidata_id.split('/')[-1]
-    else:
-        return None
+        qid = wikidata_id.split('/')[-1]
+    
+    # Store result in cache (even if None)
+    cache[mid] = qid
+    _save_cache(cache, cache_file)
+    
+    return qid
+
+
+def _save_cache(cache: Dict[str, str | None], cache_file: Path) -> None:
+    """
+    Helper function to save the cache to file.
+    
+    :param cache: Dictionary containing the cache data
+    :param cache_file: Path to the cache file
+    """
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        logging.warning(f"Could not save cache file {cache_file}: {e}")
+
+
+def get_cache_stats(cache_file: Optional[Path] = None) -> Dict[str, int]:
+    """
+    Get statistics about the MID to QID cache.
+    
+    :param cache_file: Path to the cache file (defaults to 'mid_to_qid_cache.json' in current directory)
+    :return: Dictionary with cache statistics
+    """
+    if cache_file is None:
+        cache_file = Path("mid_to_qid_cache.json")
+    
+    if not cache_file.exists():
+        return {"total_entries": 0, "successful_mappings": 0, "failed_mappings": 0}
+    
+    try:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+        
+        total_entries = len(cache)
+        successful_mappings = sum(1 for v in cache.values() if v is not None)
+        failed_mappings = total_entries - successful_mappings
+        
+        return {
+            "total_entries": total_entries,
+            "successful_mappings": successful_mappings,
+            "failed_mappings": failed_mappings
+        }
+    except (json.JSONDecodeError, IOError) as e:
+        logging.warning(f"Could not read cache file {cache_file}: {e}")
+        return {"total_entries": 0, "successful_mappings": 0, "failed_mappings": 0}
+
+
+def clear_cache(cache_file: Optional[Path] = None) -> bool:
+    """
+    Clear the MID to QID cache file.
+    
+    :param cache_file: Path to the cache file (defaults to 'mid_to_qid_cache.json' in current directory)
+    :return: True if cache was cleared successfully, False otherwise
+    """
+    if cache_file is None:
+        cache_file = Path("mid_to_qid_cache.json")
+    
+    try:
+        if cache_file.exists():
+            cache_file.unlink()
+        return True
+    except IOError as e:
+        logging.warning(f"Could not clear cache file {cache_file}: {e}")
+        return False
 
 
 def clean(label: str):
