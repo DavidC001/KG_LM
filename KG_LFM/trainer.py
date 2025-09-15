@@ -319,15 +319,23 @@ class KG_LFM_Trainer:
             torch.cuda.empty_cache()
         gc.collect()
 
-    def compute_train_metrics(self, RVQ_loss: torch.Tensor, CE_loss: torch.Tensor) -> Dict[str, float]:
+    def compute_train_metrics(self, RVQ_loss: torch.Tensor, CE_loss: torch.Tensor, decoder_loss: Optional[torch.Tensor]) -> Dict[str, float]:
         """Compute metrics from loss."""
         # Ensure loss is a scalar tensor and safely convert to float
-        RVQ_loss_val = RVQ_loss.flatten().mean().item()
         CE_loss_val = CE_loss.flatten().mean().item()
-            
+        if RVQ_loss is None:
+            RVQ_loss_val = torch.tensor(0.0, device=self.device)
+        else:
+            RVQ_loss_val = RVQ_loss.flatten().mean().item()
+        if decoder_loss is not None:
+            decoder_loss_val = decoder_loss.flatten().mean().item()
+        else:
+            decoder_loss_val = 0.0
+
         metrics = {
             'language_loss': CE_loss_val,
             'RVQ_loss': RVQ_loss_val,
+            'decoder_loss': decoder_loss_val,
             'encoder_learning_rate': self.optimizer.param_groups[0]['lr'],
             'llm_learning_rate': self.optimizer.param_groups[1]['lr'] if len(self.optimizer.param_groups) > 1 else 0
         }
@@ -336,24 +344,32 @@ class KG_LFM_Trainer:
 
     def compute_val_metrics(
             self, 
-            language_loss: torch.Tensor, RVQ_loss: torch.Tensor,
+            language_loss: torch.Tensor, RVQ_loss: torch.Tensor, decoder_loss: Optional[torch.Tensor],
             logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor,
             object_boundaries: List[Tuple[int]]
         ) -> Dict[str, float]:
         """Compute validation metrics from loss."""
         # Ensure loss is a scalar tensor and safely convert to float
         language_loss_val = language_loss.flatten()
-        RVQ_loss_val = RVQ_loss.flatten()
-        
+        if RVQ_loss is None:
+            RVQ_loss_val = torch.tensor(0.0, device=self.device)
+        else:
+            RVQ_loss_val = RVQ_loss.flatten()
+
         if torch.isnan(language_loss_val).any() or torch.isnan(RVQ_loss_val).any():
             self.logger.warning("NaN detected in validation losses")
 
         language_loss_val = language_loss_val.mean().item()
         RVQ_loss_val = RVQ_loss_val.mean().item()
+        if decoder_loss is not None:
+            decoder_loss_val = decoder_loss.flatten().mean().item()
+        else:
+            decoder_loss_val = 0.0
         
         hit_k_correct, average_num_tokens, total_objects = compute_hit_k(
             logits, input_ids, [1,3,5,10],
-            object_boundaries, self.config.model.num_quantizers + (2 if self.config.model.bounding_tokens else 0),
+            object_boundaries, 
+            (self.config.model.num_quantizers + (2 if self.config.model.bounding_tokens else 0) if self.config.model.use_kg_encoder else 0),
             attention_mask, special_token=self.model.special_kg_token, 
             tokenizer=self.model.tokenizer
         )
@@ -368,6 +384,7 @@ class KG_LFM_Trainer:
         metrics = {
             'language_loss': language_loss_val,
             'RVQ_loss': RVQ_loss_val,
+            'decoder_loss': decoder_loss_val,
             **hit_k_correct,
             'average_num_tokens': average_num_tokens
         }
@@ -400,15 +417,16 @@ class KG_LFM_Trainer:
                     )
                     
                     metrics = self.compute_val_metrics(
-                        outputs.loss, outputs.RVQ_loss,
+                        outputs.loss, outputs.RVQ_loss, outputs.decoder_loss,
                         outputs.logits, batch['input_ids'],
                         batch['attention_mask'],
                         [batch['objects'][i]['token_boundaries'] for i in range(len(batch['objects']))]
                     )
                     self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
 
-                    for i in range(self.config.model.num_quantizers):
-                        codebook_indices_seen[i].update(outputs.RVQ_indices[:, i].tolist())
+                    if outputs.RVQ_indices is not None:
+                        for i in range(self.config.model.num_quantizers):
+                            codebook_indices_seen[i].update(outputs.RVQ_indices[:, i].tolist())
 
                 except Exception as e:
                     self.logger.info(f"Error in evaluation batch {batch_idx}: {e}")
@@ -467,6 +485,7 @@ class KG_LFM_Trainer:
         # Initialize accumulation variables properly
         total_RVQ_loss = 0.0
         total_CE_loss = 0.0
+        total_decoder_loss = 0.0
 
         step = 0
         while step < self.steps_train:
@@ -492,10 +511,14 @@ class KG_LFM_Trainer:
                 )
                 language_loss = outputs.loss
                 RVQ_loss = outputs.RVQ_loss
+                decoder_loss = outputs.decoder_loss
+                
+                decoder_loss = decoder_loss if decoder_loss is not None else torch.tensor(0.0, device=self.device)
+                RVQ_loss = RVQ_loss if RVQ_loss is not None else torch.tensor(0.0, device=self.device)
                 
                 # Weighted loss combination with configurable weights
                 rvq_weight = getattr(self.config.train_conf, 'rvq_loss_weight', 1.0)
-                loss = language_loss + rvq_weight * RVQ_loss
+                loss = language_loss + rvq_weight * RVQ_loss + decoder_loss
                 
                 # print all processes' losses for debugging
                 self.logger.debug(
@@ -503,6 +526,8 @@ class KG_LFM_Trainer:
                     step + 1, self.steps_train,
                     language_loss.item(), RVQ_loss.item()
                 )
+                if decoder_loss is not None:
+                    self.logger.debug("Decoder Loss: %.4f", decoder_loss.item())
                 
                 # create a tensor to accumulate from all processes to skip all backward passes if loss is NaN or Inf
                 is_valid_loss = torch.tensor(not (torch.isnan(loss) or torch.isinf(loss)), device=self.device, dtype=torch.bool)
@@ -516,6 +541,7 @@ class KG_LFM_Trainer:
                     # Accumulate losses correctly - just add the raw values
                     total_RVQ_loss += RVQ_loss.item()
                     total_CE_loss += language_loss.item()
+                    total_decoder_loss += decoder_loss.item() if decoder_loss is not None else 0.0
                     self.accelerator.backward(loss)
                 
                 if self.accelerator.sync_gradients: # TRUE when gradient accumulation is complete
@@ -526,10 +552,12 @@ class KG_LFM_Trainer:
                     # Compute average losses over accumulation steps
                     avg_RVQ_loss = total_RVQ_loss / self.grad_accumulation_steps
                     avg_CE_loss = total_CE_loss / self.grad_accumulation_steps
+                    avg_decoder_loss = total_decoder_loss / self.grad_accumulation_steps
 
                     metrics = self.compute_train_metrics(
                         torch.tensor(avg_RVQ_loss, device=self.device), 
-                        torch.tensor(avg_CE_loss, device=self.device)
+                        torch.tensor(avg_CE_loss, device=self.device),
+                        torch.tensor(avg_decoder_loss, device=self.device)
                     )
                     self.metrics_tracker.update(metrics, batch['input_ids'].size(0))
                     
@@ -542,6 +570,7 @@ class KG_LFM_Trainer:
                     # Reset accumulation variables
                     total_CE_loss = 0.0
                     total_RVQ_loss = 0.0
+                    total_decoder_loss = 0.0
                     
                 # does NOTHING when using deepspeed
                 self.optimizer.step() 

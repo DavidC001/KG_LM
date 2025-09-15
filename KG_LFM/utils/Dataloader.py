@@ -180,6 +180,8 @@ class KGLFM_DataLoader:
             self.star_graphs,
             self.tokenizer,
             self.big_graph_aligner,
+            self.dataset_config.corrupt,
+            self.dataset_config.drop_obj_entities_prob,
         )
         
         return DataLoader(
