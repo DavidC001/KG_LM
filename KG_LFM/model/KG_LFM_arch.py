@@ -88,17 +88,11 @@ class KG_LFMConfig(AutoConfig):
     "Alpha for LoRA scaling"
     lora_target_modules: List[str] = ["q_proj", "k_proj"]
 
-    # KG Decoder Configuration
     use_kg_decoder: bool = False  
-    "Whether to use the KG decoder for reconstruction"
-    max_nodes: int = 50  
-    "Maximum number of nodes in a graph for decoder"
-    num_edge_types: int = 1000  
-    "Number of edge types for structure prediction"
-    reconstruction_weight: float = 1.0  
-    "Weight for reconstruction loss"
-    structure_weight: float = 0.1  
-    "Weight for graph structure prediction loss"
+    "Whether to use the KG decoder for prediction tasks"
+    
+    use_kg_encoder: bool = True
+    "Whether to use the KG encoder for embedding the input graphs"
 
 def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     """
@@ -142,12 +136,8 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.lora_alpha = model_args.lora_alpha
     config.lora_target_modules = model_args.lora_target_modules
     config.use_kg_decoder = model_args.use_kg_decoder
-    config.max_nodes = model_args.max_nodes
-    config.num_edge_types = model_args.num_edge_types
-    config.reconstruction_weight = model_args.reconstruction_weight
-    config.structure_weight = model_args.structure_weight
-    config.decoder_layers = model_args.decoder_layers
     config.bounding_tokens = model_args.bounding_tokens
+    config.use_kg_encoder = model_args.use_kg_encoder
     
     return config
 
@@ -179,24 +169,28 @@ class KG_LFMMetaModel(ABC):
         
         self.llm_embedding_dim = self.llm.config.hidden_size
         
-        # Initialize the KGEncoder with the specified dimensions
-        self.kg_encoder = KGEncoder(
-            node_embedding_dim=config.node_embedding_dim,
-            edge_embedding_dim=config.edge_embedding_dim,
-            final_embedding_dim=self.llm_embedding_dim,
-            dropout=config.dropout,
-            num_heads=config.num_heads,
-            gat_layers=config.gat_layers if hasattr(config, "gat_layers") else 1,
-            num_quantizers=config.num_quantizers,
-            codebook_size=config.codebook_size,
-            codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
-            shared_codebook=config.shared_codebook,
-            graph_pooling=config.graph_pooling,
-            beta_commit=0.25,
-            std_tokens=self.llm.get_input_embeddings().weight.std().item(),
-            dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5,
-            bounding_tokens=config.bounding_tokens if hasattr(config, "bounding_tokens") else False
-        )
+        self.kg_encoder = None
+        # condition to be compatible with older configs that do not have use_kg_encoder
+        if not hasattr(config, "use_kg_encoder") or config.use_kg_encoder:
+            logging.info("Initializing KG Encoder.")
+            # Initialize the KGEncoder with the specified dimensions
+            self.kg_encoder = KGEncoder(
+                node_embedding_dim=config.node_embedding_dim,
+                edge_embedding_dim=config.edge_embedding_dim,
+                final_embedding_dim=self.llm_embedding_dim,
+                dropout=config.dropout,
+                num_heads=config.num_heads,
+                gat_layers=config.gat_layers if hasattr(config, "gat_layers") else 1,
+                num_quantizers=config.num_quantizers,
+                codebook_size=config.codebook_size,
+                codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
+                shared_codebook=config.shared_codebook,
+                graph_pooling=config.graph_pooling,
+                beta_commit=0.25,
+                std_tokens=self.llm.get_input_embeddings().weight.std().item(),
+                dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5,
+                bounding_tokens=config.bounding_tokens if hasattr(config, "bounding_tokens") else False
+            )
 
         # Initialize the KGDecoder if configured
         self.kg_decoder = None
@@ -207,46 +201,8 @@ class KG_LFMMetaModel(ABC):
                 edge_embedding_dim=config.edge_embedding_dim,
                 final_embedding_dim=self.llm_embedding_dim,
                 dropout=config.dropout,
-                num_heads=config.num_heads,
-                decoder_layers=getattr(config, "decoder_layers", 2),
-                max_nodes=getattr(config, "max_nodes", 50),
-                num_edge_types=getattr(config, "num_edge_types", 1000),
-                reconstruction_weight=getattr(config, "reconstruction_weight", 1.0),
-                structure_weight=getattr(config, "structure_weight", 0.1),
                 num_quantizers=config.num_quantizers,
             )
-            
-            # Share the vector quantizer from encoder to decoder for proper reconstruction
-            if hasattr(self.kg_encoder, 'dir_vq'):
-                self.kg_decoder.set_encoder_vq(self.kg_encoder.dir_vq)
-            
-            # Freeze decoder if configured
-            if not getattr(config, "tune_kg_decoder", False):
-                logging.info("Freezing KG Decoder parameters.")
-                for param in self.kg_decoder.parameters():
-                    param.requires_grad = False
-
-        # Initialize the KGDecoder if configured
-        self.kg_decoder = None
-        if hasattr(config, "use_kg_decoder") and config.use_kg_decoder:
-            logging.info("Initializing KG Decoder.")
-            self.kg_decoder = KGDecoder(
-                node_embedding_dim=config.node_embedding_dim,
-                edge_embedding_dim=config.edge_embedding_dim,
-                final_embedding_dim=self.llm_embedding_dim,
-                dropout=config.dropout,
-                num_heads=config.num_heads,
-                decoder_layers=getattr(config, "decoder_layers", 2),
-                max_nodes=getattr(config, "max_nodes", 50),
-                num_edge_types=getattr(config, "num_edge_types", 1000),
-                reconstruction_weight=getattr(config, "reconstruction_weight", 1.0),
-                structure_weight=getattr(config, "structure_weight", 0.1),
-                num_quantizers=config.num_quantizers,
-            )
-            
-            # Share the vector quantizer from encoder to decoder for proper reconstruction
-            if hasattr(self.kg_encoder, 'dir_vq'):
-                self.kg_decoder.set_encoder_vq(self.kg_encoder.dir_vq)
             
             # Freeze decoder if configured
             if not getattr(config, "tune_kg_decoder", False):
@@ -255,7 +211,7 @@ class KG_LFMMetaModel(ABC):
                     param.requires_grad = False
 
         assert (
-            self.llm is not None and self.kg_encoder is not None
+            self.llm is not None
         ), "KG_LFM model initialization failed. Please check the configuration and ensure that the LLM and KGEncoder are properly initialized."
 
         self.is_loaded = True
@@ -409,18 +365,25 @@ class KG_LFMMetaModel(ABC):
     
     def encode_graphs(self, graphs):
         kg_encoder = self.get_kg_encoder()
+        if kg_encoder is None:
+            return None, None, None
+        
         graph_features, indexes, RVQ_loss = kg_encoder(graphs)
         return graph_features, indexes, RVQ_loss
     
-    def decode_graphs(self, quantized_tokens, quantized_indices=None, original_graphs=None, reconstruct_structure=True):
+    def decode_graphs(
+        self, 
+        quantized_tokens, 
+        original_graphs=None,
+        mode="both"
+    ):
         """
-        Decode quantized representations back to graph data using the KG decoder.
+        Perform edge prediction and/or object prediction using the KG decoder.
         
         Args:
             quantized_tokens: Quantized token representations from encoder [B, Q, D]
-            quantized_indices: Quantized indices from encoder (optional, not used in current implementation)
-            original_graphs: Original graph batch for structure reference (optional)
-            reconstruct_structure: Whether to predict graph structure (default: True)
+            original_graphs: Original graph batch for context (optional)
+            mode: Prediction mode - "edge_prediction", "object_prediction", or "both"
             
         Returns:
             Decoder output dict or None if decoder not available
@@ -432,7 +395,7 @@ class KG_LFMMetaModel(ABC):
         return kg_decoder(
             quantized_tokens=quantized_tokens,
             original_graphs=original_graphs,
-            reconstruct_structure=reconstruct_structure
+            mode=mode
         )
     
     def _temporary_reorder_cache(self, past_key_values, sorted_idx):
@@ -486,15 +449,14 @@ class KG_LFMMetaForCausalLM(ABC):
         logging.debug(f"Preparing inputs and labels for multimodal processing with {len(graphs)} graphs...")
         # Encode the knowledge graphs into embeddings that will replace KG tokens
         graph_features, indices, RVQ_loss = self.encode_graphs(graphs)
-        graph_features = graph_features.to(self.llm.dtype)
-
-        # Store quantized tokens and indices to return them for decoder use
-        quantized_tokens = graph_features
-        quantized_indices = indices
+        
+        if graph_features is not None:
+            graph_features = graph_features.to(self.llm.dtype)
 
         processed_graph = 0
         
-        logging.debug(f"Graph features shape: {graph_features.shape}, RVQ loss: {RVQ_loss}")
+        if graph_features is not None:
+            logging.debug(f"Graph features shape: {graph_features.shape}, RVQ loss: {RVQ_loss}")
 
         # Store original inputs for later reference
         _labels = labels
@@ -580,7 +542,10 @@ class KG_LFMMetaForCausalLM(ABC):
                 cur_new_labels.append(label_segments[i])
                 
                 # Insert graph embedding
-                cur_graph_feature = graph_features[processed_graph]
+                if graph_features is not None:
+                    cur_graph_feature = graph_features[processed_graph]
+                else:
+                    cur_graph_feature = torch.Tensor([]).to(input_embeds.device)
                 processed_graph += 1
                 cur_new_input_embeds.append(cur_graph_feature)
                 
@@ -686,8 +651,7 @@ class KG_LFMMetaForCausalLM(ABC):
             new_labels,
             RVQ_loss,  # Return the RVQ loss for training purposes
             indices,
-            quantized_tokens,  # Return quantized tokens for decoder
-            quantized_indices  # Return quantized indices for decoder
+            graph_features,  # Return graph features for decoder
         )
     
     @torch.inference_mode()
@@ -743,7 +707,6 @@ class KG_LFMMetaForCausalLM(ABC):
             _,
             _,
             _,  # quantized_tokens (not needed for generation)
-            _   # quantized_indices (not needed for generation)
         ) = self.prepare_inputs_labels_for_multimodal(
             input_ids, None, attention_mask, None, None, graphs
         )
@@ -883,8 +846,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
                 labels,
                 RVQ_loss,
                 indices,
-                quantized_tokens,
-                quantized_indices
+                quantized_tokens
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -916,102 +878,27 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         # Add decoder reconstruction loss if decoder is enabled and we have quantized tokens
         decoder_loss = None
         if (self.get_kg_decoder() is not None and 
-            RVQ_loss is not None and 
-            'quantized_tokens' in locals() and quantized_tokens is not None and
-            'quantized_indices' in locals() and quantized_indices is not None and
+            quantized_tokens is not None and 
             graphs is not None):
             
-            # Use the quantized tokens and indices returned from prepare function
-            
-            # Extract original graph features for reconstruction targets
-            # Create targets by gathering node and edge features per graph
-            target_node_features = []
-            target_edge_features = []
-            
-            batch_ptr = graphs.ptr if hasattr(graphs, 'ptr') else None
-            if batch_ptr is not None:
-                # Use batch pointers to split features per graph
-                for i in range(len(batch_ptr) - 1):
-                    start_idx = batch_ptr[i]
-                    end_idx = batch_ptr[i + 1]
-                    graph_nodes = graphs.x[start_idx:end_idx]
-                    target_node_features.append(graph_nodes)
-                
-                # For edges, we need to be more careful as edge indices might be different
-                for i in range(len(batch_ptr) - 1):
-                    # Count edges for this graph
-                    node_start = batch_ptr[i]
-                    node_end = batch_ptr[i + 1]
-                    
-                    # Find edges that belong to this graph
-                    edge_mask = (graphs.edge_index[0] >= node_start) & (graphs.edge_index[0] < node_end)
-                    graph_edges = graphs.edge_attr[edge_mask] if hasattr(graphs, 'edge_attr') else None
-                    if graph_edges is not None:
-                        target_edge_features.append(graph_edges)
-            else:
-                # Fallback: use batch attribute to split
-                unique_batches = torch.unique(graphs.batch)
-                for batch_id in unique_batches:
-                    node_mask = graphs.batch == batch_id
-                    graph_nodes = graphs.x[node_mask]
-                    target_node_features.append(graph_nodes)
-                    
-                    # For edges, find those connecting nodes in this graph
-                    edge_mask = torch.isin(graphs.edge_index[0], torch.where(node_mask)[0])
-                    if hasattr(graphs, 'edge_attr'):
-                        graph_edges = graphs.edge_attr[edge_mask]
-                        target_edge_features.append(graph_edges)
-            
-            # Pad target features to same length for batching
-            if target_node_features:
-                max_nodes = max(feat.shape[0] for feat in target_node_features)
-                padded_node_features = []
-                for feat in target_node_features:
-                    if feat.shape[0] < max_nodes:
-                        padding = torch.zeros(max_nodes - feat.shape[0], feat.shape[1], 
-                                            device=feat.device, dtype=feat.dtype)
-                        feat = torch.cat([feat, padding], dim=0)
-                    padded_node_features.append(feat)
-                target_node_features = torch.stack(padded_node_features)
-            else:
-                target_node_features = None
-                
-            if target_edge_features:
-                max_edges = max(feat.shape[0] for feat in target_edge_features)
-                padded_edge_features = []
-                for feat in target_edge_features:
-                    if feat.shape[0] < max_edges:
-                        padding = torch.zeros(max_edges - feat.shape[0], feat.shape[1], 
-                                            device=feat.device, dtype=feat.dtype)
-                        feat = torch.cat([feat, padding], dim=0)
-                    padded_edge_features.append(feat)
-                target_edge_features = torch.stack(padded_edge_features)
-            else:
-                target_edge_features = None
-            
-            decoder_output = self.decode_graphs(
+            # Run decoder for self-supervised learning
+            # In training mode, we can create node pairs and relations from the original graphs
+            # For now, we use a simple reconstruction objective
+            decoder_results = self.decode_graphs(
                 quantized_tokens=quantized_tokens,
-                quantized_indices=quantized_indices,
                 original_graphs=graphs,
-                target_node_features=target_node_features,
-                target_edge_features=target_edge_features
+                mode="both"  # Both edge and object prediction
             )
             
-            if decoder_output is not None:
-                decoder_loss = decoder_output['reconstruction_loss']
-                logging.debug(f"Decoder reconstruction loss: {decoder_loss}")
+            if decoder_results is not None and "total_loss" in decoder_results:
+                decoder_loss = decoder_results["total_loss"]
+                logging.debug(f"Decoder loss: {decoder_loss.item()}")
         
         # If RVQ_loss is not None, add it to the model's loss for training
         if return_dict:
             out["RVQ_loss"] = RVQ_loss
             out["RVQ_indices"] = indices
             out["decoder_loss"] = decoder_loss
-            
-            # Add decoder loss to the main loss if both exist
-            if out.loss is not None and decoder_loss is not None:
-                out.loss = out.loss + decoder_loss
-            elif decoder_loss is not None:
-                out.loss = decoder_loss
         else:
             total_loss = out[0] if RVQ_loss is None else out[0] + RVQ_loss
             if decoder_loss is not None:

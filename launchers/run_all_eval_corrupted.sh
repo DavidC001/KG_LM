@@ -131,7 +131,7 @@ MAX_SAMPLES="${MAX_SAMPLES}"
 SPLIT="${SPLIT}"
 
 accelerate launch --config-file configs/accelerate_evalconfig.yaml \
-  evaluate.py --config "\${CONFIG_FILE}" --output_file "\${OUTPUT_FILE}" --batch_size "\${BATCH_SIZE}" --max_samples "\${MAX_SAMPLES}" --no_baseline --split "\${SPLIT}"
+  evaluate.py --config "\${CONFIG_FILE}" --output_file "\${OUTPUT_FILE}" --batch_size "\${BATCH_SIZE}" --max_samples "\${MAX_SAMPLES}" --no_baseline --split "\${SPLIT}" --corrupt
 EOF
     chmod +x "$JOB_SCRIPT"
     sbatch "$JOB_SCRIPT"
@@ -192,8 +192,6 @@ if [ "$MODE" = "models" ]; then
             NAME_NO_EXT="${DATASET}-${RUN_NAME}"
             generate_and_submit_job "$GEN_CFG_PATH" "$NAME_NO_EXT" "$NAME_NO_EXT"
             echo "Submitted: $DATASET with checkpoint $CKPT_PATH from $TRAIN_CFG"
-            echo ""
-            echo ""
         done
     done
 

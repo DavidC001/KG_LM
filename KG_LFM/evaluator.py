@@ -5,9 +5,7 @@ Comprehensive evaluation script for KG-LFM model.
 This script loads the best trained model and evaluates it on various metrics
 relevant for KG-augmented generation including:
 - Perplexity
-- BLEU scores
-- ROUGE scores  
-- Top-k accuracy for KG predictions
+- Top-k accuracy for KG predictions (Hit@k metrics)
 - Graph embedding coherence metrics
 - Knowledge utilization metrics
 """
@@ -173,7 +171,9 @@ class KGLFMEvaluator:
         max_samples: Optional[int] = None,
         no_baseline: bool = False,
         no_text: bool = False,
-        only_baselines: bool = False
+        only_baselines: bool = False,
+        split: str = "test",
+        corrupt: bool = False,
     ):
         self.config_path = config_path
         self.batch_size = batch_size
@@ -192,13 +192,17 @@ class KGLFMEvaluator:
         # Load configuration
         self.config : ProjectConfig = load_yaml_config(config_path)
         self.model_path = Path(self.config.train_conf.start_from_checkpoint)
+        
         self.config.train_conf.dataloader.batch_size = batch_size
+        self.config.dataset.corrupt = corrupt
         
         set_seed(self.config.seed)
         
         # Initialize model
         self.model = None
         self.tokenizer = None
+        
+        self.split = split
         
         # Initialize metrics storage
         self.results = defaultdict(dict)
@@ -357,16 +361,16 @@ class KGLFMEvaluator:
                 self.logger.error(f"Error loading model: {e}")
             raise
     
-    def setup_data(self, split: str = "test"):
+    def setup_data(self):
         """Setup data loaders for evaluation."""
         if self.accelerator.is_main_process:
-            self.logger.info(f"Setting up {split} data loader")
-        
+            self.logger.info(f"Setting up {self.split} data loader")
+
         self.dataloader = create_dataloader(
             self.config.dataset,
             self.config.train_conf.dataloader,
             tokenizer=self.tokenizer,
-            split=split
+            split=self.split
         )
 
         # disable shuffling for evaluation
@@ -394,6 +398,106 @@ class KGLFMEvaluator:
                 self.model, self.dataloader
             )
             self.clean_model = self.model  # Use the same model if not tuning
+
+    def compute_perplexity(self) -> Dict[str, float]:
+        """Compute perplexity for all models on the evaluation dataset.
+        
+        Perplexity is computed as exp(average negative log-likelihood) over all
+        valid token positions (non-ignored tokens).
+        """
+        if self.accelerator.is_main_process:
+            self.logger.info("Computing perplexity metrics...")
+        
+        results = {}
+        
+        for name, (preprocess_func, model) in self.tests.items():
+            if self.accelerator.is_main_process:
+                self.logger.info(f"Evaluating {name} model for perplexity...")
+            
+            total_loss = 0.0
+            total_tokens = 0
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc=f"Computing perplexity for {name}", disable=not self.accelerator.is_main_process)):
+                    if self.max_samples and (batch_idx * self.batch_size * self.accelerator.num_processes) >= self.max_samples:
+                        break
+
+                    batch = preprocess_func(batch)
+                    
+                    batch['input_ids'] = batch['input_ids'].to(self.accelerator.device)
+                    batch['attention_mask'] = batch['attention_mask'].to(self.accelerator.device)
+                    
+                    # Use the proper labels from the dataset (only assistant response tokens)
+                    labels = batch.get('labels', batch['input_ids'].clone())
+                    labels = labels.to(self.accelerator.device)
+                    
+                    model_input = {
+                        'input_ids': batch['input_ids'],
+                        'attention_mask': batch['attention_mask'],
+                        'labels': labels
+                    }
+                    if batch.get('graphs'): 
+                        model_input['graphs'] = batch['graphs']
+
+                    outputs = model(**model_input)
+                    
+                    # Get the loss and number of tokens
+                    loss = outputs.loss
+                    
+                    # Count valid tokens (non-ignored tokens in labels)
+                    # Only count tokens that are not IGNORE_INDEX - these are the assistant response tokens
+                    valid_tokens = (labels != IGNORE_INDEX).sum().item()
+                    
+                    total_loss += loss.item() * valid_tokens
+                    total_tokens += valid_tokens
+
+            # Gather losses and token counts from all processes
+            total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
+            total_tokens_tensor = torch.tensor(total_tokens, device=self.accelerator.device)
+            
+            total_loss_gathered = self.accelerator.gather(total_loss_tensor).sum().item()
+            total_tokens_gathered = self.accelerator.gather(total_tokens_tensor).sum().item()
+
+            # Synchronize across processes
+            self.accelerator.wait_for_everyone()
+            
+            # Compute perplexity on main process
+            if self.accelerator.is_main_process:
+                if total_tokens_gathered > 0:
+                    avg_loss = total_loss_gathered / total_tokens_gathered
+                    perplexity = math.exp(avg_loss)
+                    
+                    results[name] = {
+                        'perplexity': perplexity,
+                        'average_loss': avg_loss,
+                        'total_tokens': total_tokens_gathered
+                    }
+                    
+                    self.logger.info(f"Perplexity for {name}: {perplexity:.4f} (avg_loss: {avg_loss:.4f}, tokens: {total_tokens_gathered})")
+                else:
+                    self.logger.warning(f"No valid tokens found for perplexity computation for {name}")
+                    results[name] = {
+                        'perplexity': float('inf'),
+                        'average_loss': float('inf'),
+                        'total_tokens': 0
+                    }
+            else:
+                # Non-main processes set dummy values
+                results[name] = {
+                    'perplexity': 0.0,
+                    'average_loss': 0.0,
+                    'total_tokens': 0
+                }
+                    
+        # Broadcast results to all processes
+        if self.accelerator.is_main_process:
+            results_to_broadcast = results
+        else:
+            results_to_broadcast = None
+        
+        results = broadcast_object_list([results_to_broadcast])[0]
+        
+        return results
 
     def compute_hit_k_metrics(self, k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, float]:
         """Compute Hit@k metrics for object label prediction.
@@ -517,6 +621,7 @@ class KGLFMEvaluator:
         
         # Run all evaluations
         evaluations = {
+            # 'perplexity': self.compute_perplexity,
             'hit_at_k': self.compute_hit_k_metrics,
         }
         
@@ -541,6 +646,8 @@ class KGLFMEvaluator:
                 'max_samples': self.max_samples,
                 'num_processes': self.accelerator.num_processes,
                 'process_index': self.accelerator.process_index,
+                'split': self.split,
+                'corrupt': self.config.dataset.corrupt,
             }
         
         # Save results if output file specified (only on main process)
@@ -579,11 +686,30 @@ class KGLFMEvaluator:
             print("-" * 40)
             
             if isinstance(metrics, dict) and 'error' not in metrics:
-                for metric_name, value in metrics.items():
-                    if isinstance(value, float):
-                        print(f"  {metric_name}: {value:.4f}")
-                    else:
-                        print(f"  {metric_name}: {value}")
+                # Handle nested results (e.g., different models for perplexity)
+                if any(isinstance(v, dict) for v in metrics.values()):
+                    for model_name, model_metrics in metrics.items():
+                        if isinstance(model_metrics, dict):
+                            print(f"  {model_name}:")
+                            for metric_name, value in model_metrics.items():
+                                if isinstance(value, float):
+                                    if metric_name == 'perplexity':
+                                        print(f"    {metric_name}: {value:.4f}")
+                                    else:
+                                        print(f"    {metric_name}: {value:.6f}")
+                                else:
+                                    print(f"    {metric_name}: {value}")
+                        else:
+                            if isinstance(model_metrics, float):
+                                print(f"  {model_name}: {model_metrics:.4f}")
+                            else:
+                                print(f"  {model_name}: {model_metrics}")
+                else:
+                    for metric_name, value in metrics.items():
+                        if isinstance(value, float):
+                            print(f"  {metric_name}: {value:.4f}")
+                        else:
+                            print(f"  {metric_name}: {value}")
             elif 'error' in metrics:
                 print(f"  Error: {metrics['error']}")
         

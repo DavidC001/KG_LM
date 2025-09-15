@@ -13,6 +13,21 @@ from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN, IGNORE_INDEX
 
 from torch_geometric.data import Data
 
+
+negative_answers = [
+    "The Knowledge Graph does not contain this information.",
+    "The Knowledge Graph does not have this information.",
+    "This information is not available in the Knowledge Graph.",
+    "The KG returned no results for this query.",
+    "The KG does not contain this information.",
+    "With the current knowledge I have, I cannot provide an answer to that question.",
+    "I don't have that information in my knowledge base.",
+    "I'm sorry, but I don't have that information.",
+    "I don't have that information.",
+    "I don't know.",
+]
+
+
 class QADataset(Dataset):
     """
     Combined dataset for TriREx sentences and TRExStar graphs.
@@ -28,11 +43,16 @@ class QADataset(Dataset):
         star_graphs: Dict[str, nx.DiGraph],
         tokenizer: PreTrainedTokenizer,
         big_graph_aligner: BigGraphAligner,
+        corrupted: bool = False,
+        drop_answer_prob: float = 0.0,
     ):
         self.webqsp_dataset = webqsp_dataset
         self.star_graphs = star_graphs
         self.tokenizer = tokenizer
         self.big_graph_aligner = big_graph_aligner
+        
+        self.corrupted = corrupted
+        self.drop_answer_prob = drop_answer_prob
         
         # add to tokenizer a special token SPECIAL_KG_TOKEN for graph embeddings
         if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
@@ -71,6 +91,8 @@ class QADataset(Dataset):
             'object': sample['object']
         }
         
+        object_id = None
+        
         # Add graph data if available and requested
         subject_id = sample['subject']['id']
         
@@ -78,8 +100,16 @@ class QADataset(Dataset):
         subject_graph = self.star_graphs.get(subject_id, None)
         assert subject_graph is not None, f"Subject graph for {subject_id} not found."
         
-        result['graph'] = self._process_graph(subject_graph)
+        answer = sample['answer']
         
+        random_value = torch.rand(1).item()
+        if self.corrupted:
+            object_id = sample['object']['id']
+        elif (self.drop_answer_prob and random_value < self.drop_answer_prob):
+            object_id = sample['object']['id']
+            answer = negative_answers[idx % len(negative_answers)]
+            
+        result['graph'] = self._process_graph(subject_graph, object_node_id=object_id)
         # Tokenize the sentence
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
@@ -96,7 +126,7 @@ class QADataset(Dataset):
             },
             {
                 'role': 'assistant',
-                'content': "the answer is: " + sample['answer']
+                'content': ("the answer is: " if answer not in negative_answers else "") + answer
             }
         ]
         # if tokenizer has chat template, use it
@@ -107,23 +137,12 @@ class QADataset(Dataset):
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
-
         except ValueError:
             print("Tokenizer does not support chat templates. Using fallback method.")
             # Fallback for tokenizers without chat template support
             sentence = f"user: {sample['question']} \ntool: {subject_text}{SPECIAL_KG_TOKEN}  \nassistant: {sample['answer']}"
         result['sentence'] = sentence
         
-        # find the index of the answer in the sentence
-        answer_start = sentence.find(sample['answer'])
-        if answer_start == -1:
-            raise ValueError("Answer not found in the tokenized sentence.")
-        # Adjust the start and end indices of the object boundaries
-        result['object']['boundaries'] = [
-            answer_start,
-            answer_start + len(sample['answer'])
-        ]
-
         tokenized = self.tokenizer(
             sentence,
             return_tensors='pt'
@@ -131,23 +150,34 @@ class QADataset(Dataset):
         result['input_ids'] = tokenized['input_ids'].squeeze(0)
         result['attention_mask'] = tokenized['attention_mask'].squeeze(0)
         
+        # find the index of the answer in the sentence
+        answer_start = sentence.find(answer)
+        if answer_start == -1:
+            raise ValueError("Answer not found in the tokenized sentence.")
+        # Adjust the start and end indices of the object boundaries
+        result['object']['boundaries'] = [
+            answer_start,
+            answer_start + len(answer)
+        ]
+        
         # compute labels by masking everything except for the object
         tok_obj_start = tokenized.char_to_token(result['object']['boundaries'][0])
         tok_obj_end = tokenized.char_to_token(result['object']['boundaries'][1])
         result["object"]["token_boundaries"] = (tok_obj_start, tok_obj_end)
-
+        
         labels = torch.full(result['input_ids'].shape, IGNORE_INDEX, dtype=result['input_ids'].dtype)
         labels[tok_obj_start:tok_obj_end] = result['input_ids'][tok_obj_start:tok_obj_end]
         result['labels'] = labels
 
         return result
-    
-    def _process_graph(self, graph: nx.DiGraph) -> Data:
+
+    def _process_graph(self, graph: nx.DiGraph, object_node_id: int=None) -> Data:
         """
         Process and potentially sample the graph based on configuration.
         
         Args:
             graph: NetworkX DiGraph
+            object_node_id: ID of the object node. If provided, it will not be included in the neighbors.
             
         Returns:
             Processed graph data as torch geometric format.
@@ -161,6 +191,9 @@ class QADataset(Dataset):
         
         nodes = graph.nodes(data=True)
         for central_node_id, neighbour_node_id, edge in graph.edges(data=True):
+            if object_node_id == neighbour_node_id:
+                continue  # Skip the object node if specified
+            
             edge_ids.append(edge['id'])
             neighbour_ids.append(neighbour_node_id)
             if contral_node_id is None:
