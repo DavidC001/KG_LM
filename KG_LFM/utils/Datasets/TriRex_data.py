@@ -53,11 +53,19 @@ class TriRexStarDataset(Dataset):
         star_graphs: Dict[str, nx.DiGraph],
         tokenizer: PreTrainedTokenizer,
         big_graph_aligner: BigGraphAligner,
+        corrupted: bool = False,
+        drop_answer_prob: float = 0.0,
     ):
         self.trirex_dataset = trirex_dataset
         self.star_graphs = star_graphs
         self.tokenizer = tokenizer
         self.big_graph_aligner = big_graph_aligner
+        
+        self.corrupted = corrupted
+        self.drop_answer_prob = drop_answer_prob
+        
+        if self.drop_answer_prob > 0.0:
+            print(f"Warning: drop_answer_prob is ignored in TriRexStarDataset, as it is only relevant for QA tasks.")
         
         # add to tokenizer a special token SPECIAL_KG_TOKEN for graph embeddings
         if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
@@ -96,6 +104,10 @@ class TriRexStarDataset(Dataset):
             'object': sample['object']
         }
         
+        object_id = None
+        if self.corrupted:
+            object_id = sample['object']['id']
+        
         # Add graph data if available and requested
         subject_id = sample['subject']['id']
         
@@ -103,7 +115,7 @@ class TriRexStarDataset(Dataset):
         subject_graph = self.star_graphs.get(subject_id, None)
         assert subject_graph is not None, f"Subject graph for {subject_id} not found."
         
-        result['graph'] = self._process_graph(subject_graph)
+        result['graph'] = self._process_graph(subject_graph, object_node_id=object_id)
         
         # Tokenize the sentence
         if self.tokenizer is None:
@@ -165,12 +177,13 @@ class TriRexStarDataset(Dataset):
 
         return result
     
-    def _process_graph(self, graph: nx.DiGraph) -> Data:
+    def _process_graph(self, graph: nx.DiGraph, object_node_id: str = None) -> Data:
         """
         Process and potentially sample the graph based on configuration.
         
         Args:
             graph: NetworkX DiGraph
+            object_node_id: If provided, this node will be excluded from the graph.
             
         Returns:
             Processed graph data as torch geometric format.
@@ -184,6 +197,9 @@ class TriRexStarDataset(Dataset):
         
         nodes = graph.nodes(data=True)
         for central_node_id, neighbour_node_id, edge in graph.edges(data=True):
+            if object_node_id == neighbour_node_id:
+                continue  # Skip the object node if specified
+            
             edge_ids.append(edge['id'])
             neighbour_ids.append(neighbour_node_id)
             if contral_node_id is None:

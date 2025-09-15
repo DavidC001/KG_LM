@@ -44,6 +44,12 @@ class DatasetConfig:
     lite: bool = False
     """Whether to use the lite version of the dataset. Defaults to False."""
     
+    corrupt: bool = False
+    """Whether to remove object entities from the input graph. Defaults to False."""
+    
+    drop_obj_entities_prob: float = 0.0
+    """Probability of dropping object entities from the input graph. Defaults to 0.0."""
+    
     # base path from $FAST/datase
     base_path: str = os.path.join(os.getenv("FAST", ""), "dataset", "KG_LFM")
     """Base path for the dataset. Defaults to $FAST/dataset/KG_LFM."""
@@ -131,6 +137,18 @@ class ModelConfig:
     tune_kg_encoder: bool = True
     """Whether to tune the knowledge graph encoder during training. Defaults to True."""
     
+    tune_kg_decoder: bool = True
+    """Whether to tune the knowledge graph decoder during training. Defaults to False."""
+    
+    use_kg_encoder: bool = True
+    """Whether to use the KG encoder for embedding the input graphs. Defaults to True."""
+    
+    # KG Decoder Configuration
+    use_kg_decoder: bool = False
+    """Whether to use the KG decoder for reconstruction. Defaults to False."""
+    decoder_layers: int = 1
+    """Number of decoder graph layers. Defaults to 1."""
+
     # Graph Node Embedding Configuration
     graph_nodes_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     """Model used for graph nodes embedding. Defaults to 'Qwen/Qwen3-Embedding-0.6B'."""
