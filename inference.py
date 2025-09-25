@@ -42,10 +42,10 @@ except Exception:  # pragma: no cover
 from torch_geometric.data import Data, Batch
 
 # Project imports
-from KG_LFM.model.KG_LFM_arch import KG_LFM
-from KG_LFM.utils.Datasets.factories.factory import trex_star_graphs_factory
-from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
-from KG_LFM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
+from KG_LM.model.KG_LM_arch import KG_LM
+from KG_LM.utils.Datasets.factories.factory import trex_star_graphs_factory
+from KG_LM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LM.configuration import DatasetConfig, SPECIAL_KG_TOKEN
 
 # ----------------------------
 # Tool schema for function calling
@@ -78,7 +78,7 @@ KG_QUERY_TOOL = {
 # ----------------------------
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("kg_lfm_cli_compare")
+logger = logging.getLogger("KG_LM_cli_compare")
 
 # ----------------------------
 # Helpers
@@ -227,7 +227,7 @@ class KGChatBot:
             self.hist_augmented.append(dict(sp))
 
         logger.info("Loading KG-LFM model…")
-        self.model = KG_LFM.from_pretrained(model_path)
+        self.model = KG_LM.from_pretrained(model_path)
         self.model.to(self.device).eval()
         self.tokenizer = _ensure_tokenizer_on(self.model, model_path)
 
@@ -688,7 +688,7 @@ def main() -> None:
 
     # Dataset config
     if args.config:
-        from KG_LFM.configuration import load_yaml_config
+        from KG_LM.configuration import load_yaml_config
 
         cfg = load_yaml_config(args.config)
         dataset_cfg: DatasetConfig = cfg.dataset

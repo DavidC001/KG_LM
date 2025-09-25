@@ -95,9 +95,11 @@ class ModelConfig:
     llm_model_name: str = "Qwen/Qwen3-8B"
     """Name of the base language model to use. Defaults to 'qwen/Qwen-7B-Chat'."""
     
-    graph_pooling: bool = True
-    """Whether to apply global mean pooling to the graph representations. Defaults to True."""
-    
+    graph_pooling: bool = False
+    """Whether to apply global mean pooling to the graph representations. Defaults to False."""
+    q_former: bool = False
+    """Whether to use a Q-Former architecture to pool graph representations. Defaults to False."""
+
     dropout: float = 0.2
     """Dropout rate for the model. Defaults to 0.2."""
     

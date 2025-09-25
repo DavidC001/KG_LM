@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, List, Optional, Union, Tuple, Any
 import warnings
 
 import torch
@@ -7,38 +7,28 @@ import networkx as nx
 from datasets import Dataset as HFDataset
 from transformers import PreTrainedTokenizer
 
-from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import SPECIAL_KG_TOKEN, DatasetConfig, IGNORE_INDEX
+from KG_LM.configuration import DatasetConfig, SPECIAL_KG_TOKEN, IGNORE_INDEX
 
 from torch_geometric.data import Data
 
 
-user_questions = [
-    "what do you know about {subject}?",
-    "tell me all you know about {subject}",
-    "what can you find about {subject}?",
-    "can you provide more details on {subject}?",
-    "give me background on {subject}.",
-    "what's important to know about {subject}?",
-    "describe {subject} in general terms.",
-    "summarize the key facts about {subject}.",
-    "what knowledge is available about {subject}?",
-    "give a high-level overview of {subject}.",
-    "what are the basics of {subject}?",
-    "explain {subject} briefly.",
-    "what is {subject} known for?",
-    "outline the main points about {subject}.",
-    "provide general information on {subject}.",
-    "what should I know first about {subject}?",
-    "share notable facts about {subject}.",
-    "what connections are relevant to {subject}?",
-    "what context is useful for understanding {subject}?",
-    "how would you characterize {subject} overall?",
+negative_answers = [
+    "The Knowledge Graph does not contain this information.",
+    "The Knowledge Graph does not have this information.",
+    "This information is not available in the Knowledge Graph.",
+    "The KG returned no results for this query.",
+    "The KG does not contain this information.",
+    "With the current knowledge I have, I cannot provide an answer to that question.",
+    "I don't have that information in my knowledge base.",
+    "I'm sorry, but I don't have that information.",
+    "I don't have that information.",
+    "I don't know.",
 ]
 
 
-class TriRexStarDataset(Dataset):
+class QADataset(Dataset):
     """
     Combined dataset for TriREx sentences and TRExStar graphs.
     
@@ -49,23 +39,20 @@ class TriRexStarDataset(Dataset):
     
     def __init__(
         self,
-        trirex_dataset: HFDataset,
+        webqsp_dataset: HFDataset,
         star_graphs: Dict[str, nx.DiGraph],
         tokenizer: PreTrainedTokenizer,
         big_graph_aligner: BigGraphAligner,
         corrupted: bool = False,
         drop_answer_prob: float = 0.0,
     ):
-        self.trirex_dataset = trirex_dataset
+        self.webqsp_dataset = webqsp_dataset
         self.star_graphs = star_graphs
         self.tokenizer = tokenizer
         self.big_graph_aligner = big_graph_aligner
         
         self.corrupted = corrupted
         self.drop_answer_prob = drop_answer_prob
-        
-        if self.drop_answer_prob > 0.0:
-            print(f"Warning: drop_answer_prob is ignored in TriRexStarDataset, as it is only relevant for QA tasks.")
         
         # add to tokenizer a special token SPECIAL_KG_TOKEN for graph embeddings
         if SPECIAL_KG_TOKEN not in self.tokenizer.get_vocab():
@@ -76,7 +63,7 @@ class TriRexStarDataset(Dataset):
             self.tokenizer.add_special_tokens({'additional_special_tokens': [SPECIAL_KG_TOKEN]})
 
     def __len__(self) -> int:
-        return len(self.trirex_dataset)
+        return len(self.webqsp_dataset)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
@@ -92,21 +79,24 @@ class TriRexStarDataset(Dataset):
             - object_graph: NetworkX graph for object entity (if available)
             - tokenized_input: Tokenized sentence (if tokenizer provided)
         """
-        # print(f"Fetching sample {idx} from TriREx dataset")
-        sample = self.trirex_dataset[idx]
-        
-        # add to the sentence a special token for graph embedding after the subject
+        # print(f"Fetching sample {idx} from WebQSP dataset")
+        sample = self.webqsp_dataset[idx]
+
+        # add to the question a special token for graph embedding after the subject
         subject_text = sample['subject']['label']
 
+        # Get question ID for WebQSP (which has multiple answers per question)
+        # For other datasets, use incremental ID so each sample is treated independently
+        question_id = sample.get('question_id', f"sample_{idx}")
+        
         result = {
+            'question_id': question_id,  # Add question ID for grouping (for WebQSP) or unique ID (for others)
             'subject': sample['subject'],
             'predicate': sample['predicate'],
             'object': sample['object']
         }
         
         object_id = None
-        if self.corrupted:
-            object_id = sample['object']['id']
         
         # Add graph data if available and requested
         subject_id = sample['subject']['id']
@@ -115,16 +105,25 @@ class TriRexStarDataset(Dataset):
         subject_graph = self.star_graphs.get(subject_id, None)
         assert subject_graph is not None, f"Subject graph for {subject_id} not found."
         
-        result['graph'] = self._process_graph(subject_graph, object_node_id=object_id)
+        answer = sample['answer']
         
+        random_value = torch.rand(1).item()
+        if self.corrupted:
+            object_id = sample['object']['id']
+        elif (self.drop_answer_prob and random_value < self.drop_answer_prob):
+            object_id = sample['object']['id']
+            answer = negative_answers[idx % len(negative_answers)]
+            
+        result['graph'] = self._process_graph(subject_graph, object_node_id=object_id)
         # Tokenize the sentence
         if self.tokenizer is None:
             raise ValueError("Tokenizer must be provided for text processing.")
-
-        result["conversation"] = [
+        
+        
+        result["conversation"]=[
             {
                 'role': 'user',
-                'content': user_questions[idx % len(user_questions)].format(subject=subject_text)
+                'content': sample['question']
             },
             {
                 'role': 'tool' if "tool" in self.tokenizer.chat_template else 'assistant',
@@ -132,7 +131,7 @@ class TriRexStarDataset(Dataset):
             },
             {
                 'role': 'assistant',
-                'content': sample['sentence']
+                'content': ("the answer is: " if answer not in negative_answers else "") + answer
             }
         ]
         # if tokenizer has chat template, use it
@@ -144,46 +143,46 @@ class TriRexStarDataset(Dataset):
                 enable_thinking=False,
             )
         except ValueError:
+            print("Tokenizer does not support chat templates. Using fallback method.")
             # Fallback for tokenizers without chat template support
-            sentence = f"user: {user_questions[idx % len(user_questions)].format(subject=subject_text)}\ntool: {SPECIAL_KG_TOKEN}\nassistant: {sample['sentence']}"
-
+            sentence = f"user: {sample['question']} \ntool: {subject_text}{SPECIAL_KG_TOKEN}  \nassistant: {sample['answer']}"
+        result['sentence'] = sentence
+        
         tokenized = self.tokenizer(
             sentence,
             return_tensors='pt'
         )
-        
-        result["sentence"] = sentence
         result['input_ids'] = tokenized['input_ids'].squeeze(0)
         result['attention_mask'] = tokenized['attention_mask'].squeeze(0)
-
-        # compute labels by masking everything except for the object
-        shift = sentence.find(sample["sentence"])
-        object_char_start, object_char_end = sample['object']['boundaries']
-        object_char_start += shift
-        object_char_end += shift
-        result['object']['boundaries'] = [object_char_start, object_char_end]
         
-        # tokenized to char mappings
-        obj_tok_start = tokenized.char_to_token(object_char_start)
-        obj_tok_end = tokenized.char_to_token(object_char_end)
-        result["object"]["token_boundaries"] = [obj_tok_start, obj_tok_end]
-
-        # compute labels
+        # find the index of the answer in the sentence
+        answer_start = sentence.find(answer)
+        if answer_start == -1:
+            raise ValueError("Answer not found in the tokenized sentence.")
+        # Adjust the start and end indices of the object boundaries
+        result['object']['boundaries'] = [
+            answer_start,
+            answer_start + len(answer)
+        ]
+        
+        # compute labels by masking everything except for the object
+        tok_obj_start = tokenized.char_to_token(result['object']['boundaries'][0])
+        tok_obj_end = tokenized.char_to_token(result['object']['boundaries'][1])
+        result["object"]["token_boundaries"] = (tok_obj_start, tok_obj_end)
+        
         labels = torch.full(result['input_ids'].shape, IGNORE_INDEX, dtype=result['input_ids'].dtype)
-        # search for start of assistant message
-        sentence_tok_start = tokenized.char_to_token(shift)
-        labels[sentence_tok_start:] = result['input_ids'][sentence_tok_start:]
+        labels[tok_obj_start:tok_obj_end] = result['input_ids'][tok_obj_start:tok_obj_end]
         result['labels'] = labels
 
         return result
-    
-    def _process_graph(self, graph: nx.DiGraph, object_node_id: str = None) -> Data:
+
+    def _process_graph(self, graph: nx.DiGraph, object_node_id: int=None) -> Data:
         """
         Process and potentially sample the graph based on configuration.
         
         Args:
             graph: NetworkX DiGraph
-            object_node_id: If provided, this node will be excluded from the graph.
+            object_node_id: ID of the object node. If provided, it will not be included in the neighbors.
             
         Returns:
             Processed graph data as torch geometric format.
@@ -245,23 +244,21 @@ class TriRexStarDataset(Dataset):
         )
         
         return graph_data
-
+    
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
-    from KG_LFM.utils.Datasets.factories.factory import trirex_factory, trex_star_graphs_factory
+    from KG_LM.utils.Datasets.factories.factory import web_qsp_factory
         
     # Create dataset config
     dataset_config = DatasetConfig(lite=True)  # Use lite for faster loading
-    dataset_config.name = "trirex"  # Use WebQSP dataset
+    dataset_config.name = "web-qsp"  # Use WebQSP dataset
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
     
-    # Load TRIRex dataset and graphs
-    trirex_dataset, _, _ = trirex_factory(dataset_config)
-    graphs = trex_star_graphs_factory(dataset_config)
-    
+    # Load WebQSP dataset
+    webqsp_dataset, graphs = web_qsp_factory(dataset_config)
     
     graph_aligner = BigGraphAligner(
         graphs=graphs,
@@ -269,8 +266,8 @@ if __name__ == "__main__":
     )
     
     # Create the combined dataset
-    combined_dataset = TriRexStarDataset(
-        trirex_dataset=trirex_dataset,
+    combined_dataset = QADataset(
+        webqsp_dataset=webqsp_dataset,
         star_graphs=graphs,
         tokenizer=tokenizer,
         big_graph_aligner=graph_aligner

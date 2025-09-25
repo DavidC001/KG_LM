@@ -57,9 +57,9 @@ model:
   codebook_dim: 0
   shared_codebook: False
   dead_codebook_threshold: 0.0625 
-  # {total batch_size}/{codebook_size}/2 
-  # meaning that the code need to be used around once every {codebook_size}*2 samples
-  
+  # {total batch_size}/{codebook_size}/4
+  # meaning that the code need to be used around once every {codebook_size}*4 samples
+
   # Training Configuration
   tune_language_model: False
   tune_kg_encoder: True

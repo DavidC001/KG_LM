@@ -37,6 +37,7 @@ class WebQSPSentences(GeneratorBasedBuilder):
                 "question": Value("string"),
                 "answer": Value("string"),
                 "k": Value("int32"),
+                "question_id": Value("string"),  # Add question_id field
                 "subject": {
                     "id": Value("string"),
                     "label": Value("string"),
@@ -96,6 +97,7 @@ class WebQSPSentences(GeneratorBasedBuilder):
                         "question": row['question'],
                         "answer": row['answer'],
                         "k": row['k'],
+                        "question_id": question_id.split('_')[0],  # Extract question ID from filename
                         "subject": {
                             "id": row['subject_id'],
                             "label": row['subject_label'],

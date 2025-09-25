@@ -24,9 +24,9 @@ import torch
 from tqdm.auto import tqdm
 
 # Project imports
-from KG_LFM.configuration import load_yaml_config, ProjectConfig, IGNORE_INDEX, SPECIAL_KG_TOKEN
-from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig
-from KG_LFM.utils.Dataloader import create_dataloader
+from KG_LM.configuration import load_yaml_config, ProjectConfig, IGNORE_INDEX, SPECIAL_KG_TOKEN
+from KG_LM.model.KG_LM_arch import KG_LM, KG_LMConfig
+from KG_LM.utils.Dataloader import create_dataloader
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from accelerate import Accelerator
@@ -91,7 +91,8 @@ def compute_hit_k(
     num_quantizers: int,
     attention_mask: torch.Tensor,
     special_token: int,
-    tokenizer
+    tokenizer,
+    return_individual_ranks: bool = False
 ):
     logger = logging.getLogger()
 
@@ -159,6 +160,25 @@ def compute_hit_k(
                 logger.debug(f"Decoded tokens[{b}]: {tokenizer.batch_decode(labels_b.tolist())}")
                 logger.debug(f"Decoded argmax[{b}]: {tokenizer.batch_decode(logits_b.argmax(dim=-1).tolist())}")
 
+    # Return individual ranks if requested (for WebQSP evaluation)
+    if return_individual_ranks:
+        individual_ranks = []
+        for b in range(B):
+            if has_object[b]:
+                individual_ranks.append(seq_ranks[b].item())
+            else:
+                individual_ranks.append(float('inf'))  # No valid object found
+        
+        # DEBUG: Verify that manual aggregation of individual ranks matches hit_k_batch_correct
+        manual_hits = {}
+        for k in k_values:
+            manual_count = sum(1 for rank in individual_ranks if rank != float('inf') and rank <= k)
+            manual_hits[k] = manual_count
+            if manual_hits[k] != hit_k_batch_correct[k]:
+                logger.warning(f"MISMATCH for k={k}: manual={manual_hits[k]}, original={hit_k_batch_correct[k]}")
+        
+        return individual_ranks, tot_num_tokens, total_objects
+    
     return hit_k_batch_correct, tot_num_tokens, total_objects
 
 class KGLFMEvaluator:
@@ -256,6 +276,7 @@ class KGLFMEvaluator:
             batch["labels"][sample_idx][tok_start:tok_end] = tokenized['input_ids'][sample_idx][tok_start:tok_end]
 
         out = {
+            "question_ids": batch["question_ids"],
             "sentences": batch_sentences,
             "objects": batch["objects"],
             "input_ids": tokenized['input_ids'],
@@ -312,17 +333,17 @@ class KGLFMEvaluator:
         self.tests = {}
         
         try:
-            self.model_config : KG_LFMConfig = KG_LFMConfig.from_pretrained(self.model_path)
+            self.model_config : KG_LMConfig = KG_LMConfig.from_pretrained(self.model_path)
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path / "llm")
             
             self.special_kg_token_id = self.tokenizer.convert_tokens_to_ids(SPECIAL_KG_TOKEN)
             
             if not self.only_baselines:
-                self.model = KG_LFM.from_pretrained(self.model_path)
+                self.model = KG_LM.from_pretrained(self.model_path)
                 self.model.eval()
                 
                 self.tests.update({
-                    "KG_LFM": (lambda x: x, self.model),  # No preprocessing needed for KG_LFM
+                    "KG_LM": (lambda x: x, self.model),  # No preprocessing needed for KG_LM
                 })
 
             # if the config requires to tune the model also load clean model
@@ -520,7 +541,18 @@ class KGLFMEvaluator:
             
             hit_k_correct = {k: 0 for k in k_values}
             total_objects = 0
+            total_samples = 0
             average_num_tokens = 0
+            
+            # For WebQSP: collect all predictions per question across all batches  
+            is_webqsp = self.config.dataset.name == "web-qsp"
+            
+            # TEMPORARY: Force disable WebQSP mode to test individual ranks method
+            if self.accelerator.is_main_process and is_webqsp:
+                self.logger.info("Using WebQSP evaluation mode: computing both per-sample and per-question metrics")
+            
+            # Collect all question predictions across batches for WebQSP
+            all_question_ranks = defaultdict(list) if is_webqsp else None
 
             with torch.no_grad():
                 for batch_idx, batch in enumerate(tqdm(self.dataloader, desc=f"Computing Hit@k metrics for {name}", disable=not self.accelerator.is_main_process)):
@@ -547,28 +579,167 @@ class KGLFMEvaluator:
                     logits = outputs.logits
                     input_ids = batch['input_ids']
 
-                    hit_k_correct_batch, batch_avg_num_tokens, new_objects = compute_hit_k(
-                        logits, input_ids, k_values,
-                        object_boundaries, self.model_config.num_quantizers + (2 if hasattr(self.model_config, 'bounding_tokens') and self.model_config.bounding_tokens else 0),
-                        batch['attention_mask'],
-                        special_token=self.special_kg_token_id, tokenizer=self.tokenizer
-                    )
-
+                    
+                    if not is_webqsp:
+                        # original compute_hit_k for non-WebQSP (should be identical to old results)
+                        hit_k_correct_batch, batch_avg_num_tokens, new_objects = compute_hit_k(
+                            logits, input_ids, k_values,
+                            object_boundaries, self.model_config.num_quantizers + (2 if hasattr(self.model_config, 'bounding_tokens') and self.model_config.bounding_tokens else 0),
+                            batch['attention_mask'],
+                            special_token=self.special_kg_token_id, tokenizer=self.tokenizer,
+                            return_individual_ranks=False
+                        )
+                        
+                        for k in k_values:
+                            hit_k_correct[k] += hit_k_correct_batch[k]
+                            
+                        total_objects += new_objects
+                    else:
+                        # new individual ranks method
+                        individual_ranks, batch_avg_num_tokens, new_objects = compute_hit_k(
+                            logits, input_ids, k_values,
+                            object_boundaries, self.model_config.num_quantizers + (2 if hasattr(self.model_config, 'bounding_tokens') and self.model_config.bounding_tokens else 0),
+                            batch['attention_mask'],
+                            special_token=self.special_kg_token_id, tokenizer=self.tokenizer,
+                            return_individual_ranks=True
+                        )
+                        
+                        question_ids = batch.get('question_ids', None)
+                        
+                        if question_ids is None:
+                            # Create unique question IDs across processes to avoid conflicts
+                            batch_size = len(batch['input_ids'])
+                            # Use process_index and batch_idx to create unique IDs
+                            base_id = batch_idx * self.accelerator.num_processes * batch_size + self.accelerator.process_index * batch_size
+                            question_ids = list(range(base_id, base_id + batch_size))
+                            
+                            # Log warning on first batch if no proper question IDs
+                            if batch_idx == 0 and self.accelerator.is_main_process:
+                                self.logger.warning(f"No 'question_ids' found in batch data. Using generated IDs starting from {base_id}. This may not represent actual WebQSP questions.")
+                        
+                        # For WebQSP, collect ranks per question for later aggregation
+                        for qid, rank in zip(question_ids, individual_ranks):
+                            if rank != float('inf'):  # Only collect valid ranks
+                                all_question_ranks[qid].append(rank)
+                        
+                        # Debug: Log question IDs to understand what we're seeing
+                        if batch_idx < 3:
+                            # Log raw question_ids from batch
+                            self.logger.info(f"Process {self.accelerator.process_index}, Batch {batch_idx}: Raw question_ids from batch: {question_ids[:3] if question_ids else 'None'}")
+                            # Log ranks
+                            valid_qids_and_ranks = [(qid, rank) for qid, rank in zip(question_ids, individual_ranks) if rank != float('inf')]
+                            if valid_qids_and_ranks:
+                                sample_data = valid_qids_and_ranks[:3]
+                                self.logger.info(f"Process {self.accelerator.process_index}, Batch {batch_idx}: Valid (qid, rank) pairs: {sample_data}")
+                                
                     average_num_tokens += batch_avg_num_tokens
-                    total_objects += new_objects
+                    total_samples += new_objects
 
+            # For WebQSP, we need to defer the per-question aggregation until after gathering all data
+            if is_webqsp and all_question_ranks is not None:
+                # Debug: Log local question ranks before gathering
+                local_question_count = len(all_question_ranks)
+                if local_question_count > 0:
+                    sample_qids = list(all_question_ranks.keys())[:5]
+                    self.logger.info(f"Process {self.accelerator.process_index}: Found {local_question_count} local questions, sample IDs: {sample_qids}")
+                else:
+                    self.logger.info(f"Process {self.accelerator.process_index}: No local questions found")
+                
+                # Manually gather question ranks from all processes using individual broadcasts
+                gathered_question_ranks = []
+                
+                for process_idx in range(self.accelerator.num_processes):
+                    # Prepare data to broadcast (only the current process has real data)
+                    if process_idx == self.accelerator.process_index:
+                        process_data = dict(all_question_ranks)
+                    else:
+                        process_data = {}
+                    
+                    # Broadcast this process's data to all processes
+                    data_to_broadcast = [process_data]
+                    broadcast_object_list(data_to_broadcast, from_process=process_idx)
+                    
+                    # All processes now have this process's data
+                    gathered_question_ranks.append(data_to_broadcast[0])
+                
+                if self.accelerator.is_main_process:
+                    # Debug: Log what each process contributed
+                    for idx, process_data in enumerate(gathered_question_ranks):
+                        self.logger.info(f"Process {idx} contributed {len(process_data)} questions: {list(process_data.keys())[:10]}...")
+                    
+                    # Merge question ranks from all processes
+                    merged_question_ranks = defaultdict(list)
+                    for process_data in gathered_question_ranks:
+                        for qid, ranks in process_data.items():
+                            merged_question_ranks[qid].extend(ranks)
+                    
+                    self.logger.info(f"Total unique questions after merging: {len(merged_question_ranks)}")
+                    
+                    if merged_question_ranks:
+                        self.logger.info(f"WebQSP proper question IDs found - using per-question evaluation")
+                    else:
+                        self.logger.warning("No WebQSP question IDs found across all processes")
+                    
+                    # Compute per-sample metrics for comparison
+                    sample_hits = {k: 0 for k in k_values}
+                    total_samples = 0
+                    for qid, ranks in merged_question_ranks.items():
+                        for rank in ranks:
+                            total_samples += 1
+                            for k in k_values:
+                                if rank <= k:
+                                    sample_hits[k] += 1
+                    
+                    # Compute per-question metrics (WebQSP standard)
+                    question_hits = {k: 0 for k in k_values}
+                    valid_questions = 0
+                    for qid, ranks in merged_question_ranks.items():
+                        if ranks:  # Only process questions with valid ranks
+                            best_rank = min(ranks)  # Get the best (minimum) rank for this question
+                            valid_questions += 1
+                            for k in k_values:
+                                if best_rank <= k:
+                                    question_hits[k] += 1
+                    
+                    self.logger.info(f"WebQSP evaluation: {valid_questions} questions, {total_samples} total samples")
                     for k in k_values:
-                        hit_k_correct[k] += hit_k_correct_batch[k]
+                        sample_rate = sample_hits[k] / total_samples if total_samples > 0 else 0
+                        question_rate = question_hits[k] / valid_questions if valid_questions > 0 else 0
+                        self.logger.info(f"Hit@{k}: per-sample={sample_rate:.4f}, per-question={question_rate:.4f}")
+                    
+                    # Update hit_k_correct and total_objects with WebQSP per-question metrics
+                    hit_k_correct = question_hits
+                    total_objects = valid_questions
+                    
 
-            # Gather hit counts and total objects from all processes
-            hit_k_tensors = {}
-            for k in k_values:
-                hit_k_tensor = torch.tensor(hit_k_correct[k], device=self.accelerator.device)
-                hit_k_tensors[k] = self.accelerator.gather(hit_k_tensor).sum().item()
+            # Gather hit counts and total objects from all processes (after WebQSP processing)
+            if not is_webqsp:
+                # For non-WebQSP datasets, gather results normally
+                hit_k_tensors = {}
+                for k in k_values:
+                    hit_k_tensor = torch.tensor(hit_k_correct[k], device=self.accelerator.device)
+                    hit_k_tensors[k] = self.accelerator.gather(hit_k_tensor).sum().item()
+                
+                total_objects_tensor = torch.tensor(total_objects, device=self.accelerator.device)
+                total_objects_gathered = self.accelerator.gather(total_objects_tensor).sum().item()
+            else:
+                # For WebQSP, results are already computed on main process, just broadcast them
+                if self.accelerator.is_main_process:
+                    hit_k_tensors = {k: hit_k_correct[k] for k in k_values}
+                    total_objects_gathered = total_objects
+                else:
+                    hit_k_tensors = {k: 0 for k in k_values}
+                    total_objects_gathered = 0
+                
+                # Broadcast the final results to all processes for consistent state
+                results_to_broadcast = [hit_k_tensors, total_objects_gathered]
+                broadcast_object_list(results_to_broadcast, from_process=0)
+                hit_k_tensors, total_objects_gathered = results_to_broadcast
             
-            total_objects_tensor = torch.tensor(total_objects, device=self.accelerator.device)
-            total_objects_gathered = self.accelerator.gather(total_objects_tensor).sum().item()
+            total_samples_tensor = torch.tensor(total_samples, device=self.accelerator.device)
+            total_samples_gathered = self.accelerator.gather(total_samples_tensor).sum().item()
 
+            # Gather average_num_tokens from all processes
             average_num_tokens_gathered = self.accelerator.gather(torch.tensor(average_num_tokens, device=self.accelerator.device)).sum().item()
 
             # Synchronize across processes
@@ -578,34 +749,37 @@ class KGLFMEvaluator:
             metrics = {}
             if self.accelerator.is_main_process:
                 if total_objects_gathered > 0:
-                    average_num_tokens_gathered /= total_objects_gathered
+                    average_num_tokens_gathered /= total_samples_gathered
                     metrics['average_num_tokens'] = average_num_tokens_gathered
                     
                     for k in k_values:
                         metrics[f'hit_at_{k}'] = hit_k_tensors[k] / total_objects_gathered
                     
-                    self.logger.info(f"Hit@k computed on {total_objects_gathered} objects with average {average_num_tokens_gathered:.2f} tokens per object.")
-                    for k in k_values:
-                        self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
+                    # Only show summary logging for non-WebQSP (WebQSP already logged detailed results)
+                    if not is_webqsp:
+                        self.logger.info(f"Hit@k computed on {total_objects_gathered} objects ({total_samples_gathered} total samples) with average {average_num_tokens_gathered:.2f} tokens per sample.")
+                        for k in k_values:
+                            self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
+                    else:
+                        self.logger.info(f"Hit@k computed on {total_objects_gathered} questions ({total_samples_gathered} total samples) with average {average_num_tokens_gathered:.2f} tokens per sample.")
+                        for k in k_values:
+                            self.logger.info(f"Hit@{k}: {metrics[f'hit_at_{k}']:.4f}")
                 else:
                     self.logger.warning("No valid objects found for Hit@k computation")
                     for k in k_values:
                         metrics[f'hit_at_{k}'] = 0.0
             else:
-                # Non-main processes set dummy values
-                for k in k_values:
-                    metrics[f'hit_at_{k}'] = 0.0
-                    
+                # Non-main processes need empty metrics
+                metrics = {}
+   
+            # Broadcast metrics to all processes so they all have the same results
+            metrics = broadcast_object_list([metrics])[0]
+            
             # Store results for this preprocessing method
             results[name] = metrics
 
         # Broadcast results to all processes
-        if self.accelerator.is_main_process:
-            results_to_broadcast = results
-        else:
-            results_to_broadcast = None
-        
-        results = broadcast_object_list([results_to_broadcast])[0]
+        results = broadcast_object_list([results])[0]
         
         return results
 

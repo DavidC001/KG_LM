@@ -1,11 +1,11 @@
-from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
-from KG_LFM.utils.Datasets.factories.factory import (
+from KG_LM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LM.utils.Datasets.factories.factory import (
     trex_star_graphs_factory, 
     web_qsp_factory,
     grailqa_factory,
     simplequestions_factory
 )
-from KG_LFM.configuration import load_yaml_config, ProjectConfig
+from KG_LM.configuration import load_yaml_config, ProjectConfig
 from argparse import ArgumentParser
 
 graph_build_functions= {

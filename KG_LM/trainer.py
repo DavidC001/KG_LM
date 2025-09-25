@@ -26,10 +26,10 @@ import wandb
 from tqdm.auto import tqdm
 
 # Assuming these are defined in your project structure
-from KG_LFM.configuration import ProjectConfig
-from KG_LFM.model.KG_LFM_arch import KG_LFM, KG_LFMConfig, set_KGLM_model_args
-from KG_LFM.utils.Dataloader import create_dataloader
-from KG_LFM.evaluator import compute_hit_k
+from KG_LM.configuration import ProjectConfig
+from KG_LM.model.KG_LM_arch import KG_LM, KG_LMConfig, set_KGLM_model_args
+from KG_LM.utils.Dataloader import create_dataloader
+from KG_LM.evaluator import compute_hit_k
 
 # import abstract class abc
 from abc import ABC, abstractmethod
@@ -81,7 +81,7 @@ class DefaultMetricsTracker(MetricsTracker):
             result[key] = value / counts if counts > 0 else 0.0
         return result
 
-class KG_LFM_Trainer:
+class KG_LM_Trainer:
     """
     Advanced trainer for KG-LFM with comprehensive features for robust and reproducible training.
     """
@@ -96,7 +96,7 @@ class KG_LFM_Trainer:
                  accelerator: Optional[Accelerator] = None
                 ):
         self.config = config
-        self.run_name = run_name or f"kg_lfm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.run_name = run_name or f"KG_LM_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.resume = resume
         self.enable_wandb = enable_wandb
         self.save_checkpoints = save_checkpoints
@@ -124,7 +124,7 @@ class KG_LFM_Trainer:
         self.logger = logging.getLogger()
 
         # Initialize state
-        self.model : KG_LFM = None
+        self.model : KG_LM = None
         
         self.optimizer = None
         self.scheduler = None
@@ -219,15 +219,15 @@ class KG_LFM_Trainer:
         # Profile model initialization
         if not self.config.train_conf.start_from_checkpoint:
             self.logger.info("Loading fresh model configuration from pretrained model.")
-            model_config = KG_LFMConfig.from_pretrained(
+            model_config = KG_LMConfig.from_pretrained(
                 self.config.model.llm_model_name,
                 trust_remote_code=True,
             )
             model_config = set_KGLM_model_args(model_config, self.config.model)
-            self.model = KG_LFM(model_config)
+            self.model = KG_LM(model_config)
         else:
             self.logger.info(f"Loading model from checkpoint: {self.config.train_conf.start_from_checkpoint}")
-            self.model = KG_LFM.from_pretrained(self.config.train_conf.start_from_checkpoint)
+            self.model = KG_LM.from_pretrained(self.config.train_conf.start_from_checkpoint)
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -604,7 +604,7 @@ class KG_LFM_Trainer:
             model_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                unwrapped_model: KG_LFM = self.accelerator.unwrap_model(self.model)
+                unwrapped_model: KG_LM = self.accelerator.unwrap_model(self.model)
                 unwrapped_model.save_pretrained(model_dir)
                 self.logger.info(f"Model saved successfully to {model_dir}")
             except Exception as e:

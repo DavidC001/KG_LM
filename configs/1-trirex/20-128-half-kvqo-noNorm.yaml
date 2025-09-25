@@ -1,22 +1,22 @@
 seed: 42
 
 dataset:
-  name: "web-qsp"
-  lite: True
+  name: "trirex"
+  lite: False
   base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM"
   graph_embs_base_path: "/leonardo_scratch/fast/IscrC_KG-LFM/dataset/KG_LFM/graph_embs"
   preload_nodes_embeddings: False
 
 train_conf:
-  run_name: "KG-LFM-QA-20-128-half-kvqo"
+  run_name: "tri-KG-LFM-20-128-half-kvqo-noNorm"
     
   epochs: 10
   early_stopping_patience: 2
   scheduler_patience: 1
   scheduler_metric: "Hit@10"
   scheduler_mode: "max"
-  steps_train: 1.0
-  eval_perc: 1.0
+  steps_train: 8192
+  eval_perc: 0.25
 
   gradient_accumulation_steps: 2 # more randomness
   clip_grad_norm: 1.0
@@ -31,7 +31,6 @@ train_conf:
   checkpoint_frequency: 5
   
   resume : True
-  start_from_checkpoint: "/leonardo_work/IscrC_KG-LFM/checkpoints/tri-KG-LFM-20-128-half-kvqo/best_model"
 
   dataloader:
     batch_size: 8

@@ -80,9 +80,9 @@ The framework supports distributed training with:
 
 ```
 KG_LM/
-├── KG_LFM/                    # Core model implementation
+├── KG_LM/                    # Core model implementation
 │   ├── model/
-│   │   ├── KG_LFM_arch.py     # Main model architecture
+│   │   ├── KG_LM_arch.py     # Main model architecture
 │   │   └── KG_encoder.py      # Graph encoder with RVQ
 │   ├── utils/                 # Data loading and preprocessing
 │   ├── trainer.py             # Training orchestration

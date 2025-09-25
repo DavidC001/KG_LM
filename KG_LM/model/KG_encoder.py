@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from KG_LM.model.qformer import QFormerPool
+from torch_geometric.utils import to_dense_batch
 
 class DirectionalVQ(nn.Module):
     """
@@ -116,7 +118,7 @@ class KGEncoder(nn.Module):
     def __init__(
         self, 
         node_embedding_dim, edge_embedding_dim, final_embedding_dim, std_tokens,
-        dropout=0.2, num_heads=1, gat_layers=3, graph_pooling=True, 
+        dropout=0.2, num_heads=1, gat_layers=3, graph_pooling=True, q_former=False,
         num_quantizers=3, codebook_size=512, codebook_dim=0, shared_codebook=False,
         beta_commit=0.25, dead_codebook_threshold=0.5, bounding_tokens=False
     ):
@@ -132,6 +134,7 @@ class KGEncoder(nn.Module):
             num_heads (int): Number of attention heads in GATv2Conv.
             gat_layers (int): Number of GATv2Conv layers.
             graph_pooling (bool): Whether to apply global mean pooling to the graph representations.
+            q_former (bool): Whether to use a Q-Former architecture to pool graph representations.
             num_quantizers (int): Number of quantizers for residual vector quantization.
             codebook_size (int): Size of the codebook for vector quantization.
             codebook_dim (int): Dimension of the downsampled codebook. If 0, no downsampling is applied.
@@ -199,6 +202,12 @@ class KGEncoder(nn.Module):
         self.output_norm = nn.LayerNorm(final_embedding_dim)
         
         self.graph_pooling = graph_pooling
+        self.q_former = q_former
+        
+        assert not (self.graph_pooling and self.q_former), "Cannot use both graph_pooling and q_former simultaneously."
+        if self.q_former:
+            logging.info("KGEncoder: using Q-Former for graph pooling")
+            self.q_former_pool = QFormerPool(channels=node_embedding_dim, num_heads=num_heads, dropout=dropout)
         
         self.bounding_tokens = bounding_tokens
         if self.bounding_tokens:
@@ -237,6 +246,9 @@ class KGEncoder(nn.Module):
 
         if self.graph_pooling:
             x = global_mean_pool(x, graphs.batch.to(x.device))
+        elif self.q_former:
+            x_padded, mask = to_dense_batch(x, graphs.batch)
+            x = self.q_former_pool(x_padded, mask)  # (batch_size, out_channels)
         else:
             # Find the first occurrence of each batch index
             num_graphs = graphs.batch.max().item() + 1
@@ -248,7 +260,7 @@ class KGEncoder(nn.Module):
             
             x = x[first_indices]
         
-        logging.debug(f"Graph embeddings shape after GATv2Conv: {x.shape}") 
+        logging.debug(f"Graph embeddings shape after Graph Conv: {x.shape}") 
 
         if self.codebook_dim > 0:
             x = self.downsample(x)
@@ -269,12 +281,12 @@ class KGEncoder(nn.Module):
         skip = self.skip_to_final(tokens)                         # [B, Q, final_D]
         tokens = self.output_norm(proj + skip)                    # residual in final space
 
-        # per-batch standardization
-        g_mu = tokens.mean(dim=(-2,-1), keepdim=True)
-        g_std = tokens.std(dim=(-2,-1), keepdim=True).clamp_min(1e-6)
-        tokens = (tokens - g_mu) / g_std
-        # match text emb std
-        tokens = tokens * self.text_embs_std + self.kg_bias
+        # # per-batch standardization
+        # g_mu = tokens.mean(dim=(-2,-1), keepdim=True)
+        # g_std = tokens.std(dim=(-2,-1), keepdim=True).clamp_min(1e-6)
+        # tokens = (tokens - g_mu) / g_std
+        # # match text emb std
+        # tokens = tokens * self.text_embs_std + self.kg_bias
         
         # add bounding tokens if needed
         if self.bounding_tokens:

@@ -4,17 +4,17 @@ from torch.utils.data import DataLoader, Dataset
 import networkx as nx
 from transformers import PreTrainedTokenizer, DataCollatorWithPadding
 
-from KG_LFM.utils.Datasets.factories.factory import (
+from KG_LM.utils.Datasets.factories.factory import (
     trirex_factory, trex_star_graphs_factory, trex_bite_factory, 
     web_qsp_factory, grailqa_factory, grailqa_factory,
     simplequestions_factory
 )
-from KG_LFM.utils.Datasets.TriRex_data import TriRexStarDataset
-from KG_LFM.utils.Datasets.QA_data import QADataset
+from KG_LM.utils.Datasets.TriRex_data import TriRexStarDataset
+from KG_LM.utils.Datasets.QA_data import QADataset
 
-from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LM.utils.BigGraphNodeEmb import BigGraphAligner
 
-from KG_LFM.configuration import DataLoaderConfig, DatasetConfig
+from KG_LM.configuration import DataLoaderConfig, DatasetConfig
 
 from torch_geometric.data import Data, Batch
 
@@ -60,6 +60,7 @@ class KGLFM_Collator:
         
         # Initialize result dictionary
         result = {
+            'question_ids': [sample.get('question_id') for sample in batch],  # Add question IDs for grouping
             'sentences': [sample['sentence'] for sample in batch],
             "conversations": [sample['conversation'] for sample in batch],
             'subjects': [sample['subject'] for sample in batch],

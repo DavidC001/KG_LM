@@ -1,4 +1,4 @@
-from KG_LFM.utils.Datasets.factories.factory import (
+from KG_LM.utils.Datasets.factories.factory import (
     trex_factory,
     trex_star_factory,
     trex_bite_factory,
@@ -8,7 +8,7 @@ from KG_LFM.utils.Datasets.factories.factory import (
     grailqa_factory,
     simplequestions_factory
 )
-from KG_LFM.configuration import ProjectConfig, load_yaml_config
+from KG_LM.configuration import ProjectConfig, load_yaml_config
 from argparse import ArgumentParser
 from pathlib import Path
 from generate_webQSP import generate_webqsp

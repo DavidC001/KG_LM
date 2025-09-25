@@ -13,7 +13,7 @@ from torchbiggraph.graph_storages import FORMAT_VERSION_ATTR, FORMAT_VERSION
 
 from sentence_transformers import SentenceTransformer
 from transformers import AutoConfig
-from KG_LFM.configuration import DatasetConfig
+from KG_LM.configuration import DatasetConfig
 
 
 class BigGraphAligner:
