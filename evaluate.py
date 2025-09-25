@@ -1,4 +1,4 @@
-from KG_LFM.evaluator import KGLFMEvaluator
+from KG_LM.evaluator import KGLFMEvaluator
 import argparse
 import logging
 

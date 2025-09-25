@@ -16,8 +16,8 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import torch
-from KG_LFM.model.KG_encoder import KGEncoder
-from KG_LFM.model.KG_decoder import KGDecoder
+from KG_LM.model.KG_encoder import KGEncoder
+from KG_LM.model.KG_decoder import KGDecoder
 
 from torch_geometric.data import Batch
 
@@ -25,23 +25,23 @@ from torch_geometric.data import Batch
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 # Constants
-from KG_LFM.configuration import IGNORE_INDEX, SPECIAL_KG_TOKEN, ModelConfig
+from KG_LM.configuration import IGNORE_INDEX, SPECIAL_KG_TOKEN, ModelConfig
 
 def infer_stop_tokens(tokenizer):
-    """Simple implementation of infer_stop_tokens for KG_LFM"""
+    """Simple implementation of infer_stop_tokens for KG_LM"""
     stop_tokens = []
     if tokenizer.eos_token:
         stop_tokens.append(tokenizer.eos_token)
     return stop_tokens
 
-class KG_LFMConfig(AutoConfig):
+class KG_LMConfig(AutoConfig):
     """
-    Configuration class for the Knowledge Graph Language Foundation Model (KG_LFM).
-    This class extends AutoConfig to include specific parameters for the KG_LFM model.
+    Configuration class for the Knowledge Graph Language Foundation Model (KG_LM).
+    This class extends AutoConfig to include specific parameters for the KG_LM model.
     
     """
     
-    model_type = "kg_lfm"
+    model_type = "KG_LM"
     llm_model_name: str = "Qwen/Qwen3-8B"
     "Name of the LLM model"
 
@@ -49,8 +49,10 @@ class KG_LFMConfig(AutoConfig):
     "Dimension of node embeddings"
     edge_embedding_dim: int = 1024  
     "Dimension of edge embeddings"
-    graph_pooling: bool = True  
+    graph_pooling: bool = False
     "Whether to apply global mean pooling to the graph representations"
+    q_former: bool = False
+    """Whether to use a Q-Former architecture to pool graph representations. Defaults to True."""
 
     dropout: float = 0.2  
     "Dropout rate for the model"
@@ -94,12 +96,12 @@ class KG_LFMConfig(AutoConfig):
     use_kg_encoder: bool = True
     "Whether to use the KG encoder for embedding the input graphs"
 
-def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
+def set_KGLM_model_args(config :KG_LMConfig, model_args: ModelConfig):
     """
     Set the model arguments from a ModelConfig instance.
     
     Args:
-        config (KG_LFMConfig): An instance of KG_LFMConfig to be updated with model parameters.
+        config (KG_LMConfig): An instance of KG_LMConfig to be updated with model parameters.
         model_args (ModelConfig): An instance of ModelConfig containing model parameters.
     """
     # get config for the LLM model to know the shape of the embeddings
@@ -107,12 +109,12 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     graph_llm_config = AutoConfig.from_pretrained(
         graph_nodes_embedding_model,
     )
-    # Check if the model is compatible with KG_LFM
+    # Check if the model is compatible with KG_LM
     if not hasattr(graph_llm_config, 'hidden_size'):
         raise ValueError(f"The model {graph_nodes_embedding_model} does not have a 'hidden_size' attribute. "
-                         "Please use a compatible model for KG_LFM.")
+                         "Please use a compatible model for KG_LM.")
     
-    config.model_type = "kg_lfm"    
+    config.model_type = "KG_LM"    
     
     config.node_embedding_dim = graph_llm_config.hidden_size
     config.edge_embedding_dim = graph_llm_config.hidden_size
@@ -120,6 +122,7 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     config.llm_model_name = model_args.llm_model_name
     
     config.graph_pooling = model_args.graph_pooling
+    config.q_former = model_args.q_former
     config.dropout = model_args.dropout
     config.num_heads = model_args.num_heads
     config.gat_layers = model_args.gat_layers
@@ -142,8 +145,8 @@ def set_KGLM_model_args(config :KG_LFMConfig, model_args: ModelConfig):
     return config
 
 
-class KG_LFMMetaModel(ABC):
-    def init_KGLM(self, config: KG_LFMConfig = None, *args, **kwargs):
+class KG_LMMetaModel(ABC):
+    def init_KGLM(self, config: KG_LMConfig = None, *args, **kwargs):
         if hasattr(self, "llm") or hasattr(self, "kg_encoder"):
             return 
 
@@ -186,6 +189,7 @@ class KG_LFMMetaModel(ABC):
                 codebook_dim=config.codebook_dim if hasattr(config, "codebook_dim") else 0,
                 shared_codebook=config.shared_codebook,
                 graph_pooling=config.graph_pooling,
+                q_former=config.q_former if hasattr(config, "q_former") else False,
                 beta_commit=0.25,
                 std_tokens=self.llm.get_input_embeddings().weight.std().item(),
                 dead_codebook_threshold=config.dead_codebook_threshold if hasattr(config, "dead_codebook_threshold") else 0.5,
@@ -212,17 +216,17 @@ class KG_LFMMetaModel(ABC):
 
         assert (
             self.llm is not None
-        ), "KG_LFM model initialization failed. Please check the configuration and ensure that the LLM and KGEncoder are properly initialized."
+        ), "KG_LM model initialization failed. Please check the configuration and ensure that the LLM and KGEncoder are properly initialized."
 
         self.is_loaded = True
         
     @classmethod
     def load_pretrained(cls, model_path_or_config, *args, **kwargs):
         """
-        Loads a pretrained KG_LFM model from a specified directory.
+        Loads a pretrained KG_LM model from a specified directory.
 
         This method reconstructs the model by:
-        1. Loading the KG_LFM configuration.
+        1. Loading the KG_LM configuration.
         2. Initializing the model architecture (`cls`).
         3. Loading the pretrained weights for the language model (`llm`).
         4. Loading the pretrained weights for the knowledge graph encoder (`kg_encoder`).
@@ -231,10 +235,10 @@ class KG_LFMMetaModel(ABC):
         if not osp.isdir(model_path_or_config):
             raise ValueError(f"The path '{model_path_or_config}' is not a valid directory.")
 
-        # Load the main configuration file for the KG_LFM model
-        config : KG_LFMConfig = KG_LFMConfig.from_pretrained(model_path_or_config, **kwargs)
+        # Load the main configuration file for the KG_LM model
+        config : KG_LMConfig = KG_LMConfig.from_pretrained(model_path_or_config, **kwargs)
 
-        # Initialize the model instance (e.g., KG_LFM) using the loaded config.
+        # Initialize the model instance (e.g., KG_LM) using the loaded config.
         # This will call `init_KGLM` and create the base architecture.
         model = cls(config, *args, **kwargs)
 
@@ -408,7 +412,7 @@ class KG_LFMMetaModel(ABC):
         return self.get_llm().get_output_embeddings()
 
 
-class KG_LFMMetaForCausalLM(ABC):
+class KG_LMMetaForCausalLM(ABC):
     def prepare_inputs_labels_for_multimodal(
         self,
         input_ids,
@@ -744,12 +748,12 @@ class KG_LFMMetaForCausalLM(ABC):
         It will implement a <ASK> and <TELL> token added to the model to generate triplets from the graph embeddings.
         THIS IS NOT TO BE IMPLEMENTED YET, IT IS A FUTURE WORK.
         """
-        raise NotImplementedError("The generate_graphs method is not implemented yet. Please implement the generate_graphs method for KG_LFM.")
+        raise NotImplementedError("The generate_graphs method is not implemented yet. Please implement the generate_graphs method for KG_LM.")
     
     @property
     def default_generation_config(self):
         """
-        Returns the default generation configuration for the KG_LFM model.
+        Returns the default generation configuration for the KG_LM model.
         
         This method retrieves the generation configuration from the underlying LLM model
         and sets sensible defaults if they are missing.
@@ -758,23 +762,23 @@ class KG_LFMMetaForCausalLM(ABC):
         return generation_config
 
 
-class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
+class KG_LM(KG_LMMetaModel, KG_LMMetaForCausalLM, PreTrainedModel):
     """
-    Knowledge Graph Language Foundation Model (KG_LFM) that combines a pre-trained language model 
+    Knowledge Graph Language Foundation Model (KG_LM) that combines a pre-trained language model 
     with a knowledge graph encoder.
     This model is designed to process both text and graph data, integrating them into a unified representation.
     
     """
-    config_class = KG_LFMConfig
+    config_class = KG_LMConfig
     
     main_input_name = "input_ids"
     supports_gradient_checkpointing = True
     
     def __init__(
         self,
-        config: KG_LFMConfig, 
+        config: KG_LMConfig, 
     ):
-        super(KG_LFM, self).__init__(config)
+        super(KG_LM, self).__init__(config)
         self.config = config
         
         # Initialize components. This will create self.llm and self.kg_encoder
@@ -799,7 +803,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        Load a pre-trained KG_LFM model from the specified path.
+        Load a pre-trained KG_LM model from the specified path.
         
         This method serves as a convenient entry point and delegates the core
         loading logic to the `load_pretrained` method implemented in the MetaModel.
@@ -810,7 +814,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
             **kwargs: Additional keyword arguments for the model.
         
         Returns:
-            KG_LFM: An instance of the loaded KG_LFM model.
+            KG_LM: An instance of the loaded KG_LM model.
         """
         return cls.load_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
     
@@ -829,7 +833,7 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         return_dict: Optional[bool] = True
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
-        Forward pass of the KG_LFM model.
+        Forward pass of the KG_LM model.
         """
         
         RVQ_loss = None
@@ -908,5 +912,5 @@ class KG_LFM(KG_LFMMetaModel, KG_LFMMetaForCausalLM, PreTrainedModel):
         return out
         
     
-AutoConfig.register(KG_LFMConfig.model_type, KG_LFMConfig)
-AutoModel.register(KG_LFMConfig, KG_LFM)
+AutoConfig.register(KG_LMConfig.model_type, KG_LMConfig)
+AutoModel.register(KG_LMConfig, KG_LM)

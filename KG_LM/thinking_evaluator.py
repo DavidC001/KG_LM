@@ -1,5 +1,5 @@
 import logging
-from KG_LFM.evaluator import KGLFMEvaluator, compute_hit_k
+from KG_LM.evaluator import KGLFMEvaluator, compute_hit_k
 import torch
 from tqdm.auto import tqdm
 from typing import Dict, Any, List, Optional, Tuple, Sequence, Iterable
@@ -26,9 +26,9 @@ except Exception:  # pragma: no cover
     def _fuzzy_topk(q: str, choices: Iterable[str], limit: int = 3):
         return list(process.extract(q, choices, scorer=fuzz.ratio, limit=limit))
 
-from KG_LFM.utils.Datasets.factories.factory import trex_star_graphs_factory
-from KG_LFM.utils.BigGraphNodeEmb import BigGraphAligner
-from KG_LFM.configuration import SPECIAL_KG_TOKEN
+from KG_LM.utils.Datasets.factories.factory import trex_star_graphs_factory
+from KG_LM.utils.BigGraphNodeEmb import BigGraphAligner
+from KG_LM.configuration import SPECIAL_KG_TOKEN
 
 # Tool schema for function calling
 KG_QUERY_TOOL = {

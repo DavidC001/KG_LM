@@ -26,5 +26,6 @@ fi
 OUTPUT_FILE="${2:-eval/eval-$JOB_ID.json}"
 BATCH_SIZE="${3:-16}"
 MAX_SAMPLES="${4:-None}"
+SPLIT="${5:-test}"
 
-accelerate launch --config-file configs/accelerate_evalconfig.yaml evaluate.py --config $CONFIG_FILE --output_file $OUTPUT_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES --no_baseline
+accelerate launch --config-file configs/accelerate_evalconfig.yaml evaluate.py --config $CONFIG_FILE --output_file $OUTPUT_FILE --batch_size $BATCH_SIZE --max_samples $MAX_SAMPLES --no_baseline --split $SPLIT

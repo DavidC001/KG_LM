@@ -1,8 +1,8 @@
 import torch
-from KG_LFM.configuration import load_yaml_config
+from KG_LM.configuration import load_yaml_config
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, DeepSpeedPlugin
-from KG_LFM.trainer import KG_LFM_Trainer, DefaultMetricsTracker
+from KG_LM.trainer import KG_LM_Trainer, DefaultMetricsTracker
 import logging
 import argparse
 import os
@@ -36,7 +36,7 @@ class RayTuneMetricsTracker(DefaultMetricsTracker):
         
         super().reset()
 
-def train_kg_lfm(config):
+def train_KG_LM(config):
     """Training function for Ray Tune hyperparameter optimization with Accelerate."""
     try:
         # Set up logging
@@ -75,7 +75,7 @@ def train_kg_lfm(config):
         )
         
         # Initialize the trainer with the updated config AND the accelerator
-        trainer = KG_LFM_Trainer(
+        trainer = KG_LM_Trainer(
             config=config_obj, 
             run_name=config_obj.train_conf.run_name,
             resume=False,
@@ -106,11 +106,11 @@ def launch_torch_trainer(config):
     scaling = ScalingConfig(num_workers=4, use_gpu=True, resources_per_worker={"GPU": 1, "CPU": 3})
     
     torch_trainer = TorchTrainer(
-        train_loop_per_worker=train_kg_lfm,
+        train_loop_per_worker=train_KG_LM,
         train_loop_config=config,
         scaling_config=scaling,
         run_config=train.RunConfig(
-            name="kg_lfm_hyperparameter_sweep",
+            name="KG_LM_hyperparameter_sweep",
             callbacks=[TuneReportCallback()],
         ),
     )
@@ -144,7 +144,7 @@ def main():
     )
     
     storage_path = "~/ray_results"
-    exp_name = "kg_lfm_hyperparameter_sweep"
+    exp_name = "KG_LM_hyperparameter_sweep"
     path = os.path.join(storage_path, exp_name)
     
     param_space = {
@@ -189,7 +189,7 @@ def main():
                 search_alg=algo
             ),
             run_config=air.RunConfig(
-                name="kg_lfm_hyperparameter_sweep",
+                name="KG_LM_hyperparameter_sweep",
             ),
             param_space=param_space
         )

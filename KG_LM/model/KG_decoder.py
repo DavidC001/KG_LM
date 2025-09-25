@@ -1,5 +1,5 @@
 """
-KG Decoder for Knowledge Graph Language Foundation Model (KG_LFM).
+KG Decoder for Knowledge Graph Language Foundation Model (KG_LM).
 
 The decoder performs two main tasks:
 1) Relation prediction: Given a center node and surrounding nodes, predict the relations.

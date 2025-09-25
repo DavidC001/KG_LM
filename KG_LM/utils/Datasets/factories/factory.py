@@ -5,22 +5,22 @@ import networkx as nx
 from datasets import Dataset
 from tqdm import tqdm
 
-from KG_LFM.utils.Datasets.factories.WebQSPSentences import WebQSPSentences
-from KG_LFM.utils.Datasets.factories.WebQSPStar import WebQSPStar
-from KG_LFM.utils.Datasets.factories.TRExBite import TRExBite
-from KG_LFM.utils.Datasets.factories.TRExBiteLite import TRExBiteLite
-from KG_LFM.utils.Datasets.factories.TriREx import TriREx
-from KG_LFM.utils.Datasets.factories.TriRExLite import TriRExLite
-from KG_LFM.utils.Datasets.factories.TREx import TREx
-from KG_LFM.utils.Datasets.factories.TRExLite import TRExLite
-from KG_LFM.utils.Datasets.factories.TRExStar import TRExStar
-from KG_LFM.utils.Datasets.factories.TRExStarLite import TRExStarLite
-from KG_LFM.utils.Datasets.factories.GrailQA import GrailQA
-from KG_LFM.utils.Datasets.factories.GrailQAStar import GrailQAStar
-from KG_LFM.utils.Datasets.factories.SimpleQuestionsSentences import SimpleQuestionsSentences
-from KG_LFM.utils.Datasets.factories.SimpleQuestionsStar import SimpleQuestionsStar
+from KG_LM.utils.Datasets.factories.WebQSPSentences import WebQSPSentences
+from KG_LM.utils.Datasets.factories.WebQSPStar import WebQSPStar
+from KG_LM.utils.Datasets.factories.TRExBite import TRExBite
+from KG_LM.utils.Datasets.factories.TRExBiteLite import TRExBiteLite
+from KG_LM.utils.Datasets.factories.TriREx import TriREx
+from KG_LM.utils.Datasets.factories.TriRExLite import TriRExLite
+from KG_LM.utils.Datasets.factories.TREx import TREx
+from KG_LM.utils.Datasets.factories.TRExLite import TRExLite
+from KG_LM.utils.Datasets.factories.TRExStar import TRExStar
+from KG_LM.utils.Datasets.factories.TRExStarLite import TRExStarLite
+from KG_LM.utils.Datasets.factories.GrailQA import GrailQA
+from KG_LM.utils.Datasets.factories.GrailQAStar import GrailQAStar
+from KG_LM.utils.Datasets.factories.SimpleQuestionsSentences import SimpleQuestionsSentences
+from KG_LM.utils.Datasets.factories.SimpleQuestionsStar import SimpleQuestionsStar
 
-from KG_LFM.configuration import DatasetConfig
+from KG_LM.configuration import DatasetConfig
 
 # Global cache for TRiREx training entities to avoid reloading
 _TRIREX_TRAIN_ENTITIES_CACHE = None

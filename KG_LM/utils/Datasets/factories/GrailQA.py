@@ -8,7 +8,7 @@ from datasets.features import Features, Value, Sequence
 logger = logging.getLogger(__name__)
 
 class GrailQA(GeneratorBasedBuilder):
-    """GrailQA dataset factory for the KG_LFM project."""
+    """GrailQA dataset factory for the KG_LM project."""
     VERSION = "1.0.0"
     BUILDER_CONFIGS = [
         BuilderConfig(

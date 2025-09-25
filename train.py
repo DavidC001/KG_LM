@@ -1,5 +1,5 @@
-from KG_LFM.configuration import load_yaml_config
-from KG_LFM.trainer import KG_LFM_Trainer
+from KG_LM.configuration import load_yaml_config
+from KG_LM.trainer import KG_LM_Trainer
 import argparse
 import logging
 import wandb
@@ -24,7 +24,7 @@ def main():
         ]
     )
     
-    trainer = KG_LFM_Trainer(
+    trainer = KG_LM_Trainer(
         config, 
         run_name=config.train_conf.run_name, 
         resume=config.train_conf.resume,

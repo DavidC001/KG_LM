@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import networkx as nx
 from tqdm import tqdm
-from KG_LFM.utils.SparqlQueryEngine import get_pagerank_map, fetch_neighbors, get_entity_label
+from KG_LM.utils.SparqlQueryEngine import get_pagerank_map, fetch_neighbors, get_entity_label
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
