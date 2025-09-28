@@ -1,4 +1,4 @@
-from KG_LFM.thinking_evaluator import KGLFMThinkingEvaluator
+from KG_LM.thinking_evaluator import KGLFMThinkingEvaluator
 import argparse
 import logging
 
@@ -27,6 +27,10 @@ def main():
                        help="Disable textualization evaluation")
     parser.add_argument("--only_baselines", action="store_true",
                        help="Only evaluate baseline models")
+    parser.add_argument("--split", type=str, default="test",
+                       help="Dataset split to evaluate on (train/val/test)")
+    parser.add_argument("--corrupt", action="store_true",
+                       help="Corrupt the input graphs by removing object entities")
 
     args = parser.parse_args()
     
@@ -45,7 +49,9 @@ def main():
         max_samples=args.max_samples,
         no_baseline=args.no_baseline,
         no_text=args.no_text,
-        only_baselines=args.only_baselines
+        only_baselines=args.only_baselines,
+        split=args.split,
+        corrupt=args.corrupt,
     )
     
     # Run evaluation

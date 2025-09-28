@@ -1,9 +1,11 @@
 import logging
+
+import nltk
 from KG_LM.evaluator import KGLFMEvaluator, compute_hit_k
 import torch
 from tqdm.auto import tqdm
 from typing import Dict, Any, List, Optional, Tuple, Sequence, Iterable
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import networkx as nx
 from torch_geometric.data import Data, Batch
@@ -13,22 +15,16 @@ import json
 import re
 from copy import deepcopy
 
-# Prefer rapidfuzz if available (faster than fuzzywuzzy)
-try:  # pragma: no cover
-    from rapidfuzz import fuzz, process  # type: ignore
+from fuzzywuzzy import fuzz, process  # type: ignore
 
-    def _fuzzy_topk(q: str, choices: Iterable[str], limit: int = 3):
-        return list(process.extract(q, choices, scorer=fuzz.ratio, limit=limit))
+def _fuzzy_topk(q: str, choices: Iterable[str], limit: int = 3):
+    return list(process.extract(q, choices, scorer=fuzz.ratio, limit=limit))
 
-except Exception:  # pragma: no cover
-    from fuzzywuzzy import fuzz, process  # type: ignore
-
-    def _fuzzy_topk(q: str, choices: Iterable[str], limit: int = 3):
-        return list(process.extract(q, choices, scorer=fuzz.ratio, limit=limit))
-
-from KG_LM.utils.Datasets.factories.factory import trex_star_graphs_factory
+from KG_LM.utils.Datasets.factories.factory import trex_star_graphs_factory, web_qsp_factory
 from KG_LM.utils.BigGraphNodeEmb import BigGraphAligner
 from KG_LM.configuration import SPECIAL_KG_TOKEN
+
+from accelerate.utils import broadcast_object_list
 
 # Tool schema for function calling
 KG_QUERY_TOOL = {
@@ -80,7 +76,7 @@ class EntityRecognizer:
         self.entity_to_id: Dict[str, str] = {}
         self.entity_labels: List[str] = []
         for eid, g in self.entity_graphs.items():
-            self._add_label(eid, eid)
+            self._add_label(eid, eid)  # allow direct id hits
             for _, data in g.nodes(data=True):
                 lab = (data.get("label") or "").strip().lower()
                 if lab:
@@ -139,11 +135,11 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
     SYSTEM_PROMPT = {
         "role": "system",
         "content": (
-            "You are a helpful assistant designed to answer user queries. Please think step-by-step. "
-            "Use the `query_knowledge_graph` tool to find factual information. For complex questions, "
-            "you may need to use this tool multiple times to build a chain of reasoning by using the "
-            "retrieved knowledge in subsequent queries. Once you have gathered all the necessary "
-            "information, provide the final answer."
+            "You are a helpful assistant designed to answer user queries."
+            # "Use the `query_knowledge_graph` tool to find factual information. For complex questions, "
+            # "you may need to use this tool multiple times to build a chain of reasoning by using the "
+            # "retrieved knowledge in subsequent queries. Once you have gathered all the necessary "
+            # "information, provide the final answer."
         )
     }
 
@@ -156,13 +152,19 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
         self.max_new_tokens = 512  # Default, can be configured
         self.temperature = 0.7     # Default, can be configured
         self.top_p = 0.9           # Default, can be configured
+        
+        
+        self.evaluations = {
+            # 'perplexity': self.compute_perplexity,
+            # 'hit_at_k': self.compute_hit_k_metrics,
+            "fuzzy_entity_recognition": self.compute_fuzzy_metrics
+        }
 
     def load_model(self):
         super().load_model()
         self.logger.info("Loading knowledge graphs for thinking evaluator...")
         dataset_conf = deepcopy(self.config.dataset)
-        dataset_conf.name = "trirex"
-        self.entity_graphs = trex_star_graphs_factory(dataset_conf)
+        _, self.entity_graphs = web_qsp_factory(dataset_conf)
         self.graph_aligner = BigGraphAligner(graphs=self.entity_graphs, config=dataset_conf)
         self.entity_recognizer = EntityRecognizer(self.entity_graphs)
         self._graph_cache: OrderedDict[str, Data] = OrderedDict()
@@ -238,7 +240,7 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
                 tools=tools if tools else None,
             )
         except Exception:
-            # Fallback from inference.py
+            # Fallback
             tool_msg = f" (tools: {', '.join([t['function']['name'] for t in tools])})" if tools else ""
             parts = []
             if messages[0]["role"] != "system":
@@ -283,18 +285,14 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
                 continue
             args = call.get("arguments", {})
             entity_name = (args or {}).get("entity_name", "")
-            
             if not entity_name:
                 fn_text_lines.append("missing entity_name")
                 continue
-            
             result = self.query_knowledge_graph(entity_name)
             if not result.get("ok"):
                 fn_text_lines.append(f"{entity_name} not found")
                 continue
-            
             eid = result["entity_id"]
-            
             entity_ids.append(eid)
             fn_text_lines.append(f"{entity_name}{SPECIAL_KG_TOKEN}")
         return "\n".join(fn_text_lines) + ("\n" if fn_text_lines else ""), entity_ids
@@ -323,7 +321,12 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
 
     def _generate_with_thinking_batched(
         self, batch: Dict[str, Any]
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, list[tuple[int, int]] | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, list[tuple[int, int]] | None, List[str] | None]:
+        """
+        Returns: logits, input_ids, token_spans, final_decoded_texts
+        - logits/input_ids/token_spans are for Hit@k
+        - final_decoded_texts is the final answer text per sample for fuzzy scoring
+        """
         device = self.accelerator.device
         n = len(batch["sentences"])
 
@@ -332,11 +335,12 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
         
         for i in range(n):
             conversations.append([self.SYSTEM_PROMPT, batch["conversations"][i][0], batch["conversations"][i][1]])
-            all_entity_ids_per_sample.append([batch["objects"][i]["id"]])
+            all_entity_ids_per_sample.append([batch["subjects"][i]["id"]])
 
         active_idx: list[int] = list(range(n))
-        max_depth = 5
-
+        max_depth = 2
+        final_answers = ["" for _ in range(n)]
+        
         for _step in range(max_depth):
             if not active_idx:
                 break
@@ -344,7 +348,12 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
             self.logger.debug(f"Thinking step {_step+1} with {len(active_idx)} active samples")
             
             # build prompts only for active samples
-            prompts = [self._apply_chat_template(conversations[i], tools=[KG_QUERY_TOOL]) for i in active_idx]
+            prompts = [
+                self._apply_chat_template(
+                    conversations[i], 
+                    tools=[KG_QUERY_TOOL] if _step < max_depth - 1 else None
+                ) for i in active_idx
+            ]
             enc = self.tokenizer(
                 prompts, 
                 return_tensors="pt", padding=True, truncation=True,
@@ -366,7 +375,10 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
             )
             texts = self.tokenizer.batch_decode(gen, skip_special_tokens=True)
             self.logger.debug(f"Model outputs at step {_step+1}: {texts}")
-            
+
+            for i, idx in enumerate(active_idx):
+                final_answers[idx] = texts[i]
+
             progressed_any = False
             new_active_idx: list[int] = []
 
@@ -388,143 +400,176 @@ class KGLFMThinkingEvaluator(KGLFMEvaluator):
                 break
             active_idx = new_active_idx
 
-        # append ground-truth answers for all samples exactly once
-        for i in range(n):
-            conversations[i].append(batch["conversations"][i][-1])
+        return final_answers
 
-        # final prompts without generation prompt
-        final_prompts = [
-            self._apply_chat_template(conv, tools=[KG_QUERY_TOOL], add_generation_prompt=False)
-            for conv in conversations
-        ]
+    # -------------------------
+    # New: Fuzzy-matching evaluation (string-level) + WebQSP aggregation
+    # -------------------------
+    def _extract_gold_answers_for_sample(self, batch: Dict[str, Any], i: int) -> List[str]:
+        """
+        Try to recover the gold answer strings robustly from common fields.
+        """
+        answers: List[str] = []
 
-        # locate object spans
-        obj_char_spans: list[tuple[int, int] | None] = []
-        for i in range(n):
-            s0, e0 = batch["objects"][i]["boundaries"]
-            obj = batch["sentences"][i][s0:e0]
-            s = final_prompts[i].rfind(obj)
-            obj_char_spans.append(None if s == -1 else (s, s + len(obj)))
+        # 1) object label(s) in objects[i]
+        obj = batch["objects"][i]
+        for key in ("object_label", "label", "answer"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                answers.append(val.strip())
 
-        final_tok = self.tokenizer(
-            final_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            return_offsets_mapping=True,
-        ).to(device)
-        offsets_batch = final_tok.pop("offset_mapping")
+        # 2) sometimes dataset stores 'answers' list at sample-level
+        sample_answers = None
+        if isinstance(batch.get("answers"), list):
+            sample_answers = batch["answers"][i]
+        elif isinstance(batch.get("gold_answers"), list):
+            sample_answers = batch["gold_answers"][i]
+        if sample_answers:
+            if isinstance(sample_answers, (list, tuple)):
+                answers.extend([str(a).strip() for a in sample_answers if str(a).strip()])
+            elif isinstance(sample_answers, str):
+                answers.append(sample_answers.strip())
 
-        token_spans: list[tuple[int, int]] = []
-        keep_idx: list[int] = []
-        for i in range(n):
-            if obj_char_spans[i] is None:
-                continue
-            ts = self._find_token_span_from_char_offsets(
-                offsets_batch[i].tolist(), obj_char_spans[i][0], obj_char_spans[i][1]
-            )
-            if ts is None:
-                continue
-            token_spans.append(ts)
-            keep_idx.append(i)
+        # 3) sentence CSV style: there might be a direct 'answer' in a per-sentence dict
+        if isinstance(batch.get("sentences_meta"), list):
+            meta = batch["sentences_meta"][i]
+            a = meta.get("answer")
+            if isinstance(a, str) and a.strip():
+                answers.append(a.strip())
 
-        if not keep_idx:
-            return None, None, None
+        # De-duplicate and lowercase for matching
+        answers = [a for a in {a.strip(): None for a in answers}.keys()]
+        return answers
 
-        input_ids = final_tok["input_ids"][keep_idx]
-        attention_mask = final_tok.get("attention_mask", None)
-        if attention_mask is not None:
-            attention_mask = attention_mask[keep_idx]
+    def grammarTree_parse(self, result, answers):
+        lowersetence=result.lower()
+        if "I'm sorry" in result:
+            return 0
+        text = nltk.word_tokenize(lowersetence)
+        sentence=nltk.pos_tag(text)
+        #grammar = "NP:{<JJ|NN|NNS.*><POS|IN.*><NN|NNS.*>}"
+        grammar = r"""
+                    NP:{<JJ|NN><POS|IN>?<NN>+}
+                    PP:{<NN|NNS|NNP|NNPS>}
 
-        # graphs only for kept samples, flattened in kept order
-        flat_entity_ids_final: list[str] = []
-        for i in keep_idx:
-            flat_entity_ids_final.extend(all_entity_ids_per_sample[i])
-        graphs_final = self._get_graph_batch(flat_entity_ids_final)
+                    """
+        cp = nltk.RegexpParser(grammar) #生成规则
+        result = cp.parse(sentence) #进行分块
 
-        model_out = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask if attention_mask is not None else None,
-            graphs=graphs_final,
-            labels=None,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = model_out.logits
-        return logits, input_ids, token_spans
+        substring=[]
+        finalstring= []
+        for subtree in result.subtrees():
+            if ((subtree.label() == 'NP')|(subtree.label()=='PP')):
+                substring.append(subtree)
+        for each in substring:
+            length=len(each)
+            #for i in (0,length-1):
+                #print(each[i])
+            final = ''
+            for i in range(0,length):
+                final += each[i][0] + ' '
+            finalstring.append(final)
+            
+        for st in finalstring:
+            #st = st[0]
+            for ans in answers:
+                if fuzz.ratio(ans.lower(), st) > 50:
+                    return 1
+        return 0
 
-
-
-
-    def compute_hit_k_metrics(self, k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, float]:
+    def compute_fuzzy_metrics(
+        self,
+        threshold: int = 50,          # fuzzy ratio threshold to count as hit
+        k_values: List[int] = [1,3,5] # optional @k reporting on top fuzzy candidates (useful if you produce multiple)
+    ) -> Dict[str, float]:
+        """
+        Generate final answers with the thinking loop and evaluate them by fuzzy string matching
+        against gold answers. For WebQSP, aggregate per question (best among linked entities).
+        """
         if self.accelerator.is_main_process:
-            self.logger.info(f"Computing Hit@k metrics with thinking for k={k_values}...")
+            self.logger.info(f"Computing fuzzy-matching metrics (threshold={threshold}) with thinking...")
 
         results = {}
         for name, (preprocess_func, model) in self.tests.items():
-            if name != "KG_LFM":
+            if name != "KG_LM":
                 continue
 
-            if self.accelerator.is_main_process:
-                self.logger.info(f"Evaluating {name} model for Hit@k metrics with thinking...")
+            total = 0
+            correct = 0
 
-            hit_k_correct = {k: 0 for k in k_values}
-            total_objects = 0
-            average_num_tokens = 0
+            # WebQSP aggregation
+            is_webqsp = (self.config.dataset.name == "web-qsp")
+            per_question_best: Dict[Any, float] = defaultdict(float) if is_webqsp else None
 
             with torch.no_grad():
-                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc=f"Computing Hit@k metrics for {name}", disable=not self.accelerator.is_main_process)):
+                for batch_idx, batch in enumerate(tqdm(self.dataloader, desc=f"Computing fuzzy metrics for {name}", disable=not self.accelerator.is_main_process)):
                     if self.max_samples and (batch_idx * self.batch_size * self.accelerator.num_processes) >= self.max_samples:
                         break
+
+                    # Run the full thinking pass and get final decoded texts
+                    final_texts = self._generate_with_thinking_batched(batch)
+
+                    # Question ids (for WebQSP)
+                    question_ids = batch.get('question_ids', None)
+                    if question_ids is None:
+                        # build stable synthetic ids (like you did)
+                        bs = len(final_texts or [])
+                        base_id = batch_idx * self.accelerator.num_processes * bs + self.accelerator.process_index * bs
+                        question_ids = list(range(base_id, base_id + bs))
+
+                    # For each sample: fuzzy-match generated text vs gold answers
+                    for i, gen_text in enumerate(final_texts or []):
+                        golds = self._extract_gold_answers_for_sample(batch, i)
+                        if not golds:
+                            continue
+                        
+                        # use nltk to extract all NN and PP
+                        correct_s = self.grammarTree_parse(gen_text, golds)
+                        if is_webqsp:
+                            qid = question_ids[i]
+                            per_question_best[qid] = max(per_question_best[qid], correct_s)
+                        else:
+                            total += 1
+                            correct += correct_s
+
+            # Gather across processes
+            if not is_webqsp:
+                total_t = torch.tensor(total, device=self.accelerator.device)
+                correct_t = torch.tensor(correct, device=self.accelerator.device)
+                total_g = self.accelerator.gather(total_t).sum().item()
+                correct_g = self.accelerator.gather(correct_t).sum().item()
+                self.accelerator.wait_for_everyone()
+
+                metrics = {}
+                if self.accelerator.is_main_process:
+                    acc = (correct_g / total_g) if total_g > 0 else 0.0
+                    metrics["fuzzy@%d" % threshold] = acc
+                    self.logger.info(f"Fuzzy accuracy @ {threshold}: {acc:.4f} over {total_g} samples")
+                results[name] = metrics
+            else:
+                # Broadcast dicts & merge on main
+                gathered = []
+                for p in range(self.accelerator.num_processes):
+                    local = dict(per_question_best) if p == self.accelerator.process_index else {}
+                    payload = [local]
+                    broadcast_object_list(payload, from_process=p)
+                    gathered.append(payload[0])
+
+                if self.accelerator.is_main_process:
+                    merged: Dict[Any, float] = {}
+                    for d in gathered:
+                        for qid, score in d.items():
+                            merged[qid] = max(merged.get(qid, 0.0), score)
+                    valid_q = len(merged)
                     
-                    logits, input_ids, object_boundaries = self._generate_with_thinking_batched(batch)
-
-                    if logits is None:
-                        continue
-
-                    # Create a dummy attention mask for compute_hit_k
-                    attention_mask = torch.ones_like(input_ids)
-
-                    hit_k_correct_batch, batch_avg_num_tokens, new_objects = compute_hit_k(
-                        logits, input_ids, k_values,
-                        object_boundaries, self.model_config.num_quantizers + (2 if hasattr(self.model_config, 'bounding_tokens') and self.model_config.bounding_tokens else 0),
-                        attention_mask,
-                        special_token=self.special_kg_token_id, tokenizer=self.tokenizer
-                    )
-
-                    average_num_tokens += batch_avg_num_tokens
-                    total_objects += new_objects
-
-                    for k in k_values:
-                        hit_k_correct[k] += hit_k_correct_batch[k]
-                        # print current hit
-                        self.logger.debug(f"Batch {batch_idx}, Hit@{k}: {hit_k_correct[k]}/{total_objects} ({hit_k_correct[k]/total_objects:.4f})")
-
-            # Gather results
-            hit_k_tensors = {}
-            for k in k_values:
-                hit_k_tensor = torch.tensor(hit_k_correct[k], device=self.accelerator.device)
-                hit_k_tensors[k] = self.accelerator.gather(hit_k_tensor).sum().item()
-            
-            total_objects_tensor = torch.tensor(total_objects, device=self.accelerator.device)
-            total_objects_gathered = self.accelerator.gather(total_objects_tensor).sum().item()
-            average_num_tokens_gathered = self.accelerator.gather(torch.tensor(average_num_tokens, device=self.accelerator.device)).sum().item()
-            
-            self.accelerator.wait_for_everyone()
-
-            metrics = {}
-            if self.accelerator.is_main_process:
-                if total_objects_gathered > 0:
-                    average_num_tokens_gathered /= total_objects_gathered
-                    metrics['average_num_tokens'] = average_num_tokens_gathered
-                    for k in k_values:
-                        metrics[f'hit_at_{k}'] = hit_k_tensors[k] / total_objects_gathered
-                    self.logger.info(f"Hit@k computed on {total_objects_gathered} objects.")
+                    acc = sum(merged.values()) / valid_q if valid_q > 0 else 0.0
+                    metrics = {"fuzzy@%d" % threshold: acc, "questions": valid_q}
                 else:
-                    self.logger.warning("No valid objects found for Hit@k computation")
-                    for k in k_values:
-                        metrics[f'hit_at_{k}'] = 0.0
-            
-            results[name] = metrics
-        
+                    metrics = {}
+                
+                # broadcast final metrics
+                blob = [metrics]
+                broadcast_object_list(blob, from_process=0)
+                results[name] = blob[0]
+
         return results

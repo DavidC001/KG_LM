@@ -227,6 +227,11 @@ class KGLFMEvaluator:
         # Initialize metrics storage
         self.results = defaultdict(dict)
         
+        self.evaluations = {
+            # 'perplexity': self.compute_perplexity,
+            'hit_at_k': self.compute_hit_k_metrics,
+        }
+        
     def remove_kg_stuff(self, batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Remove KG-related tokens from input_ids and attention_mask."""
         
@@ -794,10 +799,7 @@ class KGLFMEvaluator:
         self.prepare_accelerator()
         
         # Run all evaluations
-        evaluations = {
-            # 'perplexity': self.compute_perplexity,
-            'hit_at_k': self.compute_hit_k_metrics,
-        }
+        evaluations = self.evaluations
         
         # Run evaluations
         for eval_name, eval_func in evaluations.items():
